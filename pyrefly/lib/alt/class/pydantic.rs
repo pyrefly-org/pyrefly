@@ -71,6 +71,7 @@ use crate::binding::pydantic::VALIDATION_FLAGS;
 use crate::error::collector::ErrorCollector;
 use crate::solver::solver::ArgumentKey;
 use crate::types::class::Class;
+use crate::types::types::Forallable;
 use crate::types::types::Type;
 
 fn int_literal_from_type(ty: &Type) -> Option<&LitInt> {
@@ -872,6 +873,51 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
+    /// Check whether a metadata value can replace Pydantic's input validation.
+    fn pydantic_metadata_has_custom_schema(&self, ty: &Type) -> bool {
+        let cls = match ty {
+            Type::ClassType(cls) => cls.class_object(),
+            Type::ClassDef(cls) => cls,
+            _ => return false,
+        };
+        self.get_class_member_with_defining_class(cls, &GET_PYDANTIC_CORE_SCHEMA)
+            .is_some_and(|member| {
+                let owner = &member.defining_class;
+                owner.module_name().first_component() != "pydantic"
+                    || matches!(
+                        owner.name(self).as_str(),
+                        "BeforeValidator" | "PlainValidator" | "WrapValidator"
+                    )
+            })
+    }
+
+    /// Inspect annotation metadata retained by aliases, with bounded recursion for cyclic aliases.
+    fn pydantic_alias_has_custom_schema(&self, ty: &Type, gas: &mut Gas) -> bool {
+        if gas.stop() {
+            return false;
+        }
+        match ty {
+            Type::Annotated(inner, metadata) => {
+                metadata
+                    .iter()
+                    .any(|metadata| self.pydantic_metadata_has_custom_schema(metadata))
+                    || self.pydantic_alias_has_custom_schema(inner, gas)
+            }
+            Type::Type(inner) => self.pydantic_alias_has_custom_schema(inner, gas),
+            Type::TypeAlias(alias) => {
+                self.pydantic_alias_has_custom_schema(self.get_type_alias(alias).as_type_ref(), gas)
+            }
+            Type::Forall(forall) => match &forall.body {
+                Forallable::TypeAlias(alias) => self.pydantic_alias_has_custom_schema(
+                    self.get_type_alias(alias).as_type_ref(),
+                    gas,
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Extract Pydantic Field metadata from an annotation binding.
     /// This handles the Pydantic-specific pattern where fields can be declared as:
     /// `field: Annotated[some_type, Field(some_keyword=<value>)]`
@@ -927,21 +973,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             //
             // Metadata that is not a class (such as `Any`) is excluded.
             let has_custom_schema = metadata_items.iter().any(|metadata_item| {
-                let cls = match self.expr_infer(metadata_item, &ignore_errors) {
-                    Type::ClassType(cls) => *cls.class_object(),
-                    Type::ClassDef(cls) => cls,
-                    _ => return false,
-                };
-                self.get_class_member_with_defining_class(&cls, &GET_PYDANTIC_CORE_SCHEMA)
-                    .is_some_and(|member| {
-                        let owner = &member.defining_class;
-                        owner.module_name().first_component() != "pydantic"
-                            || matches!(
-                                owner.name(self).as_str(),
-                                "BeforeValidator" | "PlainValidator" | "WrapValidator"
-                            )
-                    })
-            });
+                self.pydantic_metadata_has_custom_schema(
+                    &self.expr_infer(metadata_item, &ignore_errors),
+                )
+            }) || self.pydantic_alias_has_custom_schema(
+                &self.expr_infer(type_expr, &ignore_errors),
+                &mut Gas::new(100),
+            );
 
             // Look through metadata items and find a Field(...) call, then extract its keywords
             for metadata_item in &metadata_items {

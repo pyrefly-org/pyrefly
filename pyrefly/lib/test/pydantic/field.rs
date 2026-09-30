@@ -1548,6 +1548,149 @@ P(x=42)
 );
 
 pydantic_testcase!(
+    test_annotated_before_validator,
+    r#"
+from typing import Annotated, TypeAlias, assert_type
+from pydantic import BaseModel, BeforeValidator, Field
+
+def join_ints(values: list[int]) -> str:
+    return ",".join(str(value) for value in values)
+
+def split_ints(value: str) -> list[int]:
+    return [int(part) for part in value.split(",")]
+
+ValidatedStr: TypeAlias = Annotated[str, BeforeValidator(join_ints)]
+ChainedStr: TypeAlias = Annotated[
+    str,
+    BeforeValidator(join_ints),
+    BeforeValidator(split_ints),
+]
+
+class Model(BaseModel):
+    direct: Annotated[str, BeforeValidator(join_ints)]
+    aliased: ValidatedStr
+    chained: ChainedStr
+    defaulted: ValidatedStr = "not validated by default"
+
+model = Model(direct=[1, 2], aliased=[3, 4], chained="5,6", defaulted=[7])
+assert_type(model.direct, str)
+assert_type(model.aliased, str)
+assert_type(model.chained, str)
+assert_type(model.defaulted, str)
+Model(direct=[1, 2], aliased=[3, 4], chained="5,6")
+model.direct = "stored"
+model.aliased = "stored"
+model.direct = [1, 2]  # E: `list[int]` is not assignable to attribute `direct` with type `str`
+model.aliased = [3, 4]  # E: `list[int]` is not assignable to attribute `aliased` with type `str`
+model.chained = [5, 6]  # E: `list[int]` is not assignable to attribute `chained` with type `str`
+model.defaulted = [7]  # E: `list[int]` is not assignable to attribute `defaulted` with type `str`
+
+class DefaultModel(BaseModel):
+    value: ValidatedStr = Field(default="stored")
+
+defaulted = DefaultModel(value=[1, 2])
+defaulted.value = "stored"
+defaulted.value = [1, 2]  # E: `list[int]` is not assignable to attribute `value` with type `str`
+
+class Child(DefaultModel):
+    pass
+
+child = Child(value=[1, 2])
+child.value = "stored"
+child.value = [1, 2]  # E: `list[int]` is not assignable to attribute `value` with type `str`
+    "#,
+);
+
+testcase!(
+    test_annotated_validator_alias_forms,
+    {
+        let mut env = pydantic_env();
+        env.add(
+            "validator_aliases",
+            r#"
+from typing import Annotated
+from pydantic import BeforeValidator
+def stringify(value: object) -> str:
+    return str(value)
+type Imported = Annotated[str, BeforeValidator(stringify)]
+"#,
+        );
+        env
+    },
+    r#"
+from typing import Annotated, TypeAlias, assert_type
+from pydantic import BaseModel, BeforeValidator as Before, PlainValidator, WrapValidator
+from validator_aliases import Imported
+
+def stringify(value: object) -> str:
+    return str(value)
+
+def wrap(value: object, handler) -> str:
+    return str(value)
+
+Implicit = Annotated[str, Before(stringify)]
+Explicit: TypeAlias = Annotated[str, PlainValidator(stringify)]
+type Scoped = Annotated[str, WrapValidator(wrap)]
+type Generic[T] = Annotated[T, Before(stringify)]
+type Nested = Implicit
+
+class Model(BaseModel):
+    implicit: Implicit
+    explicit: Explicit
+    scoped: Scoped
+    generic: Generic[str]
+    nested: Nested
+    imported: Imported
+    wrapped: Annotated[Explicit, "metadata"]
+
+model = Model(implicit=[1], explicit=[2], scoped=[3], generic=[4], nested=[5], imported=[6], wrapped=[7])
+assert_type(model.implicit, str)
+assert_type(model.explicit, str)
+assert_type(model.scoped, str)
+assert_type(model.generic, str)
+assert_type(model.nested, str)
+assert_type(model.imported, str)
+assert_type(model.wrapped, str)
+model.implicit = [1]  # E: `list[int]` is not assignable to attribute `implicit` with type `str`
+model.explicit = [2]  # E: `list[int]` is not assignable to attribute `explicit` with type `str`
+model.scoped = [3]  # E: `list[int]` is not assignable to attribute `scoped` with type `str`
+model.generic = [4]  # E: `list[int]` is not assignable to attribute `generic` with type `str`
+model.imported = [6]  # E: `list[int]` is not assignable to attribute `imported` with type `str`
+"#,
+);
+
+pydantic_testcase!(
+    test_annotated_validator_name_is_not_special,
+    r#"
+from typing import Annotated, Callable, assert_type
+from pydantic import AfterValidator, BaseModel
+
+def BeforeValidator(func: Callable[[list[int]], str]) -> int:
+    return 0
+
+def stringify(value: list[int]) -> str:
+    return str(value)
+
+type Alias = Annotated[str, BeforeValidator(stringify)]
+type AfterAlias = Annotated[str, AfterValidator(str)]
+
+class Model(BaseModel, strict=True):
+    direct: Annotated[str, BeforeValidator(stringify)]
+    aliased: Alias
+    after: AfterAlias = "stored"
+
+model = Model(direct="text", aliased="text")
+assert_type(model.direct, str)
+assert_type(model.aliased, str)
+Model(direct=[1], aliased="text")  # E: `list[int]` is not assignable to parameter `direct` with type `str`
+Model(direct="text", aliased=[1])  # E: `list[int]` is not assignable to parameter `aliased` with type `str`
+Model(direct="text", aliased="text", after=[1])  # E: `list[int]` is not assignable to parameter `after` with type `str`
+model.direct = [1]  # E: `list[int]` is not assignable to attribute `direct` with type `str`
+model.aliased = [1]  # E: `list[int]` is not assignable to attribute `aliased` with type `str`
+"#,
+);
+
+pydantic_testcase!(
     test_field_without_annotation,
     r#"
 from pydantic import BaseModel, Field

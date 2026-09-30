@@ -1616,10 +1616,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if !self.has_valid_annotation_syntax(expr, errors) {
             return TypeAlias::error(name.clone(), style);
         }
-        // Preserve exact class expressions through chains of legacy aliases.
+        // Preserve annotation metadata and exact class expressions through alias chains.
         let ty = if let Type::TypeAlias(alias) = &ty
-            && let value @ Type::SpecializedClassDef(_) =
-                self.get_type_alias(alias).as_value(self.stdlib)
+            && let value @ (Type::Annotated(..) | Type::SpecializedClassDef(_)) =
+                self.get_type_alias(alias).as_type_ref().clone()
         {
             value
         } else {
