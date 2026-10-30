@@ -37,3 +37,5 @@ pub(crate) mod types;
 pub(crate) mod unnecessary_type_conversion;
 pub(crate) mod unused_ignore;
 pub(crate) mod unused_import;
+
+pub(crate) use self::extract_shared::line_indent_and_start;

@@ -7,6 +7,7 @@
 
 //! Render annotations as source text for a module, with the imports they need.
 
+use std::slice::from_ref;
 use std::sync::Arc;
 
 use dupe::Dupe;
@@ -18,6 +19,7 @@ use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 use starlark_map::small_map::SmallMap;
+use starlark_map::small_set::SmallSet;
 
 use crate::state::ide::import_module_name;
 use crate::state::ide::import_regular_import_edit;
@@ -35,6 +37,8 @@ struct DirectImport {
 /// Source text for annotations, with the imports the text needs.
 pub(crate) struct RenderedAnnotation {
     pub text: String,
+    /// Leading names used by references, for callers that also have a class scope.
+    pub reference_roots: SmallSet<String>,
     /// Names the text uses unqualified, which need `from <module> import <name>`.
     names: Vec<DirectImport>,
     /// Modules the text references by qualified name, which need `import <module>`.
@@ -135,6 +139,22 @@ impl<'a, 'state> AnnotationRenderer<'a, 'state> {
         let (text, missing) =
             self.tracker
                 .resolve_annotation(parts, self.handle.module(), &direct_imports)?;
+        let mut reference_roots = SmallSet::new();
+        for part in parts {
+            if let AnnotationPart::Reference { .. } = part {
+                let (name, _) = self.tracker.resolve_annotation(
+                    from_ref(part),
+                    self.handle.module(),
+                    &direct_imports,
+                )?;
+                reference_roots.insert(
+                    name.split('.')
+                        .next()
+                        .expect("references have a name")
+                        .to_owned(),
+                );
+            }
+        }
 
         let mut missing = missing.into_iter().collect::<Vec<_>>();
         missing.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -148,6 +168,7 @@ impl<'a, 'state> AnnotationRenderer<'a, 'state> {
             .collect::<Option<Vec<_>>>()?;
         Some(RenderedAnnotation {
             text,
+            reference_roots,
             names: direct,
             modules,
         })

@@ -124,6 +124,9 @@ pub(crate) use fastapi_endpoint_support::EndpointModuleCache;
 mod pytest;
 mod quick_fixes;
 
+pub(crate) use self::quick_fixes::add_override::override_in_scope;
+pub(crate) use self::quick_fixes::implement_abstract_members::MemberRenderer;
+pub(crate) use self::quick_fixes::line_indent_and_start;
 pub(crate) use self::quick_fixes::move_module::MoveModuleMemberContext;
 pub(crate) use self::quick_fixes::types::LocalRefactorCodeAction;
 

@@ -145,11 +145,7 @@ pub(crate) fn implement_abstract_members_code_actions(
 
     members.sort_by(|left, right| left.name.cmp(&right.name));
     let type_env = transaction.type_env(handle);
-    let mut renderer = MemberRenderer {
-        env: &type_env,
-        python_version: handle.sys_info().version(),
-        parts: Vec::new(),
-    };
+    let mut renderer = MemberRenderer::new(&type_env, handle.sys_info().version(), false);
     if !replaces_pass {
         // A blank line separates the stubs from the existing body.
         renderer.text(&prepare_insertion_text(source, insert_range.start(), "\n"));
@@ -203,14 +199,32 @@ fn find_class_header(body: &[Stmt], position: TextSize) -> Option<&StmtClassDef>
 }
 
 /// Builds source text while retaining the module references used by annotations.
-struct MemberRenderer<'a> {
+pub(crate) struct MemberRenderer<'a> {
     env: &'a dyn TypeEnv,
     python_version: PythonVersion,
     parts: Vec<AnnotationPart>,
+    quote_annotations: bool,
 }
 
-impl MemberRenderer<'_> {
-    fn text(&mut self, text: &str) {
+impl<'a> MemberRenderer<'a> {
+    pub(crate) fn new(
+        env: &'a dyn TypeEnv,
+        python_version: PythonVersion,
+        quote_annotations: bool,
+    ) -> Self {
+        Self {
+            env,
+            python_version,
+            parts: Vec::new(),
+            quote_annotations,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> Vec<AnnotationPart> {
+        self.parts
+    }
+
+    pub(crate) fn text(&mut self, text: &str) {
         if let Some(AnnotationPart::Text(previous)) = self.parts.last_mut() {
             previous.push_str(text);
         } else {
@@ -225,8 +239,22 @@ impl MemberRenderer<'_> {
         });
     }
 
-    fn annotation(&mut self, ty: &Type) {
-        self.parts.extend(ty.get_annotation_parts(self.env));
+    pub(crate) fn annotation(&mut self, ty: &Type) {
+        let mut parts = ty.get_annotation_parts(self.env);
+        if self.quote_annotations {
+            // String annotations preserve forward references on Python versions
+            // that evaluate annotations when the class body runs.
+            self.text("'");
+            for part in &mut parts {
+                if let AnnotationPart::Text(text) = part {
+                    *text = text.replace('\\', "\\\\").replace('\'', "\\'");
+                }
+            }
+        }
+        self.parts.extend(parts);
+        if self.quote_annotations {
+            self.text("'");
+        }
     }
 
     fn member(
@@ -440,7 +468,7 @@ impl MemberRenderer<'_> {
         Some(())
     }
 
-    fn params(&mut self, params: &ParamList, strip_receiver: bool) {
+    pub(crate) fn params(&mut self, params: &ParamList, strip_receiver: bool) {
         let mut names = params
             .items()
             .iter()
