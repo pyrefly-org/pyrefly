@@ -299,11 +299,12 @@ Computed: None
     );
 }
 
-/// Writing through a property, a descriptor or `__setattr__` runs a setter, which
-/// produces no type Pyrefly can attribute to the target, so the target reports
-/// nothing. In particular the getter is never consulted: reading `p.p` and `d.d`
-/// gives `int`, which must not leak into the store. A `__slots__` attribute is a
-/// plain attribute, so its store reports the assigned type.
+/// Writing through a property or descriptor runs a setter, which reports the
+/// setter's parameter type as the target type. In particular the getter is never
+/// consulted: reading `p.p` and `d.d` gives `int`, which must not leak into the
+/// store. Dynamic `__setattr__` produces no attributed target type and reports
+/// nothing. A `__slots__` attribute is a plain attribute, so its store reports
+/// the assigned type.
 #[test]
 fn test_property_and_descriptor_target() {
     let code = r#"
@@ -353,8 +354,8 @@ sa.anything = 1
 # main.py
 11 | p.p = "s"
        ^
-Hover: None
-Computed: None
+Hover: `str`
+Computed: `str`
 
 13 | print(p.p)
              ^
@@ -363,8 +364,8 @@ Computed: `int`
 
 24 | d.d = 1
        ^
-Hover: None
-Computed: None
+Hover: `int`
+Computed: `int`
 
 26 | print(d.d)
              ^
