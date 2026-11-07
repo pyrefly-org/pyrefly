@@ -130,3 +130,23 @@ $ printf 'x = 1  # pyrefly: ignoree  # pyrefly: ignore[invalid-ignore-comment]\n
  WARN */selfsupp.py:1* (glob)
 [1]
 ```
+
+## When `ignore-without-code` is enabled, only `# pyrefly: ignore` is flagged
+
+```scrut
+$ printf 'x: int = "x"  # pyrefly: ignore\nz: int = "x"  # type: ignore\n' \
+> > $TMPDIR/ig_lints/scoped.py && \
+> echo 'errors = {ignore-without-code = true}' > $TMPDIR/ig_lints/pyrefly.toml && \
+> $PYREFLY check $TMPDIR/ig_lints/scoped.py --output-format=min-text
+ERROR */scoped.py:1* (glob)
+[1]
+```
+
+## A bare `# pyrefly: ignore` is not flagged by default
+
+```scrut
+$ printf 'x: int = "x"  # pyrefly: ignore\n' > $TMPDIR/ig_lints/bare.py && \
+> : > $TMPDIR/ig_lints/pyrefly.toml && \
+> $PYREFLY check $TMPDIR/ig_lints/bare.py --min-severity=warn --output-format=min-text
+[0]
+```
