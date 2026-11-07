@@ -221,6 +221,11 @@ pub enum ErrorKind {
     /// An unqualified import that resolves only through the fallback search path heuristic, so it
     /// may fail at runtime.
     FallbackSearchPathRelativeImport,
+    /// A `# pyrefly: ignore` comment suppresses errors without naming a specific
+    /// error code. Off by default; enable it to require every Pyrefly
+    /// suppression to list the code(s) it silences, e.g.
+    /// `# pyrefly: ignore[bad-return]`.
+    IgnoreWithoutCode,
     /// Raised when a class that inherits from an abstract class but is not itself explicitly
     /// abstract (for example, it does not directly inherit from abc.ABC or use abc.ABCMeta) has
     /// unimplemented abstract members.
@@ -709,6 +714,7 @@ impl ErrorKind {
             ErrorKind::ExplicitAny => Severity::Ignore,
             ErrorKind::ExplicitAnyUse => Severity::Ignore,
             ErrorKind::FallbackSearchPathRelativeImport => Severity::Warn,
+            ErrorKind::IgnoreWithoutCode => Severity::Ignore,
             ErrorKind::ImplicitAbstractClass => Severity::Ignore,
             ErrorKind::ImplicitAny => Severity::Ignore,
             ErrorKind::ImplicitAnyAttribute => Severity::Ignore,
@@ -824,7 +830,11 @@ impl ErrorKind {
     /// `# pyrefly: ignore[...]` for one would produce a comment that can never
     /// take effect.
     pub fn is_unsuppressable(self) -> bool {
-        self.is_unused_ignore() || self == ErrorKind::InvalidIgnoreComment
+        self.is_unused_ignore()
+            || matches!(
+                self,
+                ErrorKind::InvalidIgnoreComment | ErrorKind::IgnoreWithoutCode
+            )
     }
 
     /// Returns whether `--suppress-errors` may write a suppression comment for
@@ -923,6 +933,7 @@ mod tests {
         assert!(!ErrorKind::UnusedIgnore.is_suppressable());
         assert!(!ErrorKind::UnusedTypeIgnore.is_suppressable());
         assert!(!ErrorKind::InvalidIgnoreComment.is_suppressable());
+        assert!(!ErrorKind::IgnoreWithoutCode.is_suppressable());
         assert!(ErrorKind::BadAssignment.is_suppressable());
     }
 

@@ -531,6 +531,7 @@ impl Step {
             let module_ranges = ModuleRanges::compute(&module, &load.module_info);
             errors.add_misplaced_ignores(&module_ranges.misplaced_ignore_all);
             errors.add_invalid_ignores();
+            errors.add_ignore_without_code();
             Arc::new(module_ranges)
         });
         Arc::new(ParsedModule::new(

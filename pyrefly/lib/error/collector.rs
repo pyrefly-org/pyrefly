@@ -546,6 +546,30 @@ impl ErrorCollector {
         }
     }
 
+    /// Record diagnostics for `# pyrefly: ignore` comments that omit an error code.
+    pub(crate) fn add_ignore_without_code(&self) {
+        for (_, suppressions) in self.module_info.ignore().iter() {
+            for supp in suppressions {
+                if supp.tool() == Tool::Pyrefly && supp.error_codes().is_empty() {
+                    let line_start = self
+                        .module_info
+                        .lined_buffer()
+                        .line_start(supp.comment_line());
+                    let range = TextRange::new(
+                        line_start + TextSize::new(supp.comment_offset() as u32),
+                        line_start + TextSize::new(supp.comment_end_offset() as u32),
+                    );
+                    self.error_builder(
+                        range,
+                        ErrorKind::IgnoreWithoutCode,
+                        "`# pyrefly: ignore` has no error code; specify the code(s) being suppressed, e.g. `# pyrefly: ignore[bad-return]`".to_owned(),
+                    )
+                    .emit();
+                }
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.errors.lock().is_empty()
     }
@@ -725,6 +749,11 @@ impl ErrorCollector {
                 {
                     continue;
                 }
+            }
+            if error.error_kind() == ErrorKind::IgnoreWithoutCode
+                && !error_config.enabled_ignores.contains(&Tool::Pyrefly)
+            {
+                continue;
             }
             // Disabled diagnostics do not use suppressions. Ignore-comment diagnostics
             // bypass whole-file, per-line and multi-line string suppression together.

@@ -762,6 +762,21 @@ from . import helper
 # or: import pkg.helper
 ```
 
+## ignore-without-code
+
+Default severity: `ignore`
+
+A `# pyrefly: ignore` comment suppresses any error on its line without naming the specific error code(s) it silences. This rule is off by default; enable it to require every Pyrefly suppression to be explicit, so a blanket ignore can't silently hide a new, unrelated error introduced later. Only `# pyrefly: ignore` comments are checked, since Pyrefly only honors error codes for its own tool.
+
+```python
+def f() -> int:
+    return "oops"  # pyrefly: ignore  # ignore-without-code
+
+# Fix: name the error code being suppressed.
+def g() -> int:
+    return "oops"  # pyrefly: ignore[bad-return]
+```
+
 ## implicit-abstract-class
 
 Default severity: `ignore`

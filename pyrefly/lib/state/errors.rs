@@ -1208,9 +1208,31 @@ def f() -> int:
                     levels.set_error_severity(ErrorKind::UnusedTypeIgnore, Severity::Error);
                 });
                 let collected = errors.collect_errors();
-                assert!(collected.ordinary.is_empty());
-                assert!(collected.suppressed.is_empty());
-                assert_eq!(collected.disabled.len(), 1);
+                let is_bare_pyrefly_ignore = comment == "# pyrefly: ignore";
+                let (expected_ordinary, expected_disabled) = match (preset, is_bare_pyrefly_ignore)
+                {
+                    (Preset::All, true) => (1, 1),
+                    (Preset::Basic, true) => (0, 2),
+                    (_, false) => (0, 1),
+                    _ => (0, 1),
+                };
+                assert_eq!(
+                    collected.ordinary.len(),
+                    expected_ordinary,
+                    "{preset:?}: {comment}"
+                );
+                if expected_ordinary > 0 {
+                    assert_eq!(
+                        collected.ordinary[0].error_kind(),
+                        ErrorKind::IgnoreWithoutCode
+                    );
+                }
+                assert!(collected.suppressed.is_empty(), "{preset:?}: {comment}");
+                assert_eq!(
+                    collected.disabled.len(),
+                    expected_disabled,
+                    "{preset:?}: {comment}"
+                );
                 let unused = errors.collect_unused_ignore_errors(&collected);
                 assert_eq!(unused.len(), 1, "{preset:?}: {comment}");
                 let (_, borrowed_unused) = errors.collect_error_refs_with_unused_ignores();
@@ -1313,8 +1335,17 @@ def f() -> int:
         let collected = errors.collect_errors();
         let unused = errors.collect_unused_ignore_errors_for_display(&collected);
         assert!(unused.ordinary.is_empty());
+        // `unused-ignore` defaults to `Severity::Ignore` and lands in `unused.disabled`.
         assert_eq!(unused.disabled.len(), 1);
+        assert_eq!(unused.disabled[0].error_kind(), ErrorKind::UnusedIgnore);
         assert_eq!(unused.disabled[0].severity(), Severity::Ignore);
+        // `ignore-without-code` is collected as an ordinary module diagnostic in `collected.disabled`.
+        assert_eq!(collected.disabled.len(), 1);
+        assert_eq!(
+            collected.disabled[0].error_kind(),
+            ErrorKind::IgnoreWithoutCode
+        );
+        assert_eq!(collected.disabled[0].severity(), Severity::Ignore);
     }
 
     #[test]
@@ -1446,7 +1477,16 @@ def f() -> int:
             );
             let display = errors.collect_unused_ignore_errors_for_display(&collected);
             assert_eq!(display.ordinary.len(), visible_count, "{contents}");
-            assert!(display.disabled.is_empty(), "{contents}");
+            // `ignore-without-code` defaults to `Ignore` and stays in `disabled`
+            // when a bare `# pyrefly: ignore` is present; this test is about
+            // `unused-ignore` self-suppression, so only allow that kind there.
+            assert!(
+                display
+                    .disabled
+                    .iter()
+                    .all(|e| e.error_kind() == ErrorKind::IgnoreWithoutCode),
+                "{contents}"
+            );
             assert!(display.hints.is_empty(), "{contents}");
             assert_eq!(
                 errors.collect_lsp_errors_with_baselines().0.len(),
@@ -2076,6 +2116,98 @@ x: int = 1  # type: ignore1  # pyrefly: ignoree
                 .any(|e| e.error_kind() == ErrorKind::InvalidIgnoreComment),
             "generated code must skip invalid-ignore-comment when configured"
         );
+    }
+
+    #[test]
+    fn test_ignore_without_code_default_disabled() {
+        let contents = r#"
+x: int = "oops"  # pyrefly: ignore
+"#;
+        let (errors, _tdir) = get_errors(contents);
+        let display = errors.collect_display_errors_with_unused_ignores();
+        assert!(
+            !display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::IgnoreWithoutCode)
+        );
+    }
+
+    #[test]
+    fn test_ignore_without_code_emitted() {
+        // When enabled, a bare `# pyrefly: ignore` is flagged; a coded one is not.
+        let contents = r#"
+x: int = "oops"  # pyrefly: ignore
+y: int = "oops"  # pyrefly: ignore[bad-assignment]
+"#;
+        let (errors, _tdir) = get_errors_with_config(contents, |config| {
+            config
+                .root
+                .errors
+                .get_or_insert_with(Default::default)
+                .set_error_severity(ErrorKind::IgnoreWithoutCode, Severity::Warn);
+        });
+        let display = errors.collect_display_errors_with_unused_ignores();
+        let lints: Vec<_> = display
+            .into_iter()
+            .filter(|e| e.error_kind() == ErrorKind::IgnoreWithoutCode)
+            .collect();
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].module().code_at(lints[0].range()),
+            "# pyrefly: ignore"
+        );
+    }
+
+    #[test]
+    fn test_ignore_without_code_scoped_to_pyrefly() {
+        // Bare ignores for other tools are not flagged, even when enabled.
+        let contents = r#"
+x: int = "oops"  # type: ignore
+y: int = "oops"  # pyright: ignore
+z: int = "oops"  # pyre: ignore
+"#;
+        let (errors, _tdir) = get_errors_with_config(contents, |config| {
+            config
+                .root
+                .errors
+                .get_or_insert_with(Default::default)
+                .set_error_severity(ErrorKind::IgnoreWithoutCode, Severity::Warn);
+        });
+        let display = errors.collect_display_errors_with_unused_ignores();
+        assert!(
+            !display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::IgnoreWithoutCode)
+        );
+    }
+
+    #[test]
+    fn test_ignore_without_code_survives_file_level_ignore_errors() {
+        // A whole-file `# pyrefly: ignore-errors` suppresses ordinary errors but
+        // not the ignore-without-code diagnostics, which are unsuppressable.
+        let contents = r#"# pyrefly: ignore-errors
+x: int = "oops"  # pyrefly: ignore
+"#;
+        let (errors, _tdir) = get_errors_with_config(contents, |config| {
+            config
+                .root
+                .errors
+                .get_or_insert_with(Default::default)
+                .set_error_severity(ErrorKind::IgnoreWithoutCode, Severity::Warn);
+        });
+        let display = errors.collect_display_errors_with_unused_ignores();
+        assert!(
+            !display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::BadAssignment),
+            "file-level `# pyrefly: ignore-errors` must still suppress the error"
+        );
+        let lints: Vec<_> = display
+            .into_iter()
+            .filter(|e| e.error_kind() == ErrorKind::IgnoreWithoutCode)
+            .collect();
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].error_kind(), ErrorKind::IgnoreWithoutCode);
     }
 
     #[test]
