@@ -141,4 +141,9 @@ impl BindingsMetadata {
             (change.fields || change.def).then_some((ClassDefIndex(i as u32), change))
         })
     }
+
+    /// Return whether any class in this module defines a field with this name.
+    pub fn has_class_field(&self, name: &Name) -> bool {
+        self.classes.iter().any(|class| class.fields.contains(name))
+    }
 }
