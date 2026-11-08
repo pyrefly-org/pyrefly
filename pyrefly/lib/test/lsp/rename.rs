@@ -663,7 +663,6 @@ fn test_prepare_rename_dunder_slots_entries() {
             format!("__slots__ = [r'{name}']"),
             format!("__slots__ = {{'{name}': 'Documentation.'}}"),
             format!("__slots__: tuple[str, ...] = (\"\"\"{name}\"\"\",)"),
-            format!("names = __slots__ = ('{name}',)"),
         ] {
             let source = format!(
                 "class C:\n    {assignment}\n    {name}: int\n    def __init__(self) -> None:\n        self.{name} = 1\n\nC().{name}\n"
@@ -690,6 +689,10 @@ fn test_prepare_rename_dunder_slots_entries() {
 fn test_prepare_rename_dunder_slots_rejects_invalid_targets() {
     for (source, literal) in [
         ("class C:\n    __slots__ = ('missing',)\n", "'missing'"),
+        (
+            "class C:\n    foo: int\n    names = __slots__ = ('foo',)\n",
+            "'foo'",
+        ),
         ("class C:\n    foo: int\n    text = 'foo'\n", "'foo'"),
         (
             "class C:\n    foo: int\n    __slots__ = {'foo': 'foo'}\n",
