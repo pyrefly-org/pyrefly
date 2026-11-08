@@ -2948,10 +2948,21 @@ impl<'a> Transaction<'a> {
         if let Some((definition_handle, _, export)) =
             self.resolve_named_import(handle, module_info.name(), name.clone(), preference)
         {
-            let definition_module = self.get_module_info(&definition_handle)?;
+            let local_import = exports.import_definition(&name).filter(|(_, has_alias)| {
+                match preference.import_behavior {
+                    ImportBehavior::StopAtEverything => true,
+                    ImportBehavior::StopAtRenamedImports => *has_alias,
+                    ImportBehavior::JumpThroughEverything => false,
+                }
+            });
+            let (definition_module, definition_range) = if let Some((range, _)) = local_import {
+                (module_info, range)
+            } else {
+                (self.get_module_info(&definition_handle)?, export.location)
+            };
             return Some(FindDefinitionItemWithDocstring {
                 metadata: DefinitionMetadata::VariableOrAttribute(export.symbol_kind),
-                definition_range: export.location,
+                definition_range,
                 module: definition_module,
                 doc_ranges: export.doc_ranges,
                 display_name: Some(name.to_string()),
@@ -4950,6 +4961,33 @@ impl<'a> Transaction<'a> {
                 definition_range,
                 &definition_name,
             ));
+        }
+        if let Some(entries) = self.get_exports_data(handle).dunder_all_names()
+            && let Some(module_info) = self.get_module_info(handle)
+        {
+            let ast = self.get_ast_or_parse_module(handle, &module_info);
+            for (range, _) in entries {
+                if let Some(definition) = self.find_definition_for_dunder_all_entry(
+                    handle,
+                    range.start(),
+                    FindPreference {
+                        import_behavior: ImportBehavior::StopAtRenamedImports,
+                        ..Default::default()
+                    },
+                ) && definition.module.path() == module.path()
+                    && definition.definition_range == definition_range
+                    && let Some(content_range) = Ast::locate_node(&ast, range.start())
+                        .into_iter()
+                        .find_map(|node| match node {
+                            AnyNodeRef::ExprStringLiteral(literal) if literal.range() == range => {
+                                Some(literal.as_single_part_string()?.content_range())
+                            }
+                            _ => None,
+                        })
+                {
+                    references.push(content_range);
+                }
+            }
         }
         references.sort_by_key(|range| range.start());
         references.dedup();
