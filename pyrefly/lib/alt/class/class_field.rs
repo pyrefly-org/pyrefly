@@ -1251,7 +1251,7 @@ impl ClassField {
         }
     }
 
-    fn is_function_without_return_annotation(&self) -> bool {
+    pub(crate) fn is_function_without_return_annotation(&self) -> bool {
         match &self.0 {
             ClassFieldInner::Property { .. } => false,
             ClassFieldInner::Descriptor { .. } => false,
