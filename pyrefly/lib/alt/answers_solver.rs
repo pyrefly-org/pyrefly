@@ -1887,6 +1887,34 @@ struct LambdaBindingFrame {
     generation: u64,
 }
 
+/// Shares an attempt budget across one constructor tree, including rejected inference.
+pub(crate) struct ConstructorBudget<'a> {
+    remaining: &'a Cell<Option<usize>>,
+    owner: bool,
+}
+
+impl ConstructorBudget<'_> {
+    pub(crate) fn spend(&self) {
+        let remaining = self
+            .remaining
+            .get()
+            .expect("An active constructor owns a budget");
+        self.remaining.set(Some(remaining.saturating_sub(1)));
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.remaining.get() == Some(0)
+    }
+}
+
+impl Drop for ConstructorBudget<'_> {
+    fn drop(&mut self) {
+        if self.owner {
+            self.remaining.set(None);
+        }
+    }
+}
+
 pub(crate) struct LambdaBindingContext<'a> {
     state: &'a ThreadState,
     depth: usize,
@@ -1919,6 +1947,8 @@ impl Drop for LambdaBindingContext<'_> {
 /// we always pass the current `ThreadState`.
 pub struct ThreadState {
     stack: CalcStack,
+    /// Nested constructors share this budget until the outer constructor returns.
+    constructor_budget: Cell<Option<usize>>,
     /// For debugging only: thread-global that allows us to control debug logging across components.
     debug: RefCell<bool>,
     /// Configuration for recursion depth limiting. None means disabled.
@@ -1966,6 +1996,7 @@ impl ThreadState {
     pub fn new(recursion_limit_config: Option<RecursionLimitConfig>) -> Self {
         Self {
             stack: CalcStack::new(),
+            constructor_budget: Cell::new(None),
             debug: RefCell::new(false),
             recursion_limit_config,
             partial_answers: RefCell::new(FxHashMap::default()),
@@ -2327,6 +2358,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return self.bindings().get_class_fields(cls.index());
         }
         self.answers.get_class_fields(cls)
+    }
+
+    /// Count all contextual attempts before permitting additional argument expansion.
+    /// Exhaustion disables speculation but leaves ordinary contextual checking intact.
+    pub(crate) fn enter_constructor_budget(&self) -> ConstructorBudget<'_> {
+        let remaining = &self.thread_state.constructor_budget;
+        let owner = remaining.get().is_none();
+        if owner {
+            remaining.set(Some(1000));
+        }
+        ConstructorBudget { remaining, owner }
     }
 
     /// Start an independent lambda-hint or speculative-call inference attempt.
