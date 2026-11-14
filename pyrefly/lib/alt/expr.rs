@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::cell::Cell;
 use std::cell::LazyCell;
 use std::cell::RefCell;
 use std::fmt;
@@ -768,6 +769,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .into_ty()
     }
 
+    /// Infer the normal type and observe elements of non-empty, unprojected list/set/dict displays.
+    /// The observation keeps string and bytes literals; other expressions leave it unset.
+    /// This entry point has no type-form context, expected-type check, or argument cache.
+    pub(super) fn expr_infer_for_iteration(
+        &self,
+        x: &Expr,
+        errors: &ErrorCollector,
+    ) -> (Type, Option<Type>) {
+        let iteration_element = Cell::new(None);
+        let ty = self
+            .expr_infer_without_shape_comment_impl(x, None, errors, None, Some(&iteration_element))
+            .into_ty();
+        (ty, iteration_element.take())
+    }
+
     /// Infer a type for an expression, with an optional type hint that influences the inferred type.
     /// Convenience wrapper around `expr_with_options`.
     pub fn expr_infer_with_hint(
@@ -927,6 +943,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
         type_form_context: Option<TypeFormContext<'_>>,
     ) -> TypeInfo {
+        self.expr_infer_without_shape_comment_impl(x, hint, errors, type_form_context, None)
+    }
+
+    fn expr_infer_without_shape_comment_impl(
+        &self,
+        x: &Expr,
+        hint: Option<HintRef>,
+        errors: &ErrorCollector,
+        type_form_context: Option<TypeFormContext<'_>>,
+        iteration_element: Option<&Cell<Option<Type>>>,
+    ) -> TypeInfo {
         // Assignment values and branches of conditional and boolean expressions are checked separately.
         let mut check_deprecation = !matches!(x, Expr::Named(..) | Expr::If(..) | Expr::BoolOp(..));
         let res = match x {
@@ -1001,7 +1028,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // All other expressions operate at the `Type` level only, so we avoid the overhead of
             // wrapping and unwrapping `TypeInfo` by computing the result as a `Type` and only wrapping
             // at the end.
-            _ => TypeInfo::of_ty(self.expr_infer_impl_helper(x, hint, errors, type_form_context)),
+            _ => TypeInfo::of_ty(self.expr_infer_impl_helper(
+                x,
+                hint,
+                errors,
+                type_form_context,
+                iteration_element,
+            )),
         };
         if check_deprecation {
             self.check_for_deprecated_call(res.ty(), x.range(), errors);
@@ -1018,6 +1051,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         hint: Option<HintRef>,
         errors: &ErrorCollector,
         type_form_context: Option<TypeFormContext<'_>>,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         match x {
             Expr::Name(..) | Expr::Attribute(..) | Expr::Named(..) | Expr::Subscript(..) => {
@@ -1210,6 +1244,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             return_hint,
                             callable_errors,
                             None,
+                            None,
                         );
                         match ret {
                             Type::Any(AnyStyle::Implicit) => {
@@ -1273,11 +1308,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     self.infer_with_decomposed_hint(
                         hint,
                         |hint| self.decompose_list(hint),
-                        |elt_hint, hint| self.list_literal_infer(x, elt_hint, hint, errors),
+                        |elt_hint, hint| {
+                            self.list_literal_infer(x, elt_hint, hint, errors, iteration_element)
+                        },
                     )
                 }
             }
-            Expr::Dict(x) => self.dict_infer(&x.items, hint, x.range, errors),
+            Expr::Dict(x) => self.dict_infer(&x.items, hint, x.range, errors, iteration_element),
             Expr::Set(x) => self.infer_with_decomposed_hint(
                 hint,
                 |hint| self.decompose_set(hint),
@@ -1294,6 +1331,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             &x.elts,
                             HintRef::with_ty_opt(hint, elem_hint.as_ref()),
                             errors,
+                            iteration_element,
                         );
                         self.heap
                             .mk_class_type(self.stdlib.set(self.unions(elem_tys)))
@@ -1350,6 +1388,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             key_hint,
                             errors,
                             HintCoercion::BestEffort,
+                            None,
                         ),
                         None => self.heap.mk_any_error(),
                     };
@@ -1565,7 +1604,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.check_pytorch_redundant_to_call(callee.expr, &callee.ty, errors);
         self.check_sqlalchemy_keyword_call(callee.expr, errors);
         if let Some(d) = self.call_to_dict(&callee.ty, &callee.expr.arguments) {
-            self.dict_infer(&d, hint, callee.expr.range(), errors)
+            self.dict_infer(&d, hint, callee.expr.range(), errors, None)
         } else if let Some(ty) = self
             .anonymous_typed_dict_get_or_setdefault_with_literal(
                 &callee.expr.func,
@@ -1634,6 +1673,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         coercion: HintCoercion,
     ) -> Type {
         let ty = self.expr_infer_with_hint(x, hint, errors);
+        self.promote_with_hint(ty, x.range(), hint, coercion)
+    }
+
+    fn promote_with_hint(
+        &self,
+        ty: Type,
+        range: TextRange,
+        hint: Option<HintRef>,
+        coercion: HintCoercion,
+    ) -> Type {
         if let Some(hint) = hint {
             let use_hint = |want| match coercion {
                 HintCoercion::Enforced { errors, tcc } => {
@@ -1642,7 +1691,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     // source location; unlike errors, that write is not rolled back when a
                     // speculative union branch is later rejected, so the IDE may show the
                     // expected type from a branch we did not pick. Batch checking is unaffected.
-                    self.check_type(&ty, want, x.range(), errors, tcc);
+                    self.check_type(&ty, want, range, errors, tcc);
                     true
                 }
                 // Use a best-effort hint only if it is compatible.
@@ -1663,15 +1712,30 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         ty.promote(self.stdlib)
     }
 
+    fn observe_iteration_element(&self, ty: &Type, elements: Option<&mut Vec<Type>>) {
+        if let Some(elements) = elements {
+            elements.push(self.distribute_over_union(ty, |ty| match ty {
+                // String and bytes literals retain the length of the value being unpacked.
+                Type::Literal(lit) if matches!(lit.value, Lit::Str(_) | Lit::Bytes(_)) => {
+                    ty.clone()
+                }
+                _ => ty.clone().promote(self.stdlib),
+            }));
+        }
+    }
+
     fn dict_key_infer_with_hint(
         &self,
         x: &Expr,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
         hint_coercion: HintCoercion,
+        iteration_keys: Option<&mut Vec<Type>>,
     ) -> Type {
         let has_hint = hint.is_some();
-        let key_ty = self.expr_infer_with_hint_promote(x, hint, errors, hint_coercion);
+        let ty = self.expr_infer_with_hint(x, hint, errors);
+        self.observe_iteration_element(&ty, iteration_keys);
+        let key_ty = self.promote_with_hint(ty, x.range(), hint, hint_coercion);
         if has_hint {
             key_ty
         } else if matches!(key_ty, Type::LiteralString(_)) {
@@ -2155,6 +2219,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         hint: Option<HintRef>,
         range: TextRange,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         let flattened_items = Ast::flatten_dict_items(items);
         if let Some(hint) = hint {
@@ -2197,7 +2262,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         // Note that we don't need to filter out the TypedDict options here; any non-`dict` options
         // are ignored when decomposing the hint.
-        self.dict_items_infer(range, flattened_items, hint, errors)
+        self.dict_items_infer(range, flattened_items, hint, errors, iteration_element)
     }
 
     /// Infers a type for a dictionary literal with the specified items & an optional contextual hint
@@ -2217,6 +2282,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         items: Vec<&DictItem>,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         self.infer_with_decomposed_hint(
             hint,
@@ -2231,7 +2297,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             },
             |decomposed_hints, hint| {
                 let (key_hint, value_hint) = decomposed_hints.unwrap_or_default();
-                self.dict_items_infer_inner(range, &items, hint, key_hint, value_hint, errors)
+                self.dict_items_infer_inner(
+                    range,
+                    &items,
+                    hint,
+                    key_hint,
+                    value_hint,
+                    errors,
+                    iteration_element,
+                )
             },
         )
     }
@@ -2244,6 +2318,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         key_hint: Option<Type>,
         value_hint: Option<Type>,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         if items.is_empty() {
             let key_ty = key_hint.unwrap_or_else(|| {
@@ -2281,6 +2356,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 .any(|x| x.key.is_some() && !x.value.is_none_literal_expr());
             let mut key_tys = Vec::new();
             let mut value_tys = Vec::new();
+            let mut iteration_keys = iteration_element.map(|_| Vec::with_capacity(items.len()));
             items.iter().for_each(|x| match &x.key {
                 Some(key) => {
                     let key_t = self.dict_key_infer_with_hint(
@@ -2293,6 +2369,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         HintCoercion::new(hint.as_ref(), &|| {
                             TypeCheckContext::of_kind(TypeCheckKind::DictKey)
                         }),
+                        iteration_keys.as_mut(),
                     );
                     let value_t = self.expr_infer_with_hint_promote(
                         &x.value,
@@ -2336,6 +2413,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 None => {
                     let ty = self.expr_infer(&x.value, errors);
+                    let mapping_types = iteration_keys
+                        .as_ref()
+                        .and_then(|_| self.unwrap_mapping_for_unpacking(&ty));
+                    if let Some((key, _)) = &mapping_types
+                        && let Some(keys) = &mut iteration_keys
+                    {
+                        keys.push(key.clone());
+                    }
                     // If the unpacked value is an anonymous typed dict, merge its fields.
                     // Later fields override earlier ones with the same name.
                     if can_create_anonymous_typed_dict
@@ -2348,7 +2433,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 value_tys.push(field.ty.clone());
                             }
                         }
-                    } else if let Some((key_t, value_t)) = self.unwrap_mapping_for_unpacking(&ty) {
+                    } else if let Some((key_t, value_t)) =
+                        mapping_types.or_else(|| self.unwrap_mapping_for_unpacking(&ty))
+                    {
                         // Non-anonymous-typed-dict unpacking disables anonymous typed dict creation
                         can_create_anonymous_typed_dict = false;
                         if !key_t.is_error() {
@@ -2371,15 +2458,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         }
                     } else {
                         can_create_anonymous_typed_dict = false;
-                        self.error(
+                        let ty = self.error(
                             errors,
                             x.value.range(),
                             ErrorKind::InvalidArgument,
                             format!("Expected a mapping, got {}", self.for_display(ty)),
                         );
+                        if let Some(keys) = &mut iteration_keys {
+                            keys.push(ty);
+                        }
                     }
                 }
             });
+            if let Some(element) = iteration_element
+                && let Some(keys) = iteration_keys
+            {
+                element.set(Some(self.unions(keys)));
+            }
             let any_field_has_open_placeholder = typed_dict_fields_map.values().any(|field| {
                 field
                     .ty
@@ -3200,6 +3295,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         elt_hint: Option<Type>,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         if list.is_empty() {
             let elem_ty = elt_hint.unwrap_or_else(|| {
@@ -3213,6 +3309,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 &list.elts,
                 HintRef::with_ty_opt(hint, elt_hint.as_ref()),
                 errors,
+                iteration_element,
             );
             self.heap
                 .mk_class_type(self.stdlib.list(self.unions(elem_tys)))
@@ -3225,6 +3322,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         elts: &[Expr],
         elt_hint: Option<HintRef>,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Vec<Type> {
         let star_hint = LazyCell::new(|| {
             elt_hint.map(|hint| {
@@ -3234,18 +3332,30 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 )
             })
         });
-        elts.map(|x| match x {
+        let mut iteration_types = iteration_element.map(|_| Vec::with_capacity(elts.len()));
+        let elem_tys = elts.map(|x| match x {
             Expr::Starred(ExprStarred { value, .. }) => {
-                let unpacked_ty = self.expr_infer_with_hint_promote(
-                    value,
-                    HintRef::with_ty_opt(elt_hint, star_hint.as_ref()),
-                    errors,
+                let hint = HintRef::with_ty_opt(elt_hint, star_hint.as_ref());
+                // Only starred expansion carries the root observation into a child display.
+                let (unpacked_ty, observed) = if iteration_element.is_some() {
+                    self.expr_infer_for_iteration(value, errors)
+                } else {
+                    (self.expr_infer_with_hint(value, hint, errors), None)
+                };
+                let unpacked_ty = self.promote_with_hint(
+                    unpacked_ty,
+                    value.range(),
+                    hint,
                     HintCoercion::BestEffort,
                 );
                 if let Some(iterable_ty) = self.unwrap_iterable(&unpacked_ty) {
+                    self.observe_iteration_element(
+                        observed.as_ref().unwrap_or(&iterable_ty),
+                        iteration_types.as_mut(),
+                    );
                     iterable_ty
                 } else {
-                    self.error(
+                    let ty = self.error(
                         errors,
                         x.range(),
                         ErrorKind::NotIterable,
@@ -3253,11 +3363,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             "Expected an iterable, got `{}`",
                             self.for_display(unpacked_ty)
                         ),
-                    )
+                    );
+                    self.observe_iteration_element(&ty, iteration_types.as_mut());
+                    ty
                 }
             }
-            _ => self.expr_infer_with_hint_promote(x, elt_hint, errors, HintCoercion::BestEffort),
-        })
+            _ => {
+                let ty = self.expr_infer_with_hint(x, elt_hint, errors);
+                self.observe_iteration_element(&ty, iteration_types.as_mut());
+                self.promote_with_hint(ty, x.range(), elt_hint, HintCoercion::BestEffort)
+            }
+        });
+        if let Some(element) = iteration_element
+            && let Some(types) = iteration_types
+        {
+            element.set(Some(self.unions(types)));
+        }
+        elem_tys
     }
 
     fn is_enum_class_type(&self, ty: &Type) -> bool {
@@ -3699,7 +3821,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ),
                 Type::Type(f) if matches!(&*f, Type::Quantified(q) if q.is_type_var()) => {
                     // Repeated match because pattern guards cannot move out of bindings.
-                    let Type::Quantified(quantified) = *f else { unreachable!("guarded by matches! above") };
+                    let Type::Quantified(quantified) = *f else {
+                        unreachable!("guarded by matches! above")
+                    };
                     let quantified = *quantified;
                     let base_display_ty =
                         self.heap.mk_type_of(self.heap.mk_quantified(quantified.clone()));

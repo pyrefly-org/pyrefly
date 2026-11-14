@@ -2498,10 +2498,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // body defines a class attribute, which is reported by the class field check like a
         // plain class-body assignment.
         let target_range = match binding {
-            Binding::IterableValueLoop(None, _, _, false)
+            Binding::IterableValueLoop(None, _, _, _, false)
             | Binding::ContextValue(None, _, _, _, false) => Some(range),
             Binding::UnpackedValue(x) if x.annotation.is_none() && !x.in_class_body => Some(range),
-            Binding::IterableValueComprehension(_, _, target_range) => Some(*target_range),
+            Binding::IterableValueComprehension(_, _, target_range, _) => Some(*target_range),
             _ => None,
         };
         if let Some(target_range) = target_range
@@ -2545,8 +2545,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// expression lies within the report's range and explains it.
     pub fn target_value_range(&self, binding: &Binding) -> Option<TextRange> {
         match binding {
-            Binding::IterableValueLoop(_, e, _, _)
-            | Binding::IterableValueComprehension(e, _, _)
+            Binding::IterableValueLoop(_, e, _, _, _)
+            | Binding::IterableValueComprehension(e, _, _, _)
             | Binding::Expr(_, e) => Some(e.range()),
             Binding::ContextValue(_, _, range, _, _) => Some(*range),
             Binding::UnpackedValue(x) => self.target_value_range(self.bindings().get(x.source)),
@@ -3038,18 +3038,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if iterable_ty.ty().is_never() {
                     return EmptyAnswer;
                 }
-                // String and bytes literals have known length, so generate a fixed-length iterable
-                let iterables = match iterable_ty.ty() {
+                let mut iterables = Vec::new();
+                self.map_over_union(iterable_ty.ty(), |ty| match ty {
+                    // String and bytes literals have known length.
                     Type::Literal(lit) if let Lit::Str(s) = &lit.value => {
                         let char_ty = self.heap.mk_literal_string(LitStyle::Implicit);
-                        vec![Iterable::FixedLen(vec![char_ty; s.chars().count()])]
+                        iterables.push(Iterable::FixedLen(vec![char_ty; s.chars().count()]));
                     }
                     Type::Literal(lit) if let Lit::Bytes(b) = &lit.value => {
                         let elem_ty = self.heap.mk_class_type(self.stdlib.int().clone());
-                        vec![Iterable::FixedLen(vec![elem_ty; b.len()])]
+                        iterables.push(Iterable::FixedLen(vec![elem_ty; b.len()]));
                     }
-                    _ => self.iterate(iterable_ty.ty(), *range, errors, None),
-                };
+                    _ => iterables.extend(self.iterate(ty, *range, errors, None)),
+                });
                 for iterable in iterables {
                     match iterable {
                         Iterable::OfType(_) => {}
@@ -5541,6 +5542,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         ann: Option<Idx<KeyAnnotation>>,
         e: &Expr,
         is_async: IsAsync,
+        is_unpacking: bool,
         errors: &ErrorCollector,
     ) -> Type {
         let ann = ann.map(|k| self.get_idx(k));
@@ -5577,6 +5579,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let iterable =
                 self.expr_infer_with_hint(e, infer_hint.as_ref().map(HintRef::soft), errors);
             self.async_iterate(&iterable, e.range(), errors)
+        } else if is_unpacking {
+            let (iterable, element) = self.expr_infer_for_iteration(e, errors);
+            match element {
+                Some(element) => vec![Iterable::OfType(element)],
+                None => self.iterate(&iterable, e.range(), errors, None),
+            }
         } else {
             let infer_hint = ann.and_then(|x| {
                 x.ty(self.heap, self.stdlib)
@@ -7353,11 +7361,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 self.binding_to_type_exception_handler(classes, *is_star, *range, errors)
             }
             Binding::AugAssign(ann, x) => self.augassign_infer(*ann, x, errors),
-            Binding::IterableValueComprehension(e, is_async, _) => {
-                self.binding_to_type_iterable_value(None, e, *is_async, errors)
+            Binding::IterableValueComprehension(e, is_async, _, is_unpacking) => {
+                self.binding_to_type_iterable_value(None, e, *is_async, *is_unpacking, errors)
             }
-            Binding::IterableValueLoop(ann, e, is_async, _) => {
-                self.binding_to_type_iterable_value(*ann, e, *is_async, errors)
+            Binding::IterableValueLoop(ann, e, is_async, is_unpacking, _) => {
+                self.binding_to_type_iterable_value(*ann, e, *is_async, *is_unpacking, errors)
             }
             Binding::ContextValue(ann, e, range, kind, _) => {
                 self.binding_to_type_context_value(*ann, *e, *range, *kind, errors)
