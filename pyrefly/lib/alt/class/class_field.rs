@@ -6938,11 +6938,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    /// Given a `__set__(self, instance, value)` function, gets the type of `value`.
-    fn get_descriptor_setter_value(&self, setter: &Type) -> Type {
-        let values = setter
+    /// Given a callable, extracts the parameter type at `index` (or `index - 1` if unbound/fallback).
+    pub(crate) fn get_callable_positional_param(&self, ty: &Type, index: usize) -> Type {
+        let values = ty
             .toplevel_callable_signatures()
-            .filter_map(|(callable, _)| callable.get_positional_param(2).cloned())
+            .filter_map(|(callable, _)| {
+                callable
+                    .get_positional_param(index)
+                    .or_else(|| {
+                        if index > 0 {
+                            callable.get_positional_param(index - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .cloned()
+            })
             .collect::<Vec<_>>();
         if values.is_empty() {
             self.heap.mk_any_implicit()
@@ -6951,6 +6962,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
+    /// Given a `__set__(self, instance, value)` function, gets the type of `value`.
+    pub(crate) fn get_descriptor_setter_value(&self, setter: &Type) -> Type {
+        self.get_callable_positional_param(setter, 2)
+    }
     /// Return `__call__` as a bound method if instances of `cls` have `__call__`.
     /// This is what the runtime automatically does when we try to call an instance.
     pub fn instance_as_dunder_call(&self, cls: &ClassType) -> Option<Type> {

@@ -1556,6 +1556,7 @@ fn resolve_property_accessors(
     transaction: &Transaction,
     handle: &Handle,
     id: &IdentifierWithContext,
+    setter_type: &Type,
 ) -> Option<String> {
     let IdentifierContext::Attribute {
         base_range,
@@ -1568,10 +1569,13 @@ fn resolve_property_accessors(
     let answers = transaction.get_answers(handle)?;
     let base_type = answers.get_type_trace(*base_range)?;
     transaction.ad_hoc_solve(handle, "property_accessors", |solver| {
-        let accessors =
-            solver.property_accessor_types_for_assignment(base_type, &id.identifier.id)?;
-        let setter_str = accessors.setter_type.as_lsp_string(&solver, LspDisplayMode::Hover);
-        let getter_str = accessors.getter_type.as_lsp_string(&solver, LspDisplayMode::Hover);
+        let getter_type = solver.property_getter_type_for_assignment(
+            base_type,
+            &id.identifier.id,
+            setter_type,
+        )?;
+        let setter_str = setter_type.as_lsp_string(&solver, LspDisplayMode::Hover);
+        let getter_str = getter_type.as_lsp_string(&solver, LspDisplayMode::Hover);
         Some(format!(
             "- **Setter:** `{setter_str}` (assigned here)\n- **Getter:** `{getter_str}`"
         ))
@@ -1796,7 +1800,7 @@ pub fn get_hover_with_verbosity(
         .collect();
     let property_accessors = hover_identifier
         .as_ref()
-        .and_then(|id| resolve_property_accessors(transaction, handle, id));
+        .and_then(|id| resolve_property_accessors(transaction, handle, id, &type_));
 
     let mut hover = HoverValue {
         kind,

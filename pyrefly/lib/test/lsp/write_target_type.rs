@@ -347,6 +347,16 @@ class Setattr:
 sa = Setattr()
 sa.anything = 1
 #  ^
+
+from functools import cached_property
+
+class CP:
+    @cached_property
+    def cp(self) -> int: ...
+
+c = CP()
+c.cp = 1
+# ^
 "#;
     let report = get_batched_lsp_operations_report_allow_error(&[("main", code)], get_test_report);
     assert_eq!(
@@ -381,6 +391,11 @@ Computed: `Literal[1]`
         ^
 Hover: None
 Computed: None
+
+49 | c.cp = 1
+       ^
+Hover: `int`
+Computed: `int`
 "#
         .trim(),
         report.trim(),

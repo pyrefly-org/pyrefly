@@ -332,13 +332,6 @@ pub struct AttrAssignResult {
     pub target_type: Option<Type>,
 }
 
-/// Accessor types for an asymmetric property or descriptor during assignment hover.
-#[derive(Debug, Clone)]
-pub struct PropertyAccessorTypes {
-    pub getter_type: Type,
-    pub setter_type: Type,
-}
-
 #[derive(Debug)]
 enum InternalError {
     /// An internal error caused by `as_attribute_base` being partial.
@@ -1000,72 +993,43 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         )
     }
 
-    /// If `attr_name` on `base_type` resolves to an asymmetric property or descriptor,
-    /// returns the getter and setter types for hover display.
-    pub fn property_accessor_types_for_assignment(
+    /// If `attr_name` on `base_type` resolves to a property or descriptor with a setter,
+    /// returns the getter type for hover display if the property/descriptor is asymmetric
+    /// compared to `setter_type`.
+    pub fn property_getter_type_for_assignment(
         &self,
         base_type: Type,
         attr_name: &Name,
-    ) -> Option<PropertyAccessorTypes> {
-        let attr_base = self.as_attribute_base(base_type)?;
+        setter_type: &Type,
+    ) -> Option<Type> {
+        let attr_base = self.as_attribute_base(base_type.clone())?;
         let (found, _, _) = self.lookup_attr(attr_base, attr_name).decompose();
-        for (attr, _) in found {
-            match attr {
-                Attribute::ClassAttribute(ClassAttribute::Property(getter, Some(setter), _)) => {
-                    let getter_types = getter
-                        .toplevel_callable_signatures()
-                        .map(|(c, _)| c.ret.clone())
-                        .collect::<Vec<_>>();
-                    let getter_type = if getter_types.is_empty() {
-                        self.heap.mk_any_implicit()
-                    } else {
-                        self.unions(getter_types)
-                    };
-                    let Some(setter_type) = self.get_property_setter_value(&setter) else {
-                        continue;
-                    };
-                    if !self.is_subset_eq(&getter_type, &setter_type)
-                        || !self.is_subset_eq(&setter_type, &getter_type)
-                    {
-                        return Some(PropertyAccessorTypes {
-                            getter_type,
-                            setter_type,
-                        });
-                    }
-                }
-                Attribute::ClassAttribute(ClassAttribute::Descriptor(desc, _)) if desc.setter => {
-                    let errors = self.error_collector();
-                    let Some(setter) = self.resolve_descriptor_setter(attr_name, &desc, &errors)
-                    else {
-                        continue;
-                    };
-                    let setter_type = self.get_descriptor_setter_value(&setter);
-                    let getter_types = if let Some(getter) =
-                        self.resolve_descriptor_getter(attr_name, &desc, &errors)
-                    {
-                        getter
-                            .toplevel_callable_signatures()
-                            .map(|(c, _)| c.ret.clone())
-                            .collect::<Vec<_>>()
-                    } else {
-                        vec![]
-                    };
-                    if !getter_types.is_empty() {
-                        let getter_type = self.unions(getter_types);
-                        if !self.is_subset_eq(&getter_type, &setter_type)
-                            || !self.is_subset_eq(&setter_type, &getter_type)
-                        {
-                            return Some(PropertyAccessorTypes {
-                                getter_type,
-                                setter_type,
-                            });
-                        }
-                    }
-                }
-                _ => {}
-            }
+        let is_prop_or_desc = found.iter().any(|(attr, _)| match attr {
+            Attribute::ClassAttribute(
+                ClassAttribute::Property(_, Some(_), _) | ClassAttribute::Descriptor(..),
+            ) => true,
+            _ => false,
+        });
+        if !is_prop_or_desc {
+            return None;
         }
-        None
+        let errors = self.error_swallower();
+        let getter_type = self.type_of_attr_get(
+            &base_type,
+            attr_name,
+            TextRange::default(),
+            &errors,
+            ErrorKind::MissingAttribute,
+            None,
+            "hover::property_getter",
+        );
+        if !self.is_subset_eq(&getter_type, setter_type)
+            || !self.is_subset_eq(setter_type, &getter_type)
+        {
+            Some(getter_type)
+        } else {
+            None
+        }
     }
 
     /// Resolves an assignment to an attribute that was not found, which falls back to
@@ -1233,7 +1197,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         .is_subset_eq(&got_ty, &read_type)
                         .then_some(got_ty.clone()),
                 };
-                Some((narrow_ty, Some(got_ty)))
+                let target_type = narrow_ty.clone().unwrap_or(ty);
+                Some((narrow_ty, Some(target_type)))
             }
             AttrSetter::SetAttr(setattr_ty) => {
                 self.call_setattr(
@@ -1247,7 +1212,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 Some((None, None))
             }
             AttrSetter::PropertySetter(setter) => {
-                let target_type = self.get_property_setter_value(&setter);
+                let target_type = Some(self.get_callable_positional_param(&setter, 1));
                 self.call_property_setter(setter, CallArg::arg(got), range, errors, context);
                 Some((None, target_type))
             }
