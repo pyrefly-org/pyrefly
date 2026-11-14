@@ -2995,6 +2995,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if !errors.is_active() {
             return self.attr_infer(base, &x.attr.id, x.range, errors, None);
         }
+        // This configuration may lack a module attribute that another one provides, such as
+        // `asyncio.WindowsSelectorEventLoopPolicy`, which exists only under `win32`. A read in
+        // code only that configuration reaches resolves silently, as that configuration would.
+        if let Type::Module(module) = base.ty()
+            && self.bindings().is_in_environment_dead_code(x.range)
+        {
+            let module_name = ModuleName::from_parts(module.parts());
+            if !self.exports.export_exists(module_name, &x.attr.id)
+                && self
+                    .exports
+                    .get_environment_wildcard(module_name)
+                    .is_some_and(|names| names.contains(&x.attr.id))
+            {
+                return TypeInfo::of_ty(self.heap.mk_any_error());
+            }
+        }
         let attr_errors = self.error_collector();
         let result = self.attr_infer(base, &x.attr.id, x.range, &attr_errors, None);
         // An error `Any` is reported where it arises, not at every access it flows through: a

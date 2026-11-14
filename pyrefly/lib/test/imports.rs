@@ -11,6 +11,7 @@ use dupe::Dupe;
 use pyrefly_build::handle::Handle;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
+use pyrefly_python::sys_info::PythonPlatform;
 use pyrefly_python::sys_info::PythonVersion;
 use pyrefly_util::fs_anyhow;
 
@@ -474,6 +475,41 @@ def f() -> None:
         raise SystemExit
     finally:
         from builtins import not_a_real_value  # E: Could not import `not_a_real_value` from `builtins`
+"#,
+);
+
+// An environment test can make a `try` body terminate in this configuration, but the `finally`
+// still runs here, so its imports are checked like any other live code.
+testcase!(
+    test_bad_import_in_finally_after_environment_terminated_try,
+    TestEnv::new_with_platform(PythonPlatform::linux()),
+    r#"
+import sys
+
+def f() -> None:
+    try:
+        if sys.platform != "win32":
+            return
+    finally:
+        from builtins import not_a_real_value_1  # E: Could not import `not_a_real_value_1` from `builtins`
+"#,
+);
+
+// A `finally` that this configuration never enters is dead with its `try`, so its imports stay
+// silent the same way those of other environment-ruled-out code do.
+testcase!(
+    test_bad_import_in_finally_after_environment_terminated_try_outside,
+    TestEnv::new_with_platform(PythonPlatform::linux()),
+    r#"
+import sys
+
+def f() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        pass
+    finally:
+        from builtins import not_a_real_value_2
 "#,
 );
 

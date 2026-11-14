@@ -445,6 +445,8 @@ pub struct Bindings {
     environment_definitions: SmallMap<Idx<Key>, TextRange>,
     /// See `Bindings::environment_names`.
     environment_names: SmallSet<Name>,
+    /// See `Bindings::is_in_environment_dead_code`.
+    environment_dead_ranges: Vec<TextRange>,
     unused_imports: Vec<UnusedImport>,
     unused_variables: Vec<UnusedVariable>,
     pytest_info: Option<PytestBindingInfo>,
@@ -563,6 +565,8 @@ pub struct BindingsBuilder<'a> {
     environment_definitions: SmallMap<Idx<Key>, TextRange>,
     /// See `Bindings::environment_names`.
     environment_names: SmallSet<Name>,
+    /// See `Bindings::is_in_environment_dead_code`.
+    environment_dead_ranges: Vec<TextRange>,
     /// BoundName lookups keyed by source occurrence and finalized in insertion order.
     deferred_bound_names: SmallMap<ShortIdentifier, DeferredBoundName>,
     /// Yield and yield-from indices for lambdas that contain yields.
@@ -699,6 +703,7 @@ impl Bindings {
             global_declarations: SmallSet::new(),
             environment_definitions: SmallMap::new(),
             environment_names: SmallSet::new(),
+            environment_dead_ranges: Vec::new(),
             unused_imports: Vec::new(),
             unused_variables: Vec::new(),
             pytest_info: None,
@@ -935,6 +940,13 @@ impl Bindings {
         &self.environment_names
     }
 
+    /// Ranges of code that this configuration cannot reach because a test of the environment
+    /// chose a terminating path, as in `if sys.platform != "win32": return`. The code is still
+    /// bound, since another configuration reaches it and may provide names read there.
+    pub fn is_in_environment_dead_code(&self, range: TextRange) -> bool {
+        ranges_contain(&self.environment_dead_ranges, range)
+    }
+
     pub fn available_definitions(&self, position: TextSize) -> SmallSet<Idx<Key>> {
         if let Some(trace) = &self.scope_trace {
             trace.available_definitions(&self.table, position)
@@ -1146,6 +1158,7 @@ impl Bindings {
             global_declarations: SmallSet::new(),
             environment_definitions: SmallMap::new(),
             environment_names: SmallSet::new(),
+            environment_dead_ranges: Vec::new(),
             deferred_bound_names: SmallMap::new(),
             lambda_yield_keys: Vec::new(),
             owned_lambda_params: SmallMap::new(),
@@ -1307,6 +1320,7 @@ impl Bindings {
             global_declarations: builder.global_declarations,
             environment_definitions: builder.environment_definitions,
             environment_names: builder.environment_names,
+            environment_dead_ranges: merge_ranges(builder.environment_dead_ranges),
             unused_imports: builder.unused_imports,
             unused_variables: builder.unused_variables,
             pytest_info: builder.pytest_info,
@@ -1936,7 +1950,19 @@ impl<'a> BindingsBuilder<'a> {
         let mut certain_start = None;
         let mut prev_end = None;
         let mut iter = xs.into_iter().peekable();
+        // One record covers the rest of the suite: control that is dead here never becomes live.
+        let mut environment_dead_recorded = false;
         while let Some(x) = iter.next() {
+            // A settled test of the environment can choose a terminating path: the statements
+            // after it are dead here but stay bound for another configuration.
+            if !environment_dead_recorded
+                && self.scopes.is_unreachable_from_static_test()
+                && let Some(end) = suite_end
+            {
+                self.environment_dead_ranges
+                    .push(TextRange::new(x.range().start(), end));
+                environment_dead_recorded = true;
+            }
             // A leading `yield` is load-bearing and never blamed, so a region starts past it.
             // See `is_empty_generator_yield`.
             let is_yield = is_empty_generator_yield(&x);

@@ -222,6 +222,134 @@ inverted: int = "not windows" if sys.platform != "win32" else subprocess.CREATE_
 );
 
 testcase!(
+    test_platform_guarded_attribute_after_negative_guard,
+    TestEnv::new_with_platform(PythonPlatform::linux()),
+    r#"
+import asyncio
+import sys
+
+def returns() -> None:
+    if sys.platform != "win32":
+        return
+    asyncio.WindowsSelectorEventLoopPolicy()
+
+def raises() -> None:
+    if sys.platform != "win32":
+        raise RuntimeError("only windows")
+    asyncio.WindowsSelectorEventLoopPolicy()
+
+def asserts() -> None:
+    assert sys.platform == "win32"
+    asyncio.WindowsSelectorEventLoopPolicy()
+
+def reads() -> None:
+    if not sys.platform == "win32":
+        return
+    x = asyncio.WindowsSelectorEventLoopPolicy
+
+def os_name_guard() -> None:
+    import os
+    if os.name != "nt":
+        return
+    asyncio.WindowsSelectorEventLoopPolicy()
+
+def unguarded() -> None:
+    asyncio.WindowsSelectorEventLoopPolicy()  # E: No attribute `WindowsSelectorEventLoopPolicy` in module `asyncio`
+
+def unknown_attribute() -> None:
+    if sys.platform != "win32":
+        return
+    asyncio.NotARealThing()  # E: No attribute `NotARealThing` in module `asyncio`
+
+def finally_is_live() -> None:
+    try:
+        if sys.platform != "win32":
+            return
+    finally:
+        asyncio.WindowsSelectorEventLoopPolicy()  # E: No attribute `WindowsSelectorEventLoopPolicy` in module `asyncio`
+
+def guard_inside_finally() -> None:
+    try:
+        pass
+    finally:
+        assert sys.platform == "win32"
+        asyncio.WindowsSelectorEventLoopPolicy()
+
+def dead_region_finally() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        pass
+    finally:
+        asyncio.WindowsSelectorEventLoopPolicy()
+        from builtins import not_a_real_value_xyz
+
+def live_sibling() -> None:
+    asyncio.WindowsSelectorEventLoopPolicy()  # E: No attribute `WindowsSelectorEventLoopPolicy` in module `asyncio`
+
+def elif_guard(flag: bool) -> None:
+    if flag:
+        pass
+    elif sys.platform != "win32":
+        return
+    asyncio.WindowsSelectorEventLoopPolicy()  # E: No attribute `WindowsSelectorEventLoopPolicy` in module `asyncio`
+
+def loop_else_live() -> None:
+    for _ in range(0):
+        if sys.platform != "win32":
+            continue
+        asyncio.WindowsSelectorEventLoopPolicy()
+    else:
+        asyncio.WindowsSelectorEventLoopPolicy()  # E: No attribute `WindowsSelectorEventLoopPolicy` in module `asyncio`
+"#,
+);
+
+testcase!(
+    test_platform_guarded_attribute_after_module_exit_guard,
+    TestEnv::new_with_platform(PythonPlatform::linux()),
+    r#"
+import asyncio
+import sys
+
+if sys.platform != "win32":
+    sys.exit(1)
+
+asyncio.WindowsSelectorEventLoopPolicy()
+"#,
+);
+
+testcase!(
+    test_platform_guarded_attribute_after_negative_guard_windows,
+    TestEnv::new_with_platform(PythonPlatform::windows()),
+    r#"
+import asyncio
+import sys
+
+def returns() -> None:
+    if sys.platform != "win32":
+        return
+    asyncio.WindowsSelectorEventLoopPolicy()
+"#,
+);
+
+testcase!(
+    test_version_guarded_attribute_after_negative_guard,
+    TestEnv::new_with_version(PythonVersion::new(3, 10, 0)),
+    r#"
+import asyncio
+import sys
+
+def guarded() -> None:
+    if sys.version_info < (3, 11):
+        return
+    asyncio.TaskGroup()
+
+def unguarded() -> None:
+    asyncio.TaskGroup()  # E: No attribute `TaskGroup` in module `asyncio`
+"#,
+);
+
+testcase!(
     test_platform_ternary_walrus,
     TestEnv::new_with_platform(PythonPlatform::linux()),
     r#"

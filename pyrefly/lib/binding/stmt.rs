@@ -1978,6 +1978,10 @@ impl<'a> BindingsBuilder<'a> {
             Stmt::Try(x) => {
                 // Handlers can observe writes made before an exception, not just entry values.
                 self.scopes.clear_excluded_none_pairs();
+                // Whether this configuration enters the `try` at all: a `finally` after a `try`
+                // it never enters is dead too, while an entered `try` always reaches its finally.
+                let try_reached = !self.scopes.is_definitely_unreachable()
+                    && !self.scopes.is_unreachable_from_static_test();
                 // A `finally` body that assigns attributes directly initializes them on the paths
                 // of the `return`s inside the statement too.
                 let before_try = self.scopes.finally_return_statuses(&x.finalbody);
@@ -2111,7 +2115,9 @@ impl<'a> BindingsBuilder<'a> {
                 // so bind it as reachable and put the termination back afterwards. Leave a
                 // flow that did not terminate alone, so that a `finally` which itself
                 // terminates keeps its own termination.
-                let termination = if self.scopes.is_definitely_unreachable() {
+                let termination = if self.scopes.is_definitely_unreachable()
+                    || (try_reached && self.scopes.is_unreachable_from_static_test())
+                {
                     Some(self.scopes.take_termination())
                 } else {
                     None
