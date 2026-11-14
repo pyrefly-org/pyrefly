@@ -53,6 +53,7 @@ use lsp_types::CodeActionResponse;
 use lsp_types::CodeActionTriggerKind;
 use lsp_types::CodeLensOptions;
 use lsp_types::CodeLensRequest;
+use lsp_types::CodeLensResolveRequest;
 use lsp_types::CompletionItem;
 use lsp_types::CompletionList;
 use lsp_types::CompletionOptions;
@@ -415,6 +416,14 @@ struct FindReferencesRequest {
     find_preference: FindPreference,
     options: ReferenceOptions,
     activity_key: Option<ActivityKey>,
+    kind: ReferenceTaskKind,
+}
+
+/// Reference lenses run independently of interactive reference searches.
+#[derive(Clone, Copy)]
+enum ReferenceTaskKind {
+    Interactive,
+    CodeLens { version: Option<i32> },
 }
 
 pub struct InitializeInfo {
@@ -1157,6 +1166,8 @@ pub struct Server {
     lsp_queue: LspQueue,
     recheck_queue: HeavyTaskQueue,
     find_reference_queue: HeavyTaskQueue,
+    /// A slow lens search must not block interactive reference searches or renames.
+    code_lens_queue: HeavyTaskQueue,
     sourcedb_queue: HeavyTaskQueue,
     /// Any configs whose find cache should be invalidated.
     invalidated_source_dbs: Mutex<SmallSet<ArcId<Box<dyn SourceDatabase + 'static>>>>,
@@ -1221,6 +1232,8 @@ pub struct Server {
     /// These registrations are additive and never removed, so this set only grows.
     watched_exact_paths: Mutex<SmallSet<PathBuf>>,
     override_code_lens_refresh_support: AtomicBool,
+    supports_references_code_lens: bool,
+    reference_code_lens_refresh_enabled: AtomicBool,
     id: Uuid,
     /// The surface/entrypoint for the language server (`--from` CLI arg)
     surface: Option<String>,
@@ -1674,7 +1687,7 @@ pub fn capabilities(
             ..Default::default()
         })),
         code_lens_provider: Some(CodeLensOptions {
-            resolve_provider: Some(false),
+            resolve_provider: Some(true),
             work_done_progress_options: Default::default(),
         }),
         completion_provider: Some(CompletionOptions {
@@ -1859,6 +1872,11 @@ pub fn lsp_loop(
                 .find_reference_queue
                 .run_until_stopped(&server, telemetry);
         });
+        if server.supports_references_code_lens() {
+            scope.spawn(|| {
+                server.code_lens_queue.run_until_stopped(&server, telemetry);
+            });
+        }
         scope.spawn(|| {
             server.sourcedb_queue.run_until_stopped(&server, telemetry);
         });
@@ -2727,10 +2745,31 @@ impl Server {
                         )
                     {
                         self.set_file_stats(params.text_document.uri.clone(), telemetry_event);
-                        self.send_response(new_response(
-                            x.id,
-                            Ok(self.code_lens(&transaction, params).unwrap_or_default()),
-                        ));
+                        let response = match self.code_lens(&transaction, params) {
+                            Ok(response) => response,
+                            Err(reason) => {
+                                telemetry_event.set_empty_response_reason(reason);
+                                None
+                            }
+                        };
+                        self.send_response(new_response(x.id, Ok(response)));
+                    }
+                } else if let Some(params) = as_request::<CodeLensResolveRequest>(&x) {
+                    if let Some(params) = self
+                        .extract_request_params_or_send_err_response::<CodeLensResolveRequest>(
+                            params, &x.id,
+                        )
+                        && let Err(error) = self.resolve_code_lens(
+                            x.id.clone(),
+                            &transaction,
+                            &params,
+                            telemetry_event.activity_key.clone(),
+                        )
+                    {
+                        if let code_lens::CodeLensError::Unavailable(reason) = &error {
+                            telemetry_event.set_empty_response_reason(reason.clone());
+                        }
+                        self.send_response(error.into_response(x.id, params));
                     }
                 } else if let Some(params) = as_request::<SemanticTokensRequest>(&x) {
                     if let Some(params) = self
@@ -3086,6 +3125,14 @@ impl Server {
             initialize_params.initialization_options.as_ref(),
         );
 
+        let supports_references_code_lens = initialize_params
+            .initialization_options
+            .as_ref()
+            .and_then(|options| options.get("pyrefly"))
+            .and_then(|options| options.get("supportsReferencesCodeLens"))
+            .and_then(Value::as_bool)
+            == Some(true);
+
         let should_request_workspace_settings = initialize_params
             .capabilities
             .workspace
@@ -3097,6 +3144,7 @@ impl Server {
             lsp_queue,
             recheck_queue: HeavyTaskQueue::new(QueueName::RecheckQueue),
             find_reference_queue: HeavyTaskQueue::new(QueueName::FindReferenceQueue),
+            code_lens_queue: HeavyTaskQueue::new(QueueName::CodeLensQueue),
             sourcedb_queue: HeavyTaskQueue::new(QueueName::SourceDbQueue),
             invalidated_source_dbs: Mutex::new(SmallSet::new()),
             build_system_status: Mutex::new(None),
@@ -3127,6 +3175,8 @@ impl Server {
             watched_patterns: Mutex::new(SmallSet::new()),
             watched_exact_paths: Mutex::new(SmallSet::new()),
             override_code_lens_refresh_support: AtomicBool::new(false),
+            supports_references_code_lens,
+            reference_code_lens_refresh_enabled: AtomicBool::new(false),
             id: Uuid::new_v4(),
             surface,
             agent_session_id,
@@ -3579,6 +3629,9 @@ impl Server {
             }
         }
         self.publish_diagnostics(diags, notebook_cell_urls, versions, source);
+        if !matches!(source, DiagnosticSource::Streaming) {
+            self.refresh_reference_code_lenses();
+        }
         if self
             .initialize_params
             .capabilities
@@ -4857,6 +4910,7 @@ impl Server {
                 self.server_mode,
             );
         }
+        self.refresh_reference_code_lenses();
 
         if modified {
             self.setup_file_watcher_if_necessary(None);
@@ -4889,6 +4943,7 @@ impl Server {
                 );
             }
         }
+        self.refresh_reference_code_lenses();
 
         if modified {
             self.setup_file_watcher_if_necessary(Some(telemetry_event));
@@ -5137,6 +5192,7 @@ impl Server {
                 ..Default::default()
             },
             activity_key,
+            ReferenceTaskKind::Interactive,
             move |transaction, handle, definition, _telemetry, _telemetry_event| {
                 let FindDefinitionItemWithDocstring {
                     metadata: _,
@@ -5618,6 +5674,7 @@ impl Server {
         position: Position,
         find_preference: FindPreference,
         activity_key: Option<ActivityKey>,
+        task_kind: ReferenceTaskKind,
         find_fn: impl FnOnce(
             &mut CancellableTransaction,
             &Handle,
@@ -5649,8 +5706,20 @@ impl Server {
             .lock()
             .insert(request_id.clone(), queued_cancellation.dupe());
         let uri_for_telemetry = uri.clone();
-        self.find_reference_queue.queue_task(
-            TelemetryEventKind::FindFromDefinition,
+        let (queue, kind, source_version) = match task_kind {
+            ReferenceTaskKind::Interactive => (
+                &self.find_reference_queue,
+                TelemetryEventKind::FindFromDefinition,
+                None,
+            ),
+            ReferenceTaskKind::CodeLens { version } => (
+                &self.code_lens_queue,
+                TelemetryEventKind::LspEvent(CodeLensResolveRequest::METHOD.to_string()),
+                Some((uri.clone(), version)),
+            ),
+        };
+        queue.queue_task(
+            kind,
             Box::new(move |server, telemetry, telemetry_event| {
                 server.set_file_stats(uri_for_telemetry, telemetry_event);
                 telemetry_event.set_activity_key(activity_key);
@@ -5662,6 +5731,12 @@ impl Server {
                             return Err(RequestError::Cancelled);
                         }
                         handles.insert(request_id.clone(), transaction.get_cancellation_handle());
+                    }
+                    if source_version
+                        .as_ref()
+                        .is_some_and(|(uri, version)| server.text_document_version(uri) != *version)
+                    {
+                        return Err(RequestError::Cancelled);
                     }
                     server.validate_in_memory_for_transaction(
                         transaction.as_mut(),
@@ -5675,7 +5750,11 @@ impl Server {
                         telemetry,
                         telemetry_event,
                     )?;
-                    if transaction.get_cancellation_handle().is_cancelled() {
+                    if transaction.get_cancellation_handle().is_cancelled()
+                        || source_version.as_ref().is_some_and(|(uri, version)| {
+                            server.text_document_version(uri) != *version
+                        })
+                    {
                         return Err(RequestError::Cancelled);
                     }
                     Ok(result)
@@ -5730,6 +5809,7 @@ impl Server {
             find_preference,
             options,
             activity_key,
+            kind,
         } = request;
         let path_remapper = self.path_remapper.clone();
         let external_references = self.external_references.clone();
@@ -5744,6 +5824,7 @@ impl Server {
             position,
             find_preference,
             activity_key,
+            kind,
             move |transaction, handle, definition, telemetry, telemetry_event| {
                 let qualified_name =
                     compute_qualified_name(transaction.as_ref(), handle, &definition);
@@ -5851,6 +5932,7 @@ impl Server {
                     ..ReferenceOptions::all(params.context.include_declaration)
                 },
                 activity_key,
+                kind: ReferenceTaskKind::Interactive,
             },
             move |results| {
                 let mut locations = Vec::new();
@@ -5891,6 +5973,7 @@ impl Server {
                 },
                 options: ReferenceOptions::textual_only(true),
                 activity_key,
+                kind: ReferenceTaskKind::Interactive,
             },
             move |results| {
                 let mut changes = HashMap::new();
@@ -6975,6 +7058,7 @@ impl Server {
             params.item.selection_range.start,
             FindPreference::default(),
             activity_key,
+            ReferenceTaskKind::Interactive,
             move |transaction, handle, definition, telemetry, telemetry_event| {
                 let qualified_name =
                     compute_qualified_name(transaction.as_ref(), handle, &definition);
@@ -7067,6 +7151,7 @@ impl Server {
             params.item.selection_range.start,
             FindPreference::default(),
             activity_key,
+            ReferenceTaskKind::Interactive,
             move |transaction, handle, definition, _telemetry, _telemetry_event| {
                 // find_global_outgoing_calls_from_function_definition expects a position
                 let position = definition.definition_range.start();
@@ -7325,6 +7410,7 @@ impl Server {
             params.item.selection_range.start,
             FindPreference::default(),
             activity_key,
+            ReferenceTaskKind::Interactive,
             move |transaction, handle, definition, _telemetry, _telemetry_event| {
                 transaction.run(&[handle.dupe()], Require::Everything, None)?;
                 let Some(target) =
@@ -7381,6 +7467,7 @@ impl Server {
             params.item.selection_range.start,
             FindPreference::default(),
             activity_key,
+            ReferenceTaskKind::Interactive,
             move |transaction, handle, definition, _telemetry, _telemetry_event| {
                 transaction.run(&[handle.dupe()], Require::Everything, None)?;
                 let Some(target) =

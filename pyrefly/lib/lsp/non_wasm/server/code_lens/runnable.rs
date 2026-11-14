@@ -64,12 +64,8 @@ pub(super) fn code_lenses(
         })
         .map(|path| path.to_string_lossy().into_owned());
 
-    let maybe_cell_idx = server.maybe_get_code_cell_index(uri);
     let mut lenses = Vec::new();
     for entry in entries {
-        if info.to_cell_for_lsp(entry.range.start()) != maybe_cell_idx {
-            continue;
-        }
         let range = info.to_lsp_range(entry.range);
         lenses.push(entry_to_lsp_code_lens(uri, range, entry, cwd.as_deref()));
     }
