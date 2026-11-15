@@ -1706,6 +1706,35 @@ issubclass(Impl, SlotNamed)
 "#,
 );
 
+// A runtime-excluded member is not required to exist, but when an
+// implementation declares one it must still have a compatible type.
+testcase!(
+    test_runtime_checkable_unsafe_overlap_excluded_member,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    _abc_marker: int
+    def m(self) -> None: ...
+
+class AnnotatedWrong:
+    _abc_marker: str
+    def m(self) -> None: ...
+
+class AssignedWrong:
+    _abc_marker = "wrong"
+    def m(self) -> None: ...
+
+class Missing:
+    def m(self) -> None: ...
+
+isinstance(AnnotatedWrong(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `AnnotatedWrong`
+isinstance(AssignedWrong(), P)   # E: Runtime checkable protocol `P` has an unsafe overlap with type `AssignedWrong`
+isinstance(Missing(), P)
+"#,
+);
+
 // An annotation-only `__slots__` declares no slot descriptors and no data.
 testcase!(
     test_runtime_checkable_protocol_annotated_slots,

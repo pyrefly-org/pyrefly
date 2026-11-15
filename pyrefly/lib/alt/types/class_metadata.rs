@@ -786,7 +786,8 @@ pub struct ProtocolMetadata {
     /// names and inherited protocol members, and is version-aware; it never
     /// contains the literal `__slots__`. Whether a name is a method depends on which
     /// class in the MRO binds it, so `is_data_protocol` decides that at the check
-    /// site.
+    /// site. The unsafe-overlap check uses this set only for presence; it compares
+    /// the declared types of `members` that the implementation provides.
     pub runtime_members: SmallSet<Name>,
     /// Whether this protocol is decorated with @runtime_checkable
     pub is_runtime_checkable: bool,

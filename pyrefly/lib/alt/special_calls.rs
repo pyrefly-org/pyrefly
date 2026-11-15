@@ -684,45 +684,62 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         }
                         // Check for unsafe overlap:
                         // https://typing.python.org/en/latest/spec/protocol.html#runtime-checkable-decorator-and-narrowing-types-by-isinstance
-                        // We need to check if there is any field with unassignable types, since the `isinstance` check only
-                        // checks for the presence of the fields, not their types.
+                        // The runtime check only verifies presence. A class can pass
+                        // it while declaring an incompatible type for a member that
+                        // CPython excludes from the runtime check. Compare the types of
+                        // the protocol members the implementation actually provides;
+                        // runtime-excluded members are not required to exist.
                         //
                         // Type arguments for the protocol are not provided, so we'll use
-                        // fresh vars and solve them during the `is_subset_eq` check below.
+                        // fresh vars and solve them during the member checks below.
                         let class_info_protocol = class_info_metadata.protocol_metadata().unwrap();
                         if let Some(object_type) = &object_or_class
                             && !object_type.is_never()
                             && let (vs, Type::ClassType(protocol_class_type)) =
                                 self.instantiate_fresh_class(class_info_cls)
                         {
-                            let mut all_members_present = true;
+                            let all_runtime_members_present = class_info_protocol
+                                .runtime_members
+                                .iter()
+                                .all(|field_name| self.has_attr(object_type, field_name));
                             let mut unsafe_overlap_errors = vec![];
-                            for field_name in &class_info_protocol.runtime_members {
-                                if !self.has_attr(object_type, field_name) {
-                                    all_members_present = false;
-                                    break;
-                                }
-                                // Unsafe overlap requires the class to be statically
-                                // incompatible with the protocol. A name outside `members`
-                                // is not part of the protocol's static contract, so it
-                                // cannot contribute to an incompatibility.
-                                if !class_info_protocol.members.contains(field_name) {
-                                    continue;
-                                }
-                                if let Err(subset_err) = self.is_protocol_subset_at_attr(
-                                    object_type,
-                                    &protocol_class_type,
-                                    field_name,
-                                    &mut |x, y| self.is_subset_eq_with_reason(x, y),
-                                ) {
-                                    let error_msg = subset_err
-                                        .to_error_msg()
-                                        .map(|msg| format!(": {msg}"))
-                                        .unwrap_or_default();
-                                    unsafe_overlap_errors.push(format!(
-                                        "Attribute `{}` has incompatible types{}",
-                                        field_name, error_msg,
-                                    ));
+                            if all_runtime_members_present {
+                                for field_name in &class_info_protocol.members {
+                                    // A runtime-excluded member is not a runtime
+                                    // requirement. Only compare members that the
+                                    // implementation declares or exposes; a bare
+                                    // annotation is still a static declaration, so
+                                    // `has_static_attr` covers it.
+                                    if !self.has_attr(object_type, field_name)
+                                        && !self.has_static_attr(object_type, field_name)
+                                    {
+                                        continue;
+                                    }
+                                    // These names are protocol machinery, not
+                                    // instance members. Keep this in sync with the
+                                    // structural checks in `subset.rs`.
+                                    if field_name == &dunder::INIT
+                                        || field_name == &dunder::NEW
+                                        || field_name == &dunder::SLOTS
+                                        || field_name == &dunder::CLASS_GETITEM
+                                    {
+                                        continue;
+                                    }
+                                    if let Err(subset_err) = self.is_protocol_subset_at_attr(
+                                        object_type,
+                                        &protocol_class_type,
+                                        field_name,
+                                        &mut |x, y| self.is_subset_eq_with_reason(x, y),
+                                    ) {
+                                        let error_msg = subset_err
+                                            .to_error_msg()
+                                            .map(|msg| format!(": {msg}"))
+                                            .unwrap_or_default();
+                                        unsafe_overlap_errors.push(format!(
+                                            "Attribute `{}` has incompatible types{}",
+                                            field_name, error_msg,
+                                        ));
+                                    }
                                 }
                             }
                             if let Err(specialization_errors) = self.finish_quantified(vs, false) {
@@ -730,7 +747,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     unsafe_overlap_errors.push(e.to_error_msg(self))
                                 }
                             }
-                            if all_members_present && !unsafe_overlap_errors.is_empty() {
+                            if all_runtime_members_present && !unsafe_overlap_errors.is_empty() {
                                 errors.error_builder(
                                     range,
                                     ErrorKind::UnsafeOverlap,
