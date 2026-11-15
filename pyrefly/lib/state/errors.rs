@@ -17,6 +17,7 @@ use dupe::Dupe;
 use pyrefly_config::error_kind::ErrorKind;
 use pyrefly_config::error_kind::Severity;
 use pyrefly_python::ignore::Ignore;
+use pyrefly_python::ignore::MalformedReason;
 use pyrefly_python::ignore::Suppression;
 use pyrefly_python::ignore::SuppressionEffect;
 use pyrefly_python::ignore::Tool;
@@ -37,6 +38,7 @@ use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::visitor::walk_expr;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
+use ruff_text_size::TextSize;
 use starlark_map::small_map::SmallMap;
 use starlark_map::small_set::SmallSet;
 
@@ -410,12 +412,12 @@ impl Errors {
         CollectedErrors::concat(modules.into_iter().flatten().collect())
     }
 
-    /// Collate every module's diagnostics, borrowing them, along with the unused-suppression
+    /// Collate every module's diagnostics, borrowing them, along with the ignore-comment
     /// diagnostics, which each module works out from its own diagnostics as it collates them.
-    pub(crate) fn collect_error_refs_with_unused_ignores(
+    pub(crate) fn collect_error_refs_with_ignore_diagnostics(
         &self,
     ) -> (BorrowedCollectedErrors<'_>, Vec<Error>) {
-        let (errors, unused): (Vec<_>, Vec<_>) = self
+        let (errors, ignore_diagnostics): (Vec<_>, Vec<_>) = self
             .map_modules(|module| {
                 let LoadErrors {
                     load,
@@ -424,12 +426,10 @@ impl Errors {
                     ..
                 } = module;
                 let module_errors = Self::collect_module_error_refs(module).unwrap_or_default();
-                let path = load.module_info.path();
-                let module_unused = Self::collect_unused_ignore_errors_for_module(
-                    &load.module_info,
+                let module_diagnostics = Self::collect_ignore_diagnostics_for_module(
+                    load,
                     module_ranges.as_deref(),
-                    &config.enabled_ignores(path),
-                    config.type_ignore_unknown_tag_behavior(path),
+                    config,
                     module_errors
                         .suppressed
                         .iter()
@@ -437,14 +437,96 @@ impl Errors {
                         .chain(&module_errors.hints)
                         .map(CollectedDiagnostic::error),
                 );
-                (module_errors, module_unused)
+                (module_errors, module_diagnostics)
             })
             .into_iter()
             .unzip();
         (
             BorrowedCollectedErrors::concat(errors),
-            unused.into_iter().flatten().collect(),
+            ignore_diagnostics.into_iter().flatten().collect(),
         )
+    }
+
+    /// Collects `invalid-ignore-comment` diagnostics for one module: comments that
+    /// look like an ignore directive but are malformed.
+    fn collect_invalid_ignore_comment_errors_for_module(
+        module: &Module,
+        enabled_ignores: &SmallSet<Tool>,
+    ) -> Vec<Error> {
+        if module.ignore().malformed().is_empty() {
+            return Vec::new();
+        }
+        let mut errors = Vec::new();
+        for malformed in module.ignore().malformed() {
+            if !enabled_ignores.contains(&malformed.tool()) {
+                continue;
+            }
+            let tool = malformed.tool();
+            let msg = match malformed.reason() {
+                MalformedReason::UnknownDirective => match tool {
+                    Tool::Pyre => {
+                        "Invalid ignore comment; did you mean `# pyre-ignore`, `# pyre-fixme`, or `# pyre: ignore`?".to_owned()
+                    }
+                    Tool::Mypy => {
+                        "Invalid ignore comment; did you mean `# mypy: ignore-errors`?".to_owned()
+                    }
+                    _ => format!(
+                        "Invalid ignore comment; did you mean `# {tool}: ignore` or `# {tool}: ignore[code]`?"
+                    ),
+                },
+                MalformedReason::UnterminatedBracket => {
+                    format!("Unterminated `[` in `# {tool}: ignore[...]` error-code list")
+                }
+                MalformedReason::EmptyBracket => {
+                    format!("Empty error-code list in `# {tool}: ignore[]`")
+                }
+            };
+            let line_start = module.lined_buffer().line_start(malformed.comment_line());
+            let range = TextRange::new(
+                line_start + TextSize::new(malformed.comment_offset() as u32),
+                line_start + TextSize::new(malformed.comment_end_offset() as u32),
+            );
+            errors.push(Error::new(
+                module.dupe(),
+                range,
+                msg,
+                Vec::new(),
+                ErrorKind::InvalidIgnoreComment,
+            ));
+        }
+        errors
+    }
+
+    /// Collects all ignore diagnostics (unused ignores and invalid ignore comments)
+    /// for one module, applying module-level suppression filters (ErrorStyle::Never,
+    /// ignore_errors_in_generated_code).
+    fn collect_ignore_diagnostics_for_module<'a>(
+        load: &Load,
+        module_ranges: Option<&ModuleRanges>,
+        config: &ConfigFile,
+        affected: impl Iterator<Item = &'a Error>,
+    ) -> Vec<Error> {
+        if load.error_style == ErrorStyle::Never {
+            return Vec::new();
+        }
+        let path = load.module_info.path();
+        let error_config = config.get_error_config(path);
+        if load.module_info.is_generated() && error_config.ignore_errors_in_generated_code {
+            return Vec::new();
+        }
+        let enabled_ignores = config.enabled_ignores(path);
+        let mut module_diagnostics = Self::collect_unused_ignore_errors_for_module(
+            &load.module_info,
+            module_ranges,
+            &enabled_ignores,
+            config.type_ignore_unknown_tag_behavior(path),
+            affected,
+        );
+        module_diagnostics.extend(Self::collect_invalid_ignore_comment_errors_for_module(
+            &load.module_info,
+            &enabled_ignores,
+        ));
+        module_diagnostics
     }
 
     /// Collate one module's diagnostics, or `None` if the module does not report any.
@@ -586,7 +668,7 @@ impl Errors {
         &'a self,
         unused: &'a mut Vec<Error>,
     ) -> (Vec<CollectedDiagnostic<'a>>, Vec<CollectedDiagnostic<'a>>) {
-        let (collected, unused_ignores) = self.collect_error_refs_with_unused_ignores();
+        let (collected, unused_ignores) = self.collect_error_refs_with_ignore_diagnostics();
         *unused = unused_ignores;
         let unused: &'a [Error] = unused;
         let config_by_path = self.config_by_path();
@@ -601,7 +683,7 @@ impl Errors {
             .ordinary
             .into_iter()
             .chain(collected.hints)
-            .chain(self.shown_unused_ignore_errors(unused))
+            .chain(self.shown_ignore_diagnostics(unused))
         {
             match config_by_path.get(&error.error().path()) {
                 Some(config) if let Some(baseline) = &config.baseline => by_config
@@ -655,18 +737,18 @@ impl Errors {
             .collect()
     }
 
-    /// The diagnostics in `unused` that their module's config shows, at the severity it
+    /// The diagnostics in `ignore_diagnostics` that their module's config shows, at the severity it
     /// gives them.
-    pub(crate) fn shown_unused_ignore_errors<'a>(
+    pub(crate) fn shown_ignore_diagnostics<'a>(
         &self,
-        unused: &'a [Error],
+        ignore_diagnostics: &'a [Error],
     ) -> Vec<CollectedDiagnostic<'a>> {
-        if unused.is_empty() {
+        if ignore_diagnostics.is_empty() {
             return Vec::new();
         }
         let config_by_path = self.config_by_path();
         let self_suppressed = self.self_suppressed_unused_ignore_ranges();
-        unused
+        ignore_diagnostics
             .iter()
             .filter_map(|error| {
                 if error.error_kind() == ErrorKind::UnusedIgnore
@@ -717,9 +799,9 @@ impl Errors {
         Self::merge_display_errors(errors.ordinary, errors.directives)
     }
 
-    pub fn collect_display_errors_with_unused_ignores(&self) -> Vec<Error> {
+    pub fn collect_display_errors_with_ignore_diagnostics(&self) -> Vec<Error> {
         let collected = self.collect_errors();
-        let unused = self.collect_unused_ignore_errors_for_display(&collected);
+        let unused = self.collect_ignore_diagnostics_for_display(&collected);
         let mut ordinary = collected.ordinary;
         ordinary.extend(unused.ordinary);
         Self::merge_display_errors(ordinary, collected.directives)
@@ -991,23 +1073,30 @@ impl Errors {
         unused_errors
     }
 
-    /// Collects unused ignore errors for display, respecting severity configuration.
-    /// Unlike `collect_unused_ignore_errors()`, this applies severity filtering so
-    /// errors with `Severity::Ignore` are not included in the ordinary results.
+    /// Collects all ignore-comment diagnostics for display, respecting severity
+    /// configuration: `unused-ignore`, plus the `invalid-ignore-comment`
+    /// lint. Each error is filtered by its own kind's configured severity, so
+    /// kinds set to `Severity::Ignore` land in `disabled` rather than `ordinary`.
     /// Accepts pre-collected errors to avoid redundant error collection.
-    pub fn collect_unused_ignore_errors_for_display(
+    pub fn collect_ignore_diagnostics_for_display(
         &self,
         collected: &CollectedErrors,
     ) -> CollectedErrors {
-        let unused_errors = self.collect_unused_ignore_errors(collected);
-        if unused_errors.is_empty() {
+        let ignore_errors = self.collect_ignore_diagnostics_from(
+            collected
+                .suppressed
+                .iter()
+                .chain(&collected.ordinary)
+                .chain(&collected.hints),
+        );
+        if ignore_errors.is_empty() {
             return CollectedErrors::default();
         }
         let mut result = CollectedErrors::default();
         let config_by_path = self.config_by_path();
         let self_suppressed = self.self_suppressed_unused_ignore_ranges();
 
-        for error in unused_errors {
+        for error in ignore_errors {
             if error.error_kind() == ErrorKind::UnusedIgnore
                 && self_suppressed.contains(&(error.path(), error.range()))
             {
@@ -1028,6 +1117,42 @@ impl Errors {
         }
 
         result
+    }
+
+    fn collect_ignore_diagnostics_from<'a>(
+        &self,
+        affected: impl Iterator<Item = &'a Error>,
+    ) -> Vec<Error> {
+        let mut affected_by_suppression_by_module: SmallMap<&ModulePath, Vec<&Error>> =
+            SmallMap::new();
+        for error in affected {
+            affected_by_suppression_by_module
+                .entry(error.path())
+                .or_default()
+                .push(error);
+        }
+        self.map_modules(|module| {
+            let LoadErrors {
+                load,
+                module_ranges,
+                config,
+                ..
+            } = module;
+            let path = load.module_info.path();
+            let affected = affected_by_suppression_by_module
+                .get(path)
+                .into_iter()
+                .flat_map(|errors| errors.iter().copied());
+            Self::collect_ignore_diagnostics_for_module(
+                load,
+                module_ranges.as_deref(),
+                config,
+                affected,
+            )
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub fn check_against_expectations(&self) -> anyhow::Result<()> {
@@ -1193,7 +1318,7 @@ def f() -> int:
 "#;
         let (errors, _tdir) = get_errors(contents);
         let collected = errors.collect_errors();
-        let unused = errors.collect_unused_ignore_errors_for_display(&collected);
+        let unused = errors.collect_ignore_diagnostics_for_display(&collected);
         assert!(unused.ordinary.is_empty());
         assert_eq!(unused.disabled.len(), 1);
         assert_eq!(unused.disabled[0].severity(), Severity::Ignore);
@@ -1326,7 +1451,7 @@ def f() -> int:
                 raw_count,
                 "{contents}",
             );
-            let display = errors.collect_unused_ignore_errors_for_display(&collected);
+            let display = errors.collect_ignore_diagnostics_for_display(&collected);
             assert_eq!(display.ordinary.len(), visible_count, "{contents}");
             assert!(display.disabled.is_empty(), "{contents}");
             assert!(display.hints.is_empty(), "{contents}");
@@ -1577,6 +1702,143 @@ def f(some_condition: bool):
         let collected = errors.collect_errors();
         let unused = errors.collect_unused_ignore_errors(&collected);
         assert!(unused.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_ignore_comment_emitted() {
+        // A typo'd directive that suppresses nothing is flagged, while the real
+        // error underneath still fires (the lint is purely additive).
+        let contents = r#"
+x: int = "oops"  # pyrefly: ignoree
+"#;
+        let (errors, _tdir) = get_errors(contents);
+        let display = errors.collect_display_errors_with_ignore_diagnostics();
+        assert!(
+            display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::InvalidIgnoreComment)
+        );
+        assert!(
+            display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::BadAssignment)
+        );
+    }
+
+    #[test]
+    fn test_invalid_ignore_comment_variants() {
+        // Unterminated and empty brackets are flagged; valid forms are not.
+        let contents = r#"
+a: int = "x"  # pyrefly: ignore[bad-assignment
+b: int = "x"  # pyrefly: ignore[]
+c: int = "x"  # pyrefly: ignore[bad-assignment]
+d = list[int]  # type: list[int]
+"#;
+        let (errors, _tdir) = get_errors(contents);
+        let display = errors.collect_display_errors_with_ignore_diagnostics();
+        let lints: Vec<_> = display
+            .into_iter()
+            .filter(|e| e.error_kind() == ErrorKind::InvalidIgnoreComment)
+            .collect();
+        assert_eq!(lints.len(), 2);
+    }
+
+    #[test]
+    fn test_empty_bracket_ignore_suppresses_nothing() {
+        // An empty-bracket ignore `# pyrefly: ignore[]` suppresses nothing,
+        // produces an `invalid-ignore-comment` warning, and skips emitting a
+        // secondary `unused-ignore` diagnostic.
+        let contents = r#"
+x: int = "oops"  # pyrefly: ignore[]
+"#;
+        let (errors, _tdir) = get_errors(contents);
+        let display = errors.collect_display_errors_with_ignore_diagnostics();
+        assert!(
+            display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::BadAssignment),
+            "empty-bracket `# pyrefly: ignore[]` must not suppress the error"
+        );
+        assert!(
+            display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::InvalidIgnoreComment),
+            "empty-bracket ignore must produce invalid-ignore-comment warning"
+        );
+        assert!(
+            !display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::UnusedIgnore),
+            "empty-bracket ignore must not produce duplicate unused-ignore error"
+        );
+    }
+
+    #[test]
+    fn test_empty_bracket_without_error_skips_unused_ignore() {
+        // Reviewer example from #5583: `x = 1  # pyrefly: ignore[]` on clean code
+        // must produce only `invalid-ignore-comment` (warn) and NEVER produce a
+        // phantom `unused-ignore` error.
+        let contents = r#"
+x = 1  # pyrefly: ignore[]
+"#;
+        let (errors, _tdir) = get_errors(contents);
+        let display = errors.collect_display_errors_with_ignore_diagnostics();
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].error_kind(), ErrorKind::InvalidIgnoreComment);
+    }
+
+    #[test]
+    fn test_invalid_ignore_comment_is_unsuppressable() {
+        // A `# pyrefly: ignore[invalid-ignore-comment]` cannot silence the lint
+        // about a malformed comment on the same line: ignore-comment diagnostics
+        // are unsuppressable, so the lint still fires in display errors.
+        let contents = r#"
+x = 1  # pyrefly: ignoree  # pyrefly: ignore[invalid-ignore-comment]
+"#;
+        let (errors, _tdir) = get_errors(contents);
+        let display = errors.collect_display_errors_with_ignore_diagnostics();
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].error_kind(), ErrorKind::InvalidIgnoreComment);
+    }
+
+    #[test]
+    fn test_ignore_comment_lints_survive_file_level_ignore_errors() {
+        // A whole-file `# pyrefly: ignore-errors` suppresses ordinary errors but
+        // not the ignore-comment diagnostics, which are unsuppressable.
+        let contents = r#"# pyrefly: ignore-errors
+x: int = "oops"  # pyrefly: ignoree
+"#;
+        let (errors, _tdir) = get_errors(contents);
+        let display = errors.collect_display_errors_with_ignore_diagnostics();
+        assert!(
+            !display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::BadAssignment),
+            "file-level `# pyrefly: ignore-errors` must suppress ordinary errors"
+        );
+        assert!(
+            display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::InvalidIgnoreComment),
+            "file-level `# pyrefly: ignore-errors` must not suppress invalid-ignore-comment"
+        );
+    }
+
+    #[test]
+    fn test_invalid_ignore_comment_skipped_in_generated_code() {
+        let contents = r#"# @generated
+x: int = 1  # type: ignore1
+"#;
+        let (errors, _tdir) = get_errors_with_config(contents, |config| {
+            config.root.ignore_errors_in_generated_code = Some(true);
+        });
+        let display = errors.collect_display_errors_with_ignore_diagnostics();
+        assert!(
+            !display
+                .iter()
+                .any(|e| e.error_kind() == ErrorKind::InvalidIgnoreComment),
+            "generated code must skip invalid-ignore-comment when configured"
+        );
     }
 
     #[test]

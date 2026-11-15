@@ -1591,7 +1591,7 @@ impl IncrementalChecker {
             |transaction, handles, mut sourcedb_errors| {
                 let diagnostics = transaction
                     .get_errors(handles)
-                    .collect_display_errors_with_unused_ignores();
+                    .collect_display_errors_with_ignore_diagnostics();
                 let mut config_errors = transaction.get_config_errors();
                 config_errors.append(&mut sourcedb_errors);
                 IncrementalCheckResult {
@@ -2266,8 +2266,8 @@ impl CheckArgs {
         // Collation and writing the report run on the state's thread pool, which the check has
         // finished with, so that they can work in parallel on the configured threads.
         let (collected, unused_ignores) =
-            transaction.install(|| loads.collect_error_refs_with_unused_ignores());
-        let shown_unused_ignores = loads.shown_unused_ignore_errors(&unused_ignores);
+            transaction.install(|| loads.collect_error_refs_with_ignore_diagnostics());
+        let shown_unused_ignores = loads.shown_ignore_diagnostics(&unused_ignores);
         let mut ordinary = collected.ordinary;
         ordinary.reserve_exact(shown_unused_ignores.len() + collected.hints.len());
         ordinary.extend(shown_unused_ignores);

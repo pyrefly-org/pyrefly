@@ -215,7 +215,7 @@ fn compute_errors(
     // Collect main errors (done once, shared with unused ignore check), in parallel on the
     // state's thread pool, which the check has finished with.
     let collected = transaction.as_ref().install(|| errors.collect_errors());
-    let unused = errors.collect_unused_ignore_errors_for_display(&collected);
+    let unused = errors.collect_ignore_diagnostics_for_display(&collected);
     let mut output_errors = collected.ordinary;
     output_errors.extend(collected.hints);
     output_errors.extend(collected.directives);

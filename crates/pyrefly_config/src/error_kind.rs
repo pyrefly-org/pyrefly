@@ -308,6 +308,11 @@ pub enum ErrorKind {
     /// An f-string format specification is incompatible with the value's static type
     /// or the known builtin formatting rules.
     InvalidFormatSpec,
+    /// A comment looks like a type checker ignore directive but is malformed, so
+    /// it silently suppresses nothing (or not what was intended). For example
+    /// `# pyrefly: ignoree` (typo), `# pyrefly: ignore[bad-code` (unterminated
+    /// bracket), or `# pyrefly: ignore[]` (empty code list).
+    InvalidIgnoreComment,
     /// An error caused by incorrect inheritance in a class or type definition.
     /// e.g. a metaclass that is not a subclass of `type`.
     InvalidInheritance,
@@ -715,6 +720,7 @@ impl ErrorKind {
             ErrorKind::InvalidCast => Severity::Ignore,
             ErrorKind::InvalidDecorator => Severity::Warn,
             ErrorKind::InvalidFormatSpec => Severity::Ignore,
+            ErrorKind::InvalidIgnoreComment => Severity::Warn,
             ErrorKind::MethodAssign => Severity::Ignore,
             ErrorKind::MisplacedIgnore => Severity::Warn,
             ErrorKind::MissingAttributePatchTarget => Severity::Warn,
@@ -804,11 +810,20 @@ impl ErrorKind {
         matches!(self, ErrorKind::UnusedIgnore | ErrorKind::UnusedTypeIgnore)
     }
 
+    /// Diagnostics about ignore comments themselves. They cannot be silenced by
+    /// an ignore comment (only by their configured severity), so they must also
+    /// be excluded from automatic suppression-comment insertion — writing a
+    /// `# pyrefly: ignore[...]` for one would produce a comment that can never
+    /// take effect.
+    pub fn is_unsuppressable(self) -> bool {
+        self.is_unused_ignore() || self == ErrorKind::InvalidIgnoreComment
+    }
+
     /// Returns whether `--suppress-errors` may write a suppression comment for
-    /// this kind. Directives are not errors, and suppressing an unused-ignore
+    /// this kind. Directives are not errors, and suppressing an unsuppressable
     /// diagnostic would only leave behind another unused ignore.
     pub fn is_suppressable(self) -> bool {
-        !self.is_directive() && !self.is_unused_ignore()
+        !self.is_directive() && !self.is_unsuppressable()
     }
 
     /// A soft diagnostic or directive does not influence overload selection or inference.
@@ -897,6 +912,7 @@ mod tests {
         assert!(!ErrorKind::RevealType.is_suppressable());
         assert!(!ErrorKind::UnusedIgnore.is_suppressable());
         assert!(!ErrorKind::UnusedTypeIgnore.is_suppressable());
+        assert!(!ErrorKind::InvalidIgnoreComment.is_suppressable());
         assert!(ErrorKind::BadAssignment.is_suppressable());
     }
 

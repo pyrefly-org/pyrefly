@@ -853,7 +853,7 @@ fn compute_bazel_errors(
     let errors = transaction.get_errors(&modules_to_check);
     // Collate in parallel on the state's thread pool, which the check has finished with.
     let collected = transaction.install(|| errors.collect_errors());
-    let unused = errors.collect_unused_ignore_errors_for_display(&collected);
+    let unused = errors.collect_ignore_diagnostics_for_display(&collected);
     let mut ordinary = collected.ordinary;
     ordinary.extend(collected.hints);
     ordinary.extend(unused.ordinary);
