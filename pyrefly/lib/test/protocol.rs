@@ -1644,8 +1644,9 @@ testcase!(
     r#"
 from typing import Any, Protocol, runtime_checkable
 
-# CPython's `typing.EXCLUDED_ATTRIBUTES` names are not protocol members even when
-# the protocol declares them explicitly.
+# CPython's `typing.EXCLUDED_ATTRIBUTES` names are not runtime protocol members
+# even when the protocol declares them explicitly. They remain static members, so
+# an implementation that lacks them is an unsafe overlap.
 @runtime_checkable
 class ProtocolWithDunders(Protocol):
     __doc__: str | None
@@ -1658,7 +1659,7 @@ class ProtocolWithDunders(Protocol):
 class Impl:
     def m(self) -> None: ...
 
-issubclass(Impl, ProtocolWithDunders)
+issubclass(Impl, ProtocolWithDunders)  # E: Runtime checkable protocol `ProtocolWithDunders` has an unsafe overlap with type `Impl`
 "#,
 );
 
@@ -1682,7 +1683,8 @@ issubclass(Impl, DictSlot)
 );
 
 // CPython skips `_abc_*` when collecting runtime protocol members, for both
-// annotations and slot names. The names remain static protocol members.
+// annotations and slot names. The names remain static protocol members, so the
+// annotation form is an unsafe overlap when the implementation lacks it.
 testcase!(
     test_runtime_checkable_protocol_abc_marker,
     r#"
@@ -1701,13 +1703,13 @@ class SlotNamed(Protocol):
 class Impl:
     def m(self) -> None: ...
 
-issubclass(Impl, Annotated)
+issubclass(Impl, Annotated)  # E: Runtime checkable protocol `Annotated` has an unsafe overlap with type `Impl`
 issubclass(Impl, SlotNamed)
 "#,
 );
 
-// A runtime-excluded member is not required to exist, but when an
-// implementation declares one it must still have a compatible type.
+// A runtime-excluded member is not required to exist, but it remains part of
+// the static contract, so an implementation that lacks it is an unsafe overlap.
 testcase!(
     test_runtime_checkable_unsafe_overlap_excluded_member,
     r#"
@@ -1731,7 +1733,26 @@ class Missing:
 
 isinstance(AnnotatedWrong(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `AnnotatedWrong`
 isinstance(AssignedWrong(), P)   # E: Runtime checkable protocol `P` has an unsafe overlap with type `AssignedWrong`
-isinstance(Missing(), P)
+isinstance(Missing(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `Missing`
+"#,
+);
+
+// A missing ordinary runtime member fails the runtime presence check, so no
+// unsafe overlap is reported even though the static contract is violated.
+testcase!(
+    test_runtime_checkable_unsafe_overlap_missing_runtime_member,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    x: int
+    def m(self) -> None: ...
+
+class MissingData:
+    def m(self) -> None: ...
+
+isinstance(MissingData(), P)
 "#,
 );
 
@@ -2053,6 +2074,46 @@ issubclass(Impl, AnnotationForm)  # E: Protocol `AnnotationForm` has non-method 
 "#,
 );
 
+// On 3.12 `__match_args__` is a runtime member, so its absence fails the runtime
+// presence check and no unsafe overlap is reported.
+testcase!(
+    test_runtime_checkable_unsafe_overlap_missing_match_args_3_12,
+    TestEnv::new_with_version(PythonVersion::new(3, 12, 0)),
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __match_args__: tuple[str, ...]
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+isinstance(Impl(), P)
+"#,
+);
+
+// On 3.13+ `__match_args__` is runtime-excluded, so a missing one is an unsafe
+// overlap against the static contract.
+testcase!(
+    test_runtime_checkable_unsafe_overlap_missing_match_args_3_13,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __match_args__: tuple[str, ...]
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+isinstance(Impl(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `Impl`
+"#,
+);
+
 // On 3.8 `__class_getitem__` is not excluded from the runtime attribute set.
 // An explicit non-callable binding shadows the inherited
 // `Generic.__class_getitem__` and makes the protocol a data protocol.
@@ -2116,7 +2177,8 @@ issubclass(Impl, P)  # E: Protocol `P` has non-method members and cannot be used
 "#,
 );
 
-// `__annotate__` is excluded starting in 3.14.
+// `__annotate__` is excluded starting in 3.14. An implementation that lacks it
+// passes the runtime check but violates the static contract.
 testcase!(
     test_runtime_checkable_excluded_annotate_3_13,
     TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
@@ -2149,7 +2211,7 @@ class P(Protocol):
 class Impl:
     def m(self) -> None: ...
 
-issubclass(Impl, P)
+issubclass(Impl, P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `Impl`
 "#,
 );
 

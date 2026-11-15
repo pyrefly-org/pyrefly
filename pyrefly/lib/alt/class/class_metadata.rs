@@ -95,10 +95,7 @@ use crate::types::literal::Lit;
 use crate::types::types::CalleeKind;
 use crate::types::types::Type;
 
-/// Attributes excluded by `typing._get_protocol_attrs` at runtime.
-/// Static membership is a separate question: see `ProtocolMetadata::members`.
 const RUNTIME_EXCLUDED_ATTRIBUTES: &[&str] = &[
-    "_MutableMapping__marker",
     "_is_protocol",
     "_is_runtime_protocol",
     "__abstractmethods__",
@@ -116,21 +113,30 @@ const RUNTIME_EXCLUDED_ATTRIBUTES: &[&str] = &[
     "__weakref__",
 ];
 
-/// Whether CPython's `typing._get_protocol_attrs` excludes `name` from the runtime
-/// attribute set of a protocol on `version`.
 fn is_excluded_runtime_attribute(name: &Name, version: PythonVersion) -> bool {
     let name = name.as_str();
     if RUNTIME_EXCLUDED_ATTRIBUTES.contains(&name) {
         return true;
     }
-    // ABCMeta injects `_abc_*`s into class dictionaries, but they will be ignored.
+    // Ignore internal `_abc_*` attributes injected into class dictionaries by `ABCMeta`.
     if name.starts_with("_abc_") {
         return true;
     }
     match name {
+        // Users assign `= classmethod(types.GenericAlias)` for PEP 585-style generic
+        // subscription, or `= None` to disable it.
         "__class_getitem__" => version.at_least(3, 9),
+
+        // CPython 3.13 stops treating a declared `__match_args__` as a runtime protocol
+        // member (gh-110682).
         "__match_args__" => version.at_least(3, 13),
-        "__annotate__" | "__annotate_func__" | "__annotations_cache__" => version.at_least(3, 14),
+
+        // PEP 749 exposes `__annotate__` as a public attribute of types and functions,
+        // making it part of the typing surface.
+        "__annotate__" => version.at_least(3, 14),
+
+        // Falling through here means either there is no realistic use case or the name
+        // should not be excluded. If you insist it should be, please open an issue.
         _ => false,
     }
 }

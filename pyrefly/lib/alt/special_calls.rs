@@ -684,11 +684,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         }
                         // Check for unsafe overlap:
                         // https://typing.python.org/en/latest/spec/protocol.html#runtime-checkable-decorator-and-narrowing-types-by-isinstance
-                        // The runtime check only verifies presence. A class can pass
-                        // it while declaring an incompatible type for a member that
-                        // CPython excludes from the runtime check. Compare the types of
-                        // the protocol members the implementation actually provides;
-                        // runtime-excluded members are not required to exist.
+                        // Presence decides whether an overlap is reported, but every static
+                        // member is type-checked, including runtime-excluded ones the
+                        // implementation does not provide.
                         //
                         // Type arguments for the protocol are not provided, so we'll use
                         // fresh vars and solve them during the member checks below.
@@ -705,19 +703,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             let mut unsafe_overlap_errors = vec![];
                             if all_runtime_members_present {
                                 for field_name in &class_info_protocol.members {
-                                    // A runtime-excluded member is not a runtime
-                                    // requirement. Only compare members that the
-                                    // implementation declares or exposes; a bare
-                                    // annotation is still a static declaration, so
-                                    // `has_static_attr` covers it.
-                                    if !self.has_attr(object_type, field_name)
-                                        && !self.has_static_attr(object_type, field_name)
-                                    {
-                                        continue;
-                                    }
-                                    // These names are protocol machinery, not
-                                    // instance members. Keep this in sync with the
-                                    // structural checks in `subset.rs`.
+                                    // Protocol machinery, not instance members; `subset.rs`'s
+                                    // `is_subset_protocol_inner` skips the same four names.
                                     if field_name == &dunder::INIT
                                         || field_name == &dunder::NEW
                                         || field_name == &dunder::SLOTS
@@ -815,24 +802,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    /// Check if a protocol is a data protocol (has non-method members).
+    /// Check if a protocol is a data protocol (has non-method members)
     ///
-    /// CPython classifies a runtime member with `callable(getattr(cls, name))`, so the
-    /// nearest class in the MRO that binds the name to a value decides whether it is a
-    /// method. A class body that only annotates the name creates no class attribute, so
-    /// it does not shadow a slot. A `property` object is not callable, so a property
-    /// binding is a data member. Any other binding, and a member with no binding at all,
-    /// is classified by its declared read type, which is the type an implementation must
-    /// provide. A slot declaration with no nearer binding is a data member because the
-    /// slot descriptor is never callable and attribute lookup reports the declared type
-    /// rather than that descriptor.
+    /// Mirrors CPython's runtime check `callable(getattr(cls, name))`:
+    /// - `property` objects and `__slots__` descriptors are never callable (data members).
+    /// - Other members fall back to checking if their declared read type is callable.
     fn is_data_protocol(&self, cls: &Class, range: TextRange) -> bool {
         let Some(protocol_metadata) = self.get_metadata_for_class(cls).protocol_metadata() else {
             return false;
         };
         let class_type = self.heap.mk_class_type(self.as_class_type_unchecked(cls));
-        // `ancestors_no_object` omits `cls` itself, `Protocol`, `Generic`, and
-        // `object`, which CPython also skips when it collects protocol members.
+        // Skips `Protocol`, `Generic`, and `object`, matching CPython.
         let ancestors = self.get_mro_for_class(cls).ancestors_no_object();
         for field_name in &protocol_metadata.runtime_members {
             for ancestor in
@@ -842,8 +822,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     fields.class_body_fields().any(|name| name == field_name)
                         && fields.is_field_initialized_on_class(field_name)
                 }) {
-                    // The nearest binding is in a class body. A `property` object is not
-                    // callable, so it is a data member regardless of its read type.
+                    // `property`s cannot be `callable` -> data member
                     if self
                         .get_field_from_current_class_only(ancestor, field_name)
                         .is_some_and(|field| field.is_property())
@@ -858,9 +837,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     .slots_info()
                     .is_some_and(|slots| slots.names.contains(field_name))
                 {
-                    // A slot descriptor is never callable, and attribute lookup reports
-                    // the declared type rather than that descriptor, so an unshadowed
-                    // slot name is a data member.
+                    // Slot descriptors cannot be `callable` -> data member
                     return true;
                 }
             }
