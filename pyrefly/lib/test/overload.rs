@@ -2343,6 +2343,40 @@ f(3.14)  # E: `float` is not assignable to parameter `x` with type `int`
     "#,
 );
 
+// Regression test for https://github.com/facebook/pyrefly/issues/5217
+testcase!(
+    test_overload_error_bad_self_argument,
+    r#"
+from typing import assert_type, overload
+
+class A:
+    @overload
+    def meth(self, a: int) -> int: ...
+    @overload
+    def meth(self, a: str) -> str: ...
+    def meth(self, a: int | str) -> int | str: ...
+
+class B:
+    meth = A.meth
+
+class C[T]:
+    @overload
+    def f(self: C[int], x: int) -> int: ...
+    @overload
+    def f(self: C[str], x: str) -> str: ...
+    def f(self, x: int | str) -> int | str: ...
+
+def test(b: B, c: C[str]):
+    # Only `self` is wrong, and every overload expects the same `self`, so there's no need to
+    # mention overloads.
+    assert_type(b.meth(1), int)  # E: Argument `B` is not assignable to parameter `self` with type `A` in function `A.meth`
+    # The argument doesn't match any overload either.
+    b.meth(1.5)  # E: No matching overload found for function `A.meth`
+    # The overloads expect different types of `self`, and another overload accepts `c`.
+    c.f(1)  # E: No matching overload found for function `C.f`
+    "#,
+);
+
 testcase!(
     test_varargs_materialization,
     r#"

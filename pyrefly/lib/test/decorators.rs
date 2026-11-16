@@ -3043,7 +3043,7 @@ class A:
 
 assert_type(A().g(1), int)
 assert_type(A().g("hello"), str)
-A.f(1)  # E: No matching overload
+A.f(1)  # E: Argument `type[A]` is not assignable
 "#,
 );
 
