@@ -39,8 +39,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/clipboard.js/2.0.0/clipboard.min.js"></script>
 <script src="/js/code-block-buttons.js"></script>
 <script src="/js/gtag-fragment-tracking.js"></script><link rel="stylesheet" href="/assets/css/styles.519bb944.css">
-<script src="/assets/js/runtime~main.67a594be.js" defer="defer"></script>
-<script src="/assets/js/main.681fef49.js" defer="defer"></script>
+<script src="/assets/js/runtime~main.aa589d0c.js" defer="defer"></script>
+<script src="/assets/js/main.8b318dd2.js" defer="defer"></script>
 </head>
 <body class="navigation-with-keyboard">
 <script>!function(){function t(t){document.documentElement.setAttribute("data-theme",t)}var e=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme")}catch(t){}}();t(null!==e?e:"dark")}(),function(){try{const n=new URLSearchParams(window.location.search).entries();for(var[t,e]of n)if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script>
@@ -143,6 +143,13 @@ resolve imports.</p>
 See <a href="/en/docs/configuration/#environment-autoconfiguration">Environment Autoconfiguration</a>
 for more information on finding interpreters.</li>
 </ol>
+<p>A module found through the site package path is part of the importer&#x27;s environment. When
+files use different configurations, as in the language server or <code>pyrefly check</code> with file
+arguments, the module&#x27;s own configuration may have a different site package path. So may
+the default configuration, which a module outside any configuration uses. Pyrefly then
+resolves the module&#x27;s imports through the importer&#x27;s site package path, as Python does at
+runtime. See
+<a href="/en/docs/IDE/#configuration-selection">IDE configuration selection</a> for an example.</p>
 <h2 class="anchor anchorWithStickyNavbar_LWe7" id="stub-files-vs-source-files">Stub Files vs Source Files<a href="#stub-files-vs-source-files" class="hash-link" aria-label="Direct link to Stub Files vs Source Files" title="Direct link to Stub Files vs Source Files">​</a></h2>
 <p>A
 <a href="https://typing.python.org/en/latest/spec/distributing.html#stub-files" target="_blank" rel="noopener noreferrer">stub file</a>
@@ -157,9 +164,11 @@ when available, since they contain the interfaces a library exposes to developer
 example of this includes the popular library <a href="https://github.com/pandas-dev/pandas" target="_blank" rel="noopener noreferrer"><code>pandas</code></a>,
 and its stub package, <a href="https://github.com/pandas-dev/pandas-stubs" target="_blank" rel="noopener noreferrer"><code>pandas-stubs</code></a>.</p>
 <p>When importing from a non-stubs package, Pyrefly loads typing information from
-imports by first searching for a relevant <code>-stubs</code> package, then by looking at
-the non-stubs package&#x27;s <code>.pyi</code> files, then falls back to a <code>.py</code> file. A <code>-stubs</code>
-directory only overrides modules it provides: a stub package without a top-level
+imports by first searching for a relevant <code>-shape-stubs</code> package, then a <code>-stubs</code>
+package, then the non-stubs package&#x27;s <code>.pyi</code> files, and finally a <code>.py</code> file.
+<code>-shape-stubs</code> packages are specific to Pyrefly and are ignored when
+<a href="/en/docs/configuration/#use-shape-comments-and-stubs"><code>use-shape-comments-and-stubs</code></a> is <code>false</code>.
+A stub directory only overrides modules it provides: a stub package without a top-level
 <code>__init__.pyi</code> does not hide the runtime package&#x27;s <code>__init__.py</code>. See
 <a href="#absolute-imports">Absolute Imports</a> for details on when non-stubs packages
 are allowed to be used for types, and how you can override that behavior.</p>
@@ -183,6 +192,9 @@ environment. However, since resolving module locations through an import hook
 operate without code execution. Consequently, when an editable install is configured to use import hooks, Pyrefly
 will be unable to automatically locate and analyze the corresponding source files, resulting in incomplete type checking and
 code analysis.</p>
+<p>A project installed in editable mode resolves its imports in the environment it is installed
+into, even if it has its own configuration and virtual environment. See
+<a href="#site-packages-path">Site Packages Path</a>.</p>
 <p>Setuptools build system uses import hooks by default for editable installations. To ensure compatibility between
 setuptools-based editable installs and Pyrefly, setuptools must be configured to use path-based <code>.pth</code> files instead.
 This configuration should be performed through the build frontend (such as <code>pip</code>) by specifying the appropriate

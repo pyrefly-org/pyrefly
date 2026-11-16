@@ -123,6 +123,10 @@ correspond to different but useful ways we expect most people to interact with P
       filtered to that directory. Directories with different configs are different projects,
       and one run checks all of them: each file belongs to the given project whose config root
       is its nearest ancestor, and is checked once, with that config.
+      A given directory is checked even if `project-excludes` excludes it: an exclude that
+      matches the directory, or one of its parents, does not apply. The other excludes still
+      apply to the files under it, such as `**/generated`. Pass `--force-exclude` to skip a
+      given directory that the excludes match instead.
 - **Per-file** or **Single-file** mode: when given files (and optionally [`--project-excludes`](#project-excludes))
   during a CLI invocation, find the relevant config file for each file listed.
   `project-includes` and `project-excludes` are ignored from the config file, but it is used
@@ -159,7 +163,9 @@ we find the config for each file matched by the pattern provided.
 
 The language server finds a configuration separately for each source file because one
 session can serve multiple projects. The language server also runs the search for each
-imported file. The per-file search can produce different IDE and project-mode CLI results.
+imported file, but a file found through the importer's site package path resolves its imports
+in the importer's Python environment. The per-file search can produce different IDE and
+project-mode CLI results.
 See [IDE configuration selection](./IDE.mdx#configuration-selection) for details and ways
 to configure external source trees.
 
@@ -225,6 +231,15 @@ or remove `project-excludes`.
   exclude items in your [`search-path`](#search-path).
 - Flag equivalent: `--project-excludes`, which replaces `project-excludes`.
   `--extend-project-excludes` adds patterns to `project-excludes` instead.
+  `--force-exclude` applies the excludes to the paths given in the CLI invocation too.
+  How the flags apply to each kind of check:
+
+  | Flag | `pyrefly check` | `pyrefly check dir` | `pyrefly check file.py` |
+  |---|---|---|---|
+  | None | The config's `project-excludes` | The config's `project-excludes`, except the ones that match `dir` | The default excludes. The config's `project-excludes` are not used |
+  | `--project-excludes X` | `X` replaces the config's `project-excludes` | `X` replaces the config's `project-excludes`. An `X` that matches `dir` does not apply | `X` replaces the default excludes. A file that `X` matches is not checked |
+  | `--extend-project-excludes X` | `X` is added to the config's `project-excludes` | `X` is added to the config's `project-excludes`. An `X` that matches `dir` does not apply | `X` is added to the default excludes. A file that `X` matches is not checked |
+  | `--force-exclude` | No effect | `dir` is skipped if the excludes match it | `file.py` is skipped if the `project-excludes` of its config match it |
 - Equivalent configs: `exclude` in Pyright and mypy
 - Notes:
     - While not explicitly part of `project-excludes`, there are several patterns that are
@@ -1169,6 +1184,22 @@ valid for a parameter, is ignored without an error.
 - Type: `bool`
 - Default: `false`
 - Flag equivalent: `--infer-param-types-from-docstring`
+
+### `use-shape-comments-and-stubs`
+
+Enables Pyrefly-specific shape information in `# shapes:` / `# shaped:` comments
+and `{package}-shape-stubs` packages throughout the project. Set this to `false`
+to ignore both and use ordinary annotations and stubs instead. Native shape
+annotations keep their normal semantics regardless of this setting. This is a
+project-level option, not a `sub-config` setting.
+
+Dependencies outside the project may use their own default config in the IDE and
+in per-file `pyrefly check`; for per-file `check`,
+`--use-shape-comments-and-stubs=false` applies the opt-out to those dependencies too.
+
+- Type: `bool`
+- Default: `true`
+- Flag equivalent: `--use-shape-comments-and-stubs=false` to opt out
 
 ### `strict-callable-subtyping`
 
