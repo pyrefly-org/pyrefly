@@ -84,14 +84,12 @@ pub enum SpecialExport {
     BuiltinsFloat,
     Deprecated,
     Final,
+    ClassVar,
     TypingMapping,
     TypeForm,
-    UsesShapeDsl,
-    ShapeDslFunction,
     TypeShapeDslFunction,
     MapIntTuples,
     NamedInts,
-    ShapedArray,
     StaticJaxtyping,
     Shaped,
     ShapeVars,
@@ -180,14 +178,12 @@ impl SpecialExport {
             "float" => Some(Self::BuiltinsFloat),
             "deprecated" => Some(Self::Deprecated),
             "Final" => Some(Self::Final),
+            "ClassVar" => Some(Self::ClassVar),
             "Mapping" => Some(Self::TypingMapping),
             "TypeForm" => Some(Self::TypeForm),
-            "uses_shape_dsl" => Some(Self::UsesShapeDsl),
-            "shape_dsl_function" => Some(Self::ShapeDslFunction),
-            "type_shape_dsl_function" => Some(Self::TypeShapeDslFunction),
+            "shape_transform" | "type_shape_dsl_function" => Some(Self::TypeShapeDslFunction),
             "MapIntTuples" => Some(Self::MapIntTuples),
             "NamedInts" => Some(Self::NamedInts),
-            "shaped_array" => Some(Self::ShapedArray),
             "static_jaxtyping" => Some(Self::StaticJaxtyping),
             "ProxyMethod" => Some(Self::ProxyMethod),
             "Sentinel" => Some(Self::Sentinel),
@@ -236,6 +232,7 @@ impl SpecialExport {
             | Self::TypingList
             | Self::TypingTuple
             | Self::Final
+            | Self::ClassVar
             | Self::TypingMapping
             | Self::TypeForm => {
                 matches!(m.as_str(), "typing" | "typing_extensions")
@@ -286,10 +283,7 @@ impl SpecialExport {
                 "typing" | "typing_extensions" | "collections.abc"
             ),
             Self::Deprecated => matches!(m.as_str(), "warnings" | "typing_extensions"),
-            Self::UsesShapeDsl => matches!(m.as_str(), "shape_extensions"),
-            Self::ShapeDslFunction => matches!(m.as_str(), "shape_extensions.dsl"),
             Self::TypeShapeDslFunction => matches!(m.as_str(), "shape_extensions"),
-            Self::ShapedArray => matches!(m.as_str(), "shape_extensions"),
             Self::StaticJaxtyping => matches!(m.as_str(), "shape_extensions"),
             Self::Shaped => matches!(m.as_str(), "shape_extensions"),
             Self::ShapeVars => matches!(m.as_str(), "shape_extensions"),

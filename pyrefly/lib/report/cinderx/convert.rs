@@ -13,6 +13,7 @@ use pyrefly_types::class::Class;
 use pyrefly_types::identity::IdentityIgnored;
 use pyrefly_types::literal::Lit;
 use pyrefly_types::quantified::Quantified;
+use pyrefly_types::quantified::TypeVarLike;
 use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_types::type_var::Restriction;
 use pyrefly_types::typed_dict::TypedDict;
@@ -449,10 +450,8 @@ pub(crate) fn type_to_structured(
         | Type::TypeForm(_)
         | Type::Sentinel(_)
         | Type::ElementOfTypeVarTuple(_)
-        | Type::ShapedArray(_)
         | Type::IntTuple(_)
         | Type::NamedInts(_)
-        | Type::NNModule(_)
         | Type::DataFrame(_)
         | Type::Series(_)
         | Type::Int(_)

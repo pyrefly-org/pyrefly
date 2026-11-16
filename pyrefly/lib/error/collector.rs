@@ -31,7 +31,7 @@ use crate::error::style::ErrorStyle;
 use crate::module::module_info::ModuleInfo;
 use crate::state::errors::find_containing_range;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 struct ModuleErrors {
     /// Set to `true` when we have no duplicates and are sorted.
     clean: bool,
@@ -49,6 +49,17 @@ impl ModuleDiagnostics {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &Error> {
         self.0.iter()
+    }
+
+    /// Replay finalized diagnostics into an inference attempt while retaining the snapshot.
+    pub(crate) fn replay(&self, errors: &ErrorCollector) {
+        if errors.is_active() {
+            let replayed = ModuleErrors {
+                clean: true,
+                items: self.0.to_vec(),
+            };
+            errors.errors.lock().extend(replayed);
+        }
     }
 }
 
@@ -203,6 +214,10 @@ pub(crate) struct CollectedDiagnostic<'a> {
     error: &'a Error,
     severity: Severity,
     baseline_status: BaselineStatus,
+    /// The match's `baseline-error-level` is unset. An open file shows it as an
+    /// LSP hint, which `to_diagnostic_with_severity` does not produce for an
+    /// untagged hint.
+    unconfigured_baseline_hint: bool,
 }
 
 impl<'a> CollectedDiagnostic<'a> {
@@ -211,6 +226,7 @@ impl<'a> CollectedDiagnostic<'a> {
             error,
             severity,
             baseline_status: error.baseline_status(),
+            unconfigured_baseline_hint: false,
         }
     }
 
@@ -231,6 +247,17 @@ impl<'a> CollectedDiagnostic<'a> {
             baseline_status,
             ..self
         }
+    }
+
+    pub(crate) fn with_unconfigured_baseline_hint(self) -> Self {
+        Self {
+            unconfigured_baseline_hint: true,
+            ..self
+        }
+    }
+
+    pub(crate) fn unconfigured_baseline_hint(self) -> bool {
+        self.unconfigured_baseline_hint
     }
 
     pub(crate) fn into_error(self) -> Error {
@@ -292,7 +319,14 @@ impl BorrowedCollectedErrors<'_> {
 }
 
 /// Collects the user errors (e.g. type errors) associated with a module.
-// Deliberately don't implement Clone,
+///
+/// IMPORTANT: to avoid accidentally duplicating or dropping errors, or coupling semantic decisions
+/// to diagnostic collection, the error collector:
+/// - Deliberately does not implement `Clone`.
+/// - Avoids examining specific errors for the purpose of influencing downstream analysis. I.e., do
+///   not add anything like a non-private `has_error_message` or `has_error_kind`.
+/// - Only consumes other error collectors (i.e., takes ownership of them when taking errors). Do
+///   not copy errors from borrowed collectors.
 #[derive(Debug)]
 pub struct ErrorCollector {
     module_info: ModuleInfo,
@@ -329,14 +363,6 @@ impl ErrorCollector {
     pub fn extend(&self, other: ErrorCollector) {
         if self.is_active() {
             self.errors.lock().extend(other.errors.into_inner());
-        }
-    }
-
-    /// Copies diagnostics from cached inference into the current attempt.
-    pub(crate) fn extend_from(&self, other: &ErrorCollector) {
-        if self.is_active() {
-            let errors = other.errors.lock().clone();
-            self.errors.lock().extend(errors);
         }
     }
 
@@ -449,15 +475,6 @@ impl ErrorCollector {
 
     pub fn is_empty(&self) -> bool {
         self.errors.lock().is_empty()
-    }
-
-    /// Whether the collector holds an error of the given kind.
-    pub(crate) fn has_error_kind(&self, kind: ErrorKind) -> bool {
-        self.errors
-            .lock()
-            .items
-            .iter()
-            .any(|error| error.error_kind() == kind)
     }
 
     pub fn len(&self) -> usize {
@@ -716,6 +733,34 @@ impl ErrorBuilder<'_> {
         self
     }
 
+    /// Append a diagnostic's details and editor metadata without repeating its header.
+    /// Duplicate details, annotations, and fixes are included once.
+    pub(crate) fn with_error_details(mut self, error: &Error) -> Self {
+        if self.active {
+            if let Some(details) = error.msg_details() {
+                let details = details
+                    .strip_prefix("  ")
+                    .expect("error details are indented")
+                    .to_owned();
+                if !self.details.contains(&details) {
+                    self.details.push(details);
+                }
+            }
+            for annotation in error.secondary_annotations() {
+                let annotation = (annotation.range, annotation.label.to_string());
+                if !self.annotations.contains(&annotation) {
+                    self.annotations.push(annotation);
+                }
+            }
+            for fix in error.quick_fixes() {
+                if !self.quick_fixes.contains(fix) {
+                    self.quick_fixes.push(fix.clone());
+                }
+            }
+        }
+        self
+    }
+
     /// Add a secondary labeled span.
     pub fn with_annotation(mut self, range: TextRange, label: String) -> Self {
         if self.active {
@@ -787,7 +832,6 @@ impl ErrorBuilder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::collections::HashMap;
     use std::path::Path;
     use std::path::PathBuf;
@@ -808,6 +852,40 @@ mod tests {
 
     fn add(errors: &ErrorCollector, range: TextRange, kind: ErrorKind, msg: String) {
         errors.error_builder(range, kind, msg).emit();
+    }
+
+    #[test]
+    fn test_error_builder_merges_details_and_metadata() {
+        let mi = ModuleInfo::new(
+            ModuleName::from_name(&Name::new_static("main")),
+            ModulePath::filesystem(Path::new("main.py").to_owned()),
+            Arc::new("contents".to_owned()),
+        );
+        let range = TextRange::new(TextSize::new(1), TextSize::new(2));
+        let error = Error::new(
+            mi.dupe(),
+            range,
+            "Protocol failure".to_owned(),
+            vec![
+                "Enter failed\n    Explanation".to_owned(),
+                "Exit failed".to_owned(),
+            ],
+            ErrorKind::BadContextManager,
+        )
+        .with_annotation(range, "Enter".to_owned())
+        .with_quick_fix(ErrorQuickFix::AssertNotNone);
+        let merged = ErrorCollector::new(mi, ErrorStyle::Delayed);
+        merged
+            .error_builder(
+                range,
+                ErrorKind::BadContextManager,
+                "Protocol failure".to_owned(),
+            )
+            .with_error_details(&error)
+            .with_error_details(&error)
+            .emit();
+        let merged = merged.finish();
+        assert_eq!(merged.iter().collect::<Vec<_>>(), vec![&error]);
     }
 
     #[test]
@@ -851,7 +929,7 @@ mod tests {
         assert_eq!(
             errors
                 .collect(&ErrorConfig::new(
-                    Cow::Owned(ErrorDisplayConfig::default()),
+                    Arc::new(ErrorDisplayConfig::default()),
                     false,
                     Tool::default_enabled(),
                     TypeIgnoreUnknownTagBehavior::NoEffect,
@@ -970,7 +1048,7 @@ mod tests {
             (ErrorKind::NotIterable, Severity::Ignore),
         ]));
         let config = ErrorConfig::new(
-            Cow::Owned(display_config),
+            Arc::new(display_config),
             false,
             Tool::default_enabled(),
             TypeIgnoreUnknownTagBehavior::NoEffect,
@@ -1006,7 +1084,7 @@ mod tests {
         let display_config =
             ErrorDisplayConfig::new(HashMap::from([(ErrorKind::BadAssignment, Severity::Hint)]));
         let config = ErrorConfig::new(
-            Cow::Owned(display_config),
+            Arc::new(display_config),
             false,
             Tool::default_enabled(),
             TypeIgnoreUnknownTagBehavior::NoEffect,
@@ -1034,7 +1112,7 @@ mod tests {
 
         let display_config = ErrorDisplayConfig::default();
         let config0 = ErrorConfig::new(
-            Cow::Borrowed(&display_config),
+            Arc::new(display_config.clone()),
             false,
             Tool::default_enabled(),
             TypeIgnoreUnknownTagBehavior::NoEffect,
@@ -1051,7 +1129,7 @@ mod tests {
             "misplaced".to_owned(),
         );
         let config1 = ErrorConfig::new(
-            Cow::Owned(display_config),
+            Arc::new(display_config),
             true,
             Tool::default_enabled(),
             TypeIgnoreUnknownTagBehavior::NoEffect,
@@ -1082,7 +1160,7 @@ mod tests {
         assert_eq!(
             errors
                 .collect(&ErrorConfig::new(
-                    Cow::Owned(ErrorDisplayConfig::default()),
+                    Arc::new(ErrorDisplayConfig::default()),
                     false,
                     Tool::default_enabled(),
                     TypeIgnoreUnknownTagBehavior::NoEffect,

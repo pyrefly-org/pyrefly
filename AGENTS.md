@@ -121,8 +121,20 @@ run alone does not establish cross-platform correctness.
   concepts, because doing so reduces comprehensibility.
 - Write comments and documentation as statements of current truth. Never narrate
   corrections, prior framings, or what changed.
-- When adding or modifying configuration options or command line flags, the corresponding
-  docs should be updated.
+
+### User-facing documentation
+
+User-facing documentation should be concise and include only the information
+necessary to understand how to use Pyrefly. Focus on explaining key concepts.
+Do not exhaustively enumerate implementation details or edge case behavior.
+
+When adding or modifying configuration options, command line flags, or error
+kinds, make the *minimal* updates to the corresponding docs to keep them
+complete and up-to-date. Every error kind should have a small, self-contained
+code example.
+
+**When fixing a bug, do not make the documentation longer.** Only fix
+inaccuracies in the existing documentation.
 
 ## Commit Messages
 
@@ -134,6 +146,11 @@ Do not write a laundry list of implementation changes. Focus on:
 - **Why**: what problem or design gap motivated the change
 - **What** (high level): the approach or solution, not individual file edits
 - **Why it works**: how the code changes realize the solution
+
+## Shape-stub packaging
+
+Before changing `tensor-shapes` package layouts, dependencies, or the shape-stub
+build/publish workflows, read `tensor-shapes/AGENTS.md`.
 
 ## Development environments
 

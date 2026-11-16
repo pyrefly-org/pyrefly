@@ -161,7 +161,6 @@ CORPUS = (
             "astral",
             "attrs",
             "awesomeversion",
-            "cryptography",
             "httpx",
             "jinja2",
             "orjson",
@@ -283,6 +282,11 @@ def build_with_pgo(
     # Cargo profile would change the hash in every symbol name, and LLVM matches
     # profile records to functions by symbol name.
     instrumented_dir = target_dir / "instrumented"
+    instrument = f"-Cprofile-generate={profile_dir}"
+    if target == "aarch64-pc-windows-msvc":
+        # MSVC's linker leaves the function names out of the profiles that an
+        # instrumented ARM64 executable writes, so LLVM cannot read them.
+        instrument += " -Clinker=rust-lld"
     run(
         [
             *cargo_build(target, debug, "rustc"),
@@ -291,9 +295,7 @@ def build_with_pgo(
         environment=environment
         | {
             "CARGO_TARGET_DIR": str(instrumented_dir),
-            "RUSTFLAGS": append_flags(
-                environment.get("RUSTFLAGS"), f"-Cprofile-generate={profile_dir}"
-            ),
+            "RUSTFLAGS": append_flags(environment.get("RUSTFLAGS"), instrument),
         },
     )
     binary = built_binary(instrumented_dir, target, debug)
@@ -548,7 +550,8 @@ def check_program_header_address(readobj: Path, binary: Path) -> None:
     """Fail unless the program headers are mapped at their file offset.
 
     Older kernels compute `AT_PHDR` from the file offset of the program header
-    table, so a binary that maps it elsewhere crashes in the dynamic loader.
+    table, so a binary that maps it elsewhere crashes in the dynamic loader, or,
+    for a static PIE, which has no `PT_PHDR`, in its own startup code.
     """
     (elf,) = json.loads(
         subprocess.check_output(
@@ -562,11 +565,27 @@ def check_program_header_address(readobj: Path, binary: Path) -> None:
         )
     )
     offset = elf["ElfHeader"]["ProgramHeaderOffset"]
-    for entry in elf["ProgramHeaders"]:
-        header = entry["ProgramHeader"]
-        if header["Type"]["Name"] == "PT_PHDR" and header["VirtualAddress"] == offset:
-            return
-    raise RuntimeError(f"Program headers are not mapped at address {offset:#x}")
+    headers = [entry["ProgramHeader"] for entry in elf["ProgramHeaders"]]
+    phdr = [h for h in headers if h["Type"]["Name"] == "PT_PHDR"]
+    if phdr:
+        address = phdr[0]["VirtualAddress"]
+    else:
+        loads = [
+            h
+            for h in headers
+            if h["Type"]["Name"] == "PT_LOAD"
+            and h["Offset"] <= offset < h["Offset"] + h["FileSize"]
+        ]
+        if len(loads) != 1:
+            raise RuntimeError(
+                f"Expected one loadable segment to contain the program headers "
+                f"at {offset:#x}, found {len(loads)}"
+            )
+        address = loads[0]["VirtualAddress"] + offset - loads[0]["Offset"]
+    if address != offset:
+        raise RuntimeError(
+            f"Program headers are mapped at {address:#x}, not {offset:#x}"
+        )
 
 
 def replace_wheel_binary(wheel: Path, binary: Path) -> None:

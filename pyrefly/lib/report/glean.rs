@@ -290,6 +290,28 @@ class Outer:
 totals = [n * 2 for n in range(3)]
 "#;
 
+    let string_literal = r#"from enum import StrEnum
+from typing import Literal, LiteralString
+
+def plain(word: str) -> str:
+    return word.title()
+
+def literal(word: Literal["red"]) -> str:
+    return word.title()
+
+def literal_string(word: LiteralString) -> str:
+    return word.title()
+
+def joined(parts: list[str]) -> str:
+    return ", ".join(parts)
+
+class Colour(StrEnum):
+    RED = "red"
+
+    def label(self) -> str:
+        return self.value.title()
+"#;
+
     let files = [
         ("simple", simple_code),
         ("classes", classes_code),
@@ -307,6 +329,7 @@ totals = [n * 2 for n in range(3)]
         ("inherited_members", inherited_members),
         ("nested_later_class", nested_later_class),
         ("comprehensions", comprehensions),
+        ("string_literal", string_literal),
     ];
     let (handles, state) = mk_multi_file_state_assert_no_errors(&files, Require::Everything);
     let transaction = state.transaction();
@@ -399,8 +422,56 @@ fn ownership_test() {
 }
 
 #[test]
+fn attribute_writes_and_deletions_have_references() {
+    use crate::state::require::Require;
+    use crate::test::util::mk_multi_file_state_assert_no_errors;
+
+    let source = "class Widget:\n    value: int = 0\nwidget = Widget()\nwidget.value = 1\ndel widget.value\ndef clear():\n    local = 1\n    del local\n";
+    let (handles, state) =
+        mk_multi_file_state_assert_no_errors(&[("simple", source)], Require::Everything);
+    let report = glean(
+        &state.transaction(),
+        handles.get("simple").unwrap(),
+        false,
+        &GleanNaming::default(),
+    );
+    let facts: serde_json::Value = serde_json::from_str(&report).unwrap();
+    let xrefs = facts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["predicate"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("python.XRefsViaNameByFile."))
+        })
+        .unwrap()["facts"][0]["key"]["xrefs"]
+        .as_array()
+        .unwrap();
+    for (statement, local_name, target) in [
+        ("widget.value = 1", "value", "simple.Widget.value"),
+        ("del widget.value", "value", "simple.Widget.value"),
+        ("del local", "local", "simple.clear.<locals>.local"),
+    ] {
+        let start = source.find(statement).unwrap() + statement.find(local_name).unwrap();
+        assert!(
+            xrefs.iter().any(|xref| {
+                xref["source"]["start"] == start
+                    && xref["source"]["length"] == local_name.len()
+                    && xref["target"]["key"] == target
+            }),
+            "Missing reference for {statement}: {xrefs:?}",
+        );
+    }
+}
+
+#[test]
 fn module_names_only_change_reported_names() {
     use std::collections::HashMap;
+    use std::path::Path;
+
+    use pyrefly_config::module_names::ModuleNames;
+    use pyrefly_util::arc_id::ArcId;
 
     use crate::state::require::Require;
     use crate::test::util::mk_multi_file_state_assert_no_errors;
@@ -431,7 +502,10 @@ fn module_names_only_change_reported_names() {
         .as_str()
         .unwrap();
     let naming = GleanNaming::new(
-        HashMap::from([(file.to_owned(), "public.api".to_owned())]),
+        Some(ArcId::new(ModuleNames::new(
+            HashMap::from([(file.to_owned(), "public.api".to_owned())]),
+            Path::new(""),
+        ))),
         None,
     );
     let renamed = glean(&transaction, original, false, &naming);

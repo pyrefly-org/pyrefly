@@ -887,11 +887,11 @@ from abc import ABC, abstractmethod
 
 class A1(ABC):
     @abstractmethod
-    def a(): ...
+    def a(): ...  # E: Instance method `a` must accept the instance as its first positional parameter
 
 class B1(ABC):
     @abstractmethod
-    def b(): ...
+    def b(): ...  # E: Instance method `b` must accept the instance as its first positional parameter
 
 class C(A1, B1): ...
 
@@ -924,6 +924,45 @@ class Foo:
     @abstractmethod
     def fn(self) -> int:  # E: `Foo.fn` is decorated with `@abstractmethod` but `Foo` is not an abstract class
         ...
+"#,
+);
+
+testcase!(
+    test_abstract_method_with_implementation,
+    TestEnv::new().enable_abstract_method_with_implementation_error(),
+    r#"
+from abc import ABC, abstractmethod
+
+class Foo(ABC):
+    @abstractmethod
+    def implemented(self) -> int:  # E: `Foo.implemented` is decorated with `@abstractmethod` but has an implementation
+        return 1
+
+    @abstractmethod
+    def placeholder(self) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def trivial(self) -> None:
+        pass
+
+    @abstractmethod
+    def elided(self) -> None: ...
+"#,
+);
+
+testcase!(
+    test_abstract_method_with_implementation_no_type_check,
+    TestEnv::new().enable_abstract_method_with_implementation_error(),
+    r#"
+from abc import ABC, abstractmethod
+from typing import no_type_check
+
+class Foo(ABC):
+    @no_type_check
+    @abstractmethod
+    def implemented(self) -> int:
+        return 1
 "#,
 );
 

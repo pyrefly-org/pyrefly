@@ -638,6 +638,17 @@ except ImportError:
 );
 
 testcase!(
+    test_optional_import_with_annotation_fallback,
+    r#"
+from typing import Any
+try:
+    from nomod import x  # E: Cannot find module `nomod`
+except ImportError:
+    x: Any
+"#,
+);
+
+testcase!(
     bug = "A name imported from a module that lacks it at this version should have a fallback",
     test_optional_from_import_of_missing_name,
     TestEnv::new_with_version(PythonVersion::new(3, 10, 0)),
@@ -2337,7 +2348,7 @@ testcase!(
     test_malformed_def_from_star,
     r#"
 def # E: Parse error: Expected an identifier
-from *a # E: Parse error: Expected `)`, found `from` # E: Parse error: Expected a module name # E: Parse error: Star import must be the only import # E: Parse error: Expected `,`, found name
+from *a # E: Parse error: Expected `)`, found `from` # E: Parse error: Expected a module name # E: Parse error: Star import must be the only import # E: Parse error: Expected `,`, found identifier
 "#,
 );
 
@@ -2346,7 +2357,7 @@ testcase!(
     test_malformed_class_from_star,
     r#"
 class # E: Parse error: Expected an identifier
-from *a # E: Parse error: Expected an indented block after `class` definition # E: Parse error: Expected a module name # E: Parse error: Star import must be the only import # E: Parse error: Expected `,`, found name # E: Cannot find module `main`
+from *a # E: Parse error: Expected an indented block after `class` definition # E: Parse error: Expected a module name # E: Parse error: Star import must be the only import # E: Parse error: Expected `,`, found identifier # E: Cannot find module `main`
 "#,
 );
 
@@ -3419,5 +3430,24 @@ class Node:
 
 assert_type(Node().clone(), Node)
 assert_type(Node().copy(), Node)
+"#,
+);
+
+// One file can be imported under two module names, e.g. when two import roots overlap.
+// Each name is a distinct module with its own classes.
+testcase!(
+    test_one_file_two_module_names,
+    {
+        let mut env = TestEnv::new().enable_reveal_type_qualified_names();
+        env.add_with_path("foo", "shared.py", "class C: ...");
+        env.add_with_path("bar", "shared.py", "class C: ...");
+        env
+    },
+    r#"
+from typing import reveal_type
+import foo
+import bar
+reveal_type(foo.C())  # E: revealed type: foo.C
+reveal_type(bar.C())  # E: revealed type: bar.C
 "#,
 );

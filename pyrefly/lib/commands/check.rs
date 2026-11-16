@@ -42,6 +42,7 @@ use pyrefly_config::base::Preset;
 use pyrefly_config::config::BaselineFormat;
 use pyrefly_config::config::BaselineMatchingMode;
 use pyrefly_config::config::ConfigFile;
+use pyrefly_config::config::ConfigSource;
 use pyrefly_config::config::OutputFormat;
 use pyrefly_config::config::SynthesizedPresetReason;
 use pyrefly_config::error_kind::ErrorKind;
@@ -156,7 +157,7 @@ pub struct FullCheckArgs {
 
     /// Watch for file changes and re-check them.
     /// (Warning: This mode is highly experimental!)
-    #[arg(long, conflicts_with = "check_all")]
+    #[arg(long, conflicts_with_all = ["check_all", "report_scip"])]
     watch: bool,
 
     /// Type checking arguments and configuration
@@ -337,15 +338,31 @@ struct OutputArgs {
     #[arg(long, requires = "report_glean")]
     report_glean_ownership: bool,
 
-    /// JSON object mapping Glean file paths (relative to the working directory) to
-    /// module names. Affects Glean output only, without changing import resolution.
-    #[arg(long, value_name = "FILE", requires = "report_glean")]
-    glean_module_names: Option<PathBuf>,
     /// Directory, relative to the working directory, holding the stdlib sources that the
     /// typeshed stdlib stubs bundled with Pyrefly describe. Glean cross-references into the
     /// stdlib then record those source files instead of stub paths. Affects Glean output only.
     #[arg(long, value_name = "DIR", requires = "report_glean")]
     glean_stdlib_root: Option<String>,
+    /// Generate a SCIP index for the project
+    #[arg(
+        long,
+        value_name = "OUTPUT_FILE",
+        conflicts_with_all = [
+            "report_glean",
+            "report_pysa",
+            "report_trace",
+            "report_demand_tree",
+            "debug_info",
+            "report_binding_memory",
+        ]
+    )]
+    report_scip: Option<PathBuf>,
+    /// Package name for the project's symbols in the SCIP index. Defaults to the name in `pyproject.toml`.
+    #[arg(long, requires = "report_scip")]
+    report_scip_project_name: Option<String>,
+    /// Package version for the project's symbols in the SCIP index. Defaults to the version in `pyproject.toml`.
+    #[arg(long, requires = "report_scip")]
+    report_scip_project_version: Option<String>,
     /// Generate a Pysa-compatible JSON file for each module. Pysa treats every type error
     /// as a failure, so this defaults `--min-severity` to `error`.
     #[arg(long, value_name = "OUTPUT_FILE")]
@@ -358,7 +375,12 @@ struct OutputArgs {
     #[arg(long, value_name = "OUTPUT_FILE")]
     report_demand_tree: Option<PathBuf>,
     /// Generate a CinderX-format type report (experimental, internal-only).
-    #[arg(long, value_name = "OUTPUT_DIR", hide = true)]
+    #[arg(
+        long,
+        value_name = "OUTPUT_DIR",
+        hide = true,
+        conflicts_with = "report_scip"
+    )]
     report_cinderx: Option<PathBuf>,
     /// Also write human-readable .txt files alongside the CinderX JSON report.
     /// Each .txt file inlines type-table indices so types are fully readable without
@@ -451,8 +473,8 @@ struct OutputArgs {
     #[arg(long, group = "baseline_action")]
     error_stale_baseline: bool,
 
-    /// Minimum severity level for errors to be displayed.
-    /// Errors below this severity will not be shown. Defaults to "error".
+    /// Minimum severity level for errors to be displayed and to cause a nonzero exit code.
+    /// When unset, warnings and errors are displayed, and only errors cause a nonzero exit code.
     #[arg(long, value_enum)]
     min_severity: Option<Severity>,
 }
@@ -516,8 +538,10 @@ impl OutputArgs {
             report_timings,
             report_glean,
             report_glean_ownership,
-            glean_module_names,
             glean_stdlib_root,
+            report_scip,
+            report_scip_project_name,
+            report_scip_project_version,
             report_pysa,
             report_pysa_format,
             report_demand_tree,
@@ -562,8 +586,10 @@ impl OutputArgs {
             || report_timings.is_some()
             || report_glean.is_some()
             || *report_glean_ownership
-            || glean_module_names.is_some()
             || glean_stdlib_root.is_some()
+            || report_scip.is_some()
+            || report_scip_project_name.is_some()
+            || report_scip_project_version.is_some()
             || report_pysa.is_some()
             || !matches!(report_pysa_format, report::pysa::PysaFormat::Capnp)
             || report_demand_tree.is_some()
@@ -641,6 +667,10 @@ impl OutputArgs {
             // With no threshold set, warnings are printed but only errors make the exit
             // code nonzero.
             show_severity: min_severity.unwrap_or(Severity::Warn),
+            only: self
+                .only
+                .clone()
+                .or_else(|| config.and_then(|config| config.only.clone())),
         }
     }
 
@@ -671,6 +701,9 @@ struct OutputDefaults {
     /// Diagnostics at or above this severity are printed. It is never above
     /// `min_severity`.
     show_severity: Severity,
+    /// Diagnostics matching the specific kinds are reported.
+    /// If `None`, no filtering is applied and all error kinds are processed.
+    only: Option<Vec<ErrorKind>>,
 }
 
 #[derive(Clone, Debug, ValueEnum, Default, PartialEq, Eq)]
@@ -1287,6 +1320,24 @@ impl Handles {
                 .insert(path.dupe());
         }
 
+        let mut warned_targets = HashSet::new();
+        let warnings: Vec<_> = configs
+            .keys()
+            .filter_map(|config| {
+                let warning = config.bundled_typeshed_version_warning()?;
+                // Synthetic configs have no path prefix, so repeated versions share one warning.
+                let origin = match &config.source {
+                    ConfigSource::File(path) => Some(path.clone()),
+                    _ => None,
+                };
+                warned_targets
+                    .insert((config.python_version(), origin))
+                    .then_some(warning)
+            })
+            .collect();
+        if !warnings.is_empty() {
+            config_finder.add_errors(warnings);
+        }
         // TODO(connernilsen): wire in force logic
         let reloaded_source_dbs = ConfigFile::query_source_db(&configs, false, None).reloaded;
         let result = configs
@@ -1678,7 +1729,7 @@ impl IncrementalCheckCommand {
             )
         });
         let defaults = args.output.resolve(config.as_deref());
-        let run = args.prepare_cli_run(timings, transaction, handles, &defaults)?;
+        let run = args.prepare_cli_run(timings, transaction, version, handles, &defaults)?;
         check.run(|transaction, handles, sourcedb_errors| {
             let result = args.finish_cli_run(
                 run,
@@ -1726,6 +1777,7 @@ struct PreparedCliRun {
     memory_trace: MemoryUsageTrace,
     demand_tree_subscriber: Option<TestSubscriber>,
     type_check_start: Instant,
+    scip: Option<Arc<report::scip::ScipWriter<BufWriter<File>>>>,
 }
 
 impl CheckArgs {
@@ -1862,6 +1914,9 @@ impl CheckArgs {
             .as_ref()
             .config_finder()
             .python_file(ModuleNameWithKind::guaranteed(module_name), &module_path);
+        if let Some(warning) = config.bundled_typeshed_version_warning() {
+            holder.as_ref().config_finder().add_errors(vec![warning]);
+        }
         let sys_info = config.get_sys_info();
         let handle = Handle::new(module_name, module_path.clone(), sys_info);
 
@@ -1899,10 +1954,14 @@ impl CheckArgs {
     fn get_required_levels(&self) -> RequireLevels {
         let retain = self.output.report_binding_memory.is_some()
             || self.output.debug_info.is_some()
-            || self.output.report_trace.is_some()
-            || self.output.report_glean.is_some();
+            || self.output.report_trace.is_some();
         RequireLevels {
-            specified: if retain {
+            // The SCIP and Glean reports need the AST and type traces of each checked file until
+            // it is written. The definitions they find in imported modules only need exports.
+            specified: if retain
+                || self.output.report_scip.is_some()
+                || self.output.report_glean.is_some()
+            {
                 Require::Everything
             } else {
                 Require::Errors
@@ -1932,7 +1991,7 @@ impl CheckArgs {
         upsell: UpsellDecision,
         inspect: impl FnOnce(&[CollectedDiagnostic<'_>], &Path) -> R,
     ) -> anyhow::Result<(CommandExitStatus, R)> {
-        let run = self.prepare_cli_run(timings, transaction, handles, defaults)?;
+        let run = self.prepare_cli_run(timings, transaction, version, handles, defaults)?;
         transaction.run(handles, require, None);
         self.finish_cli_run(
             run,
@@ -1950,6 +2009,7 @@ impl CheckArgs {
         &self,
         timings: Timings,
         transaction: &mut Transaction,
+        version: &str,
         handles: &[Handle],
         defaults: &OutputDefaults,
     ) -> anyhow::Result<PreparedCliRun> {
@@ -2010,6 +2070,33 @@ impl CheckArgs {
             transaction.set_cinderx_reporter(Some(cinderx_reporter));
         }
 
+        // Each indexed file is written as soon as it is solved, while its answers are still in
+        // memory, so they don't have to be kept for the whole run.
+        let scip = match &self.output.report_scip {
+            Some(path) => {
+                let relative_to = match &self.output.relative_to {
+                    Some(path) => PathBuf::from(path),
+                    None => std::env::current_dir()
+                        .context("while determining the SCIP project root")?,
+                };
+                let project = report::scip::Package::project(
+                    &relative_to,
+                    self.output.report_scip_project_name.clone(),
+                    self.output.report_scip_project_version.clone(),
+                )?;
+                let scip = report::scip::ScipWriter::new(
+                    BufWriter::new(File::create(path)?),
+                    handles,
+                    &relative_to,
+                    project,
+                    version,
+                )?
+                .start(transaction);
+                Some(scip)
+            }
+            None => None,
+        };
+
         let type_check_start = Instant::now();
         let demand_tree_subscriber = if self.output.report_demand_tree.is_some() {
             transaction.set_demand_collector(Some(DemandCollector::new()));
@@ -2026,6 +2113,7 @@ impl CheckArgs {
             memory_trace,
             demand_tree_subscriber,
             type_check_start,
+            scip,
         })
     }
 
@@ -2047,6 +2135,7 @@ impl CheckArgs {
             mut memory_trace,
             demand_tree_subscriber,
             type_check_start,
+            scip,
         } = run;
         transaction.set_subscriber(None);
 
@@ -2072,7 +2161,10 @@ impl CheckArgs {
         let output_format = defaults.output_format;
 
         // Every diagnostic below borrows its error, from `loads` or from `unused_ignores`.
-        let (collected, unused_ignores) = loads.collect_error_refs_with_unused_ignores();
+        // Collation and writing the report run on the state's thread pool, which the check has
+        // finished with, so that they can work in parallel on the configured threads.
+        let (collected, unused_ignores) =
+            transaction.install(|| loads.collect_error_refs_with_unused_ignores());
         let shown_unused_ignores = loads.shown_unused_ignore_errors(&unused_ignores);
         let mut ordinary = collected.ordinary;
         ordinary.reserve_exact(shown_unused_ignores.len() + collected.hints.len());
@@ -2095,8 +2187,7 @@ impl CheckArgs {
 
         let (baseline_status, unused_baseline_entries, retained_baseline_entries) =
             baseline_apply_result.resolve(self.output.update_baseline)?;
-        let only_filter = self
-            .output
+        let only_filter = defaults
             .only
             .as_ref()
             .map(|only| only.iter().collect::<SmallSet<&ErrorKind>>());
@@ -2250,33 +2341,36 @@ impl CheckArgs {
             OutputFormat::JunitXml => failing_errors.as_slice(),
             _ => output_errors.as_slice(),
         };
-        if self.output.output.is_empty() {
-            write_errors_to_console(
-                output_format,
-                version,
-                relative_to.as_path(),
-                errors_for(output_format),
-            )?;
-        } else {
-            for output in &self.output.output {
-                let format = output.format.unwrap_or(output_format);
-                match &output.destination {
-                    ErrorOutputDestination::Stdout => write_errors_to_console(
-                        format,
-                        version,
-                        relative_to.as_path(),
-                        errors_for(format),
-                    )?,
-                    ErrorOutputDestination::File(path) => write_errors_to_file(
-                        format,
-                        path,
-                        version,
-                        relative_to.as_path(),
-                        errors_for(format),
-                    )?,
+        transaction.install(|| -> anyhow::Result<()> {
+            if self.output.output.is_empty() {
+                write_errors_to_console(
+                    output_format,
+                    version,
+                    relative_to.as_path(),
+                    errors_for(output_format),
+                )?;
+            } else {
+                for output in &self.output.output {
+                    let format = output.format.unwrap_or(output_format);
+                    match &output.destination {
+                        ErrorOutputDestination::Stdout => write_errors_to_console(
+                            format,
+                            version,
+                            relative_to.as_path(),
+                            errors_for(format),
+                        )?,
+                        ErrorOutputDestination::File(path) => write_errors_to_file(
+                            format,
+                            path,
+                            version,
+                            relative_to.as_path(),
+                            errors_for(format),
+                        )?,
+                    }
                 }
             }
-        }
+            Ok(())
+        })?;
         memory_trace.stop();
         if let Some(limit) = self.output.count_errors {
             print_error_counts(&output_errors, limit);
@@ -2419,15 +2513,14 @@ impl CheckArgs {
             )?;
         }
         if let Some(glean) = &self.output.report_glean {
-            let naming = report::glean::GleanNaming::new(
-                match &self.output.glean_module_names {
-                    Some(path) => serde_json::from_str(&fs_anyhow::read_to_string(path)?)?,
-                    None => Default::default(),
-                },
-                self.output.glean_stdlib_root.clone(),
-            );
             fs_anyhow::create_dir_all(glean)?;
             for handle in handles {
+                let naming = report::glean::GleanNaming::new(
+                    transaction
+                        .get_config(handle)
+                        .and_then(|config| config.module_names.dupe()),
+                    self.output.glean_stdlib_root.clone(),
+                );
                 // Generate a safe filename using hash to avoid OS filename length limits
                 let module_hash = blake3::hash(handle.path().to_string().as_bytes());
                 fs_anyhow::write(
@@ -2440,6 +2533,13 @@ impl CheckArgs {
                     ),
                 )?;
             }
+        }
+        if let Some(scip) = scip
+            && let Some(path) = &self.output.report_scip
+        {
+            scip.finish(transaction)
+                .and_then(|mut writer| Ok(writer.flush()?))
+                .with_context(|| format!("while writing SCIP index to `{}`", path.display()))?;
         }
         if let Some(pysa_reporter) = transaction.take_pysa_reporter() {
             report::pysa::write_project_file(&pysa_reporter, transaction, handles, &output_errors)?;
@@ -2494,7 +2594,11 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use clap::error::ErrorKind as ClapErrorKind;
+    use protobuf::Message as _;
     use pyrefly_config::config::ConfigScope;
+    use pyrefly_config::module_names::ModuleNames;
+    use pyrefly_config::module_names::ModuleNamesSourceDatabase;
     use pyrefly_python::module::Module;
     use pyrefly_python::module_name::ModuleName;
     use pyrefly_python::module_path::ModulePath;
@@ -2538,13 +2642,30 @@ mod tests {
     /// A config finder that resolves everything under `root` without querying an
     /// interpreter, so tests do not depend on the machine's Python environment.
     fn test_config_finder(root: &Path) -> ConfigFinder {
+        ConfigFinder::new_constant(ArcId::new(test_config(root)))
+    }
+
+    /// A config like `test_config_finder`'s, as `--module-names` sets it up.
+    fn test_config_finder_with_module_names(
+        root: &Path,
+        module_names: ModuleNames,
+    ) -> ConfigFinder {
+        let mut config = test_config(root);
+        let module_names = ArcId::new(module_names);
+        let source_db = ModuleNamesSourceDatabase::new(module_names.dupe(), config.get_sys_info());
+        config.fallback_source_db = Some(ArcId::new(Box::new(source_db)));
+        config.module_names = Some(module_names);
+        ConfigFinder::new_constant(ArcId::new(config))
+    }
+
+    fn test_config(root: &Path) -> ConfigFile {
         let mut config = ConfigFile::default();
         config.python_environment.set_empty_to_default();
         config.interpreters.skip_interpreter_query = true;
         config.search_path_from_file = vec![root.to_path_buf()];
         config.disable_search_path_heuristics = true;
         config.configure();
-        ConfigFinder::new_constant(ArcId::new(config))
+        config
     }
 
     fn incremental_checker(root: &Path, initial_files: Vec<PathBuf>) -> IncrementalChecker {
@@ -2676,6 +2797,74 @@ mod tests {
     /// See https://github.com/facebook/pyrefly/issues/4683: the CinderX report
     /// dropped the ASTs that the Glean report reads once the check is done, so
     /// the run died partway through writing its output.
+    /// A module that a build system imports under a name its path doesn't give is found through
+    /// `--module-names`. The type of a value from it is then known, so a method call on a
+    /// parameter annotated with its class refers to that method.
+    #[test]
+    fn module_names_resolve_imports() {
+        let temp = TempDir::new().unwrap();
+        // Canonical, so that the listed path and the checked file's path agree.
+        let root = fs::canonicalize(temp.path()).unwrap().join("project");
+        fs::create_dir_all(root.join("lib").join("src")).unwrap();
+        fs::create_dir_all(root.join("app")).unwrap();
+        let platform = root.join("lib").join("src").join("platform.py");
+        fs::write(
+            &platform,
+            "class Platform:\n    def chat(self) -> None: ...\n",
+        )
+        .unwrap();
+        let main = root.join("app").join("main.py");
+        fs::write(
+            &main,
+            r#"from platform_api.platform import Platform
+
+
+def go(p: Platform) -> None:
+    p.chat()
+"#,
+        )
+        .unwrap();
+        let glean_dir = temp.path().join("glean");
+
+        let cwd = fs::canonicalize(env::current_dir().unwrap()).unwrap();
+        let listed = platform
+            .strip_prefix(&cwd)
+            .unwrap_or(&platform)
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        let module_names = ModuleNames::new(
+            HashMap::from([(listed, "platform_api.platform".to_owned())]),
+            &cwd,
+        );
+        let args = CheckArgs::parse_from(["check", "--report-glean", glean_dir.to_str().unwrap()]);
+        let (_, check_result) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![platform, main],
+                }),
+                test_config_finder_with_module_names(&root, module_names),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let errors = &check_result.legacy_errors;
+        assert!(errors.is_empty(), "the import should resolve: {errors:#?}");
+
+        let facts: String = fs::read_dir(&glean_dir)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        assert!(
+            facts.contains("\"platform_api.platform.Platform.chat\""),
+            "the declaration and the method call should both name the method after the given module"
+        );
+        assert!(!facts.contains("<locals>.p.chat"));
+        assert!(!facts.contains("lib.src.platform"));
+    }
+
     #[test]
     fn check_writes_cinderx_and_glean_reports_together() {
         let temp = TempDir::new().unwrap();
@@ -2697,30 +2886,12 @@ def go(w: Widget) -> int:
         let cinderx_dir = temp.path().join("cinderx");
         let glean_dir = temp.path().join("glean");
 
-        // Glean file keys resolve symlinks, are relative to the working directory when
-        // possible, and use forward slashes rather than native path separators.
-        let module_path = fs::canonicalize(&module).unwrap();
-        let cwd = fs::canonicalize(env::current_dir().unwrap()).unwrap();
-        let module_key = module_path
-            .strip_prefix(&cwd)
-            .unwrap_or(&module_path)
-            .to_str()
-            .unwrap()
-            .replace('\\', "/");
-        let names_path = temp.path().join("module_names.json");
-        fs::write(
-            &names_path,
-            serde_json::to_string(&HashMap::from([(module_key, "public.api")])).unwrap(),
-        )
-        .unwrap();
         let args = CheckArgs::parse_from([
             "check",
             "--report-cinderx",
             cinderx_dir.to_str().unwrap(),
             "--report-glean",
             glean_dir.to_str().unwrap(),
-            "--glean-module-names",
-            names_path.to_str().unwrap(),
         ]);
         let (status, check_result) = args
             .run_once(
@@ -2753,8 +2924,141 @@ def go(w: Widget) -> int:
             .collect();
         assert_eq!(glean_files.len(), 1, "expected one Glean file per module");
         let facts = fs::read_to_string(&glean_files[0]).unwrap();
-        assert!(facts.contains("public.api.Widget"));
-        assert!(!facts.contains("main.Widget"));
+        assert!(facts.contains("main.Widget"));
+    }
+
+    /// The Glean report keeps only the checked files in full. An imported module that isn't
+    /// checked is kept at the exports level, which is still enough to find the definitions that
+    /// the checked files refer to.
+    #[test]
+    fn glean_report_finds_definitions_in_unchecked_imports() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("lib.py"),
+            "class Widget:\n    def apply(self, n: int) -> int:\n        return n + 1\n",
+        )
+        .unwrap();
+        let main = root.join("main.py");
+        fs::write(
+            &main,
+            "from lib import Widget\n\n\ndef go(w: Widget) -> int:\n    return w.apply(1)\n",
+        )
+        .unwrap();
+        let glean_dir = temp.path().join("glean");
+
+        let args = CheckArgs::parse_from(["check", "--report-glean", glean_dir.to_str().unwrap()]);
+        let levels = args.get_required_levels();
+        assert_eq!(levels.specified, Require::Everything);
+        assert_eq!(levels.default, Require::Exports);
+        let (_, check_result) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![main],
+                }),
+                test_config_finder(&root),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let errors = &check_result.legacy_errors;
+        assert!(errors.is_empty(), "unexpected type errors: {errors:#?}");
+
+        let glean_files: Vec<_> = fs::read_dir(&glean_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(
+            glean_files.len(),
+            1,
+            "only the checked file should be reported"
+        );
+        let facts = fs::read_to_string(&glean_files[0]).unwrap();
+        assert!(
+            facts.contains("\"lib.Widget.apply\""),
+            "the method call should refer to the method's definition in the unchecked module"
+        );
+    }
+
+    #[test]
+    fn scip_rejects_incompatible_options() {
+        assert!(FullCheckArgs::try_parse_from(["check", "--report-scip", "index.scip"]).is_ok());
+        for options in [
+            &["--watch"][..],
+            &["--debug-info", "debug.json"][..],
+            &["--report-binding-memory", "memory.csv"][..],
+        ] {
+            assert!(
+                FullCheckArgs::try_parse_from(["check"].into_iter().chain(options.iter().copied()))
+                    .is_ok(),
+                "standalone options should remain valid: {options:?}"
+            );
+            let error = FullCheckArgs::try_parse_from(
+                ["check", "--report-scip", "index.scip"]
+                    .into_iter()
+                    .chain(options.iter().copied()),
+            )
+            .expect_err("SCIP must reject options requiring retained state");
+            assert_eq!(error.kind(), ClapErrorKind::ArgumentConflict);
+            let message = error.to_string();
+            assert!(message.contains("--report-scip"), "{message}");
+            assert!(message.contains(options[0]), "{message}");
+        }
+    }
+
+    #[test]
+    fn check_writes_scip_report() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let module = root.join("main.py");
+        fs::write(&module, "x = 1\n").unwrap();
+        let scip_path = temp.path().join("index.scip");
+
+        let args = CheckArgs::parse_from([
+            "check",
+            "--report-scip",
+            scip_path.to_str().unwrap(),
+            "--report-scip-project-name",
+            "demo",
+            "--relative-to",
+            root.to_str().unwrap(),
+        ]);
+        let (status, check_result) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![module],
+                }),
+                test_config_finder(&root),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let errors = &check_result.legacy_errors;
+        assert!(errors.is_empty(), "unexpected type errors: {errors:#?}");
+        assert!(matches!(status, CommandExitStatus::Success));
+
+        let index = scip::types::Index::parse_from_bytes(&fs::read(&scip_path).unwrap()).unwrap();
+        assert_eq!(index.documents.len(), 1);
+        assert_eq!(index.documents[0].relative_path, "main.py");
+        assert_eq!(
+            index.documents[0].occurrences[0].symbol,
+            "scip-python python demo . main/__init__:"
+        );
+        let metadata = index.metadata.unwrap();
+        assert_eq!(metadata.tool_info.name, "scip-pyrefly");
+        assert_eq!(metadata.tool_info.version, "test");
+        assert!(
+            metadata.project_root.starts_with("file://")
+                && metadata.project_root.ends_with("/project/"),
+            "unexpected project root: {}",
+            metadata.project_root
+        );
     }
 
     #[test]
@@ -3437,6 +3741,31 @@ def go(w: Widget) -> int:
         assert_eq!(
             overridden.resolve(Some(&warn)).baseline_error_level,
             Severity::Error
+        );
+    }
+
+    #[test]
+    fn only_cli_and_config_precedence() {
+        let inherited = OutputArgs::parse_from(["pyrefly-check"]);
+        assert_eq!(inherited.resolve(None).only, None);
+        let config = ConfigFile {
+            only: Some(vec![ErrorKind::BadClassDefinition]),
+            ..Default::default()
+        };
+        assert_eq!(
+            inherited.resolve(Some(&config)).only,
+            Some(vec![ErrorKind::BadClassDefinition])
+        );
+
+        let overridden = OutputArgs::parse_from(["pyrefly-check", "--only", "bad-return"]);
+        assert_eq!(
+            overridden.resolve(None).only,
+            Some(vec![ErrorKind::BadReturn])
+        );
+
+        assert_eq!(
+            overridden.resolve(Some(&config)).only,
+            Some(vec![ErrorKind::BadReturn])
         );
     }
 

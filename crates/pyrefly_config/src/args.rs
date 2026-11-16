@@ -6,11 +6,14 @@
  */
 
 use std::collections::HashSet;
+use std::env;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::Context as _;
 use clap::Parser;
+use dupe::Dupe as _;
 use pyrefly_python::ignore::Tool;
 use pyrefly_python::ignore::TypeIgnoreUnknownTagBehavior;
 use pyrefly_python::sys_info::PythonPlatform;
@@ -18,6 +21,7 @@ use pyrefly_python::sys_info::PythonVersion;
 use pyrefly_util::absolutize::Absolutize as _;
 use pyrefly_util::arc_id::ArcId;
 use pyrefly_util::display;
+use pyrefly_util::interned_path::InternedPath;
 
 use crate::base::InferReturnTypes;
 use crate::base::Preset;
@@ -30,6 +34,8 @@ use crate::error::ErrorDisplayConfig;
 use crate::error_kind::ErrorKind;
 use crate::error_kind::Severity;
 use crate::finder::ConfigError;
+use crate::module_names::ModuleNames;
+use crate::module_names::ModuleNamesSourceDatabase;
 use crate::module_wildcard::ModuleWildcard;
 use crate::util::ConfigOrigin;
 
@@ -37,6 +43,10 @@ use crate::util::ConfigOrigin;
 fn absolute_path_parser(s: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(s);
     Ok(path.absolutize())
+}
+
+fn interned_path_parser(s: &str) -> Result<InternedPath, String> {
+    Ok(InternedPath::from_path(Path::new(s)))
 }
 
 /// Environment and module-resolution overrides shared by all commands that
@@ -128,6 +138,17 @@ pub struct EnvironmentArgs {
     /// Override the bundled typeshed with a custom path.
     #[arg(long, value_parser = absolute_path_parser)]
     pub(crate) typeshed_path: Option<PathBuf>,
+
+    /// JSON object mapping source file paths, relative to the working directory, to module
+    /// names, for files that a build system imports under a name their path doesn't give.
+    /// Pyrefly checks the listed files under these names, finds them by these names when no
+    /// other import lookup finds a module, and reports such as `--report-glean` use them.
+    #[arg(long, value_name = "FILE", value_parser = interned_path_parser)]
+    pub(crate) module_names: Option<InternedPath>,
+
+    /// The contents of `module_names`, read once by `validate` and shared by every config.
+    #[arg(skip)]
+    pub(crate) loaded_module_names: OnceLock<ArcId<ModuleNames>>,
 }
 
 impl EnvironmentArgs {
@@ -146,6 +167,8 @@ impl EnvironmentArgs {
             fallback_python_interpreter_name,
             skip_interpreter_query,
             typeshed_path,
+            module_names,
+            loaded_module_names: _,
         } = self;
 
         preset.is_some()
@@ -161,6 +184,7 @@ impl EnvironmentArgs {
             || fallback_python_interpreter_name.is_some()
             || *skip_interpreter_query
             || typeshed_path.is_some()
+            || module_names.is_some()
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -174,7 +198,18 @@ impl EnvironmentArgs {
         }
         validate_arg("--site-packages-path", self.site_package_path.as_deref())?;
         validate_arg("--search-path", self.search_path.as_deref())?;
+        if let Some(path) = &self.module_names
+            && self.loaded_module_names.get().is_none()
+        {
+            let names = ModuleNames::load(path, &env::current_dir()?)?;
+            let _ = self.loaded_module_names.set(ArcId::new(names));
+        }
         Ok(())
+    }
+
+    /// The module names given with `--module-names`, once `validate` has read them.
+    pub fn module_names(&self) -> Option<&ArcId<ModuleNames>> {
+        self.loaded_module_names.get()
     }
 
     pub fn preset(&self) -> Option<Preset> {
@@ -190,7 +225,7 @@ impl EnvironmentArgs {
     /// that only flatten `EnvironmentArgs`.
     pub fn override_environment_config(&self, config: &mut ConfigFile) {
         if let Some(x) = self.preset {
-            config.preset = Some(x);
+            config.root.preset = Some(x);
             config.synthesized_preset_reason = Some(SynthesizedPresetReason::UserOverride);
         }
         if let Some(x) = &self.python_platform {
@@ -202,6 +237,9 @@ impl EnvironmentArgs {
         }
         if let Some(x) = &self.search_path {
             config.search_path_from_args = x.clone();
+        }
+        if let Some(x) = self.module_names() {
+            config.module_names = Some(x.dupe());
         }
         if let Some(x) = &self.disable_search_path_heuristics {
             config.disable_search_path_heuristics = *x;
@@ -309,6 +347,11 @@ pub struct ConfigOverrideArgs {
         num_args = 0..=1
     )]
     use_ignore_files: Option<bool>,
+    /// A command that finds the Python environment of a PEP 723 script, one argument per use of
+    /// this flag. Pyrefly appends the script's path to the command, which prints the environment in
+    /// the JSON format of `uv workspace metadata --script`.
+    #[arg(long, allow_hyphen_values = true)]
+    script_command: Option<Vec<String>>,
     /// Deprecated: use --check-unannotated-defs and --infer-return-types instead.
     /// Controls how Pyrefly analyzes function definitions that lack type annotations on parameters and return values.
     #[arg(long)]
@@ -369,6 +412,14 @@ pub struct ConfigOverrideArgs {
     /// Deprecated no-op. Tensor shape support is derived from whether `shape_extensions` is resolvable.
     #[arg(long)]
     tensor_shapes: Option<bool>,
+    /// Use shape comments and shape-stub packages (default true). Native annotations are unaffected.
+    #[arg(
+        long,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1
+    )]
+    use_shape_comments_and_stubs: Option<bool>,
     /// Whether to strictly check callable subtyping for signatures with `*args: Any, **kwargs: Any`.
     /// When false (the default), callables with `*args: Any, **kwargs: Any` are treated as
     /// compatible with any signature (similar to `...` behavior).
@@ -447,6 +498,7 @@ impl ConfigOverrideArgs {
             ignore_errors_in_generated_code,
             infer_with_first_use,
             use_ignore_files,
+            script_command,
             untyped_def_behavior,
             check_unannotated_defs,
             infer_return_types,
@@ -461,6 +513,7 @@ impl ConfigOverrideArgs {
             recursion_overflow_handler,
             pytorch_efficiency_lints,
             tensor_shapes,
+            use_shape_comments_and_stubs,
             strict_callable_subtyping,
             strict_partial_subtyping,
             spec_compliant_overloads,
@@ -477,6 +530,7 @@ impl ConfigOverrideArgs {
             || ignore_errors_in_generated_code.is_some()
             || infer_with_first_use.is_some()
             || use_ignore_files.is_some()
+            || script_command.is_some()
             || untyped_def_behavior.is_some()
             || check_unannotated_defs.is_some()
             || infer_return_types.is_some()
@@ -491,6 +545,7 @@ impl ConfigOverrideArgs {
             || recursion_overflow_handler.is_some()
             || pytorch_efficiency_lints.is_some()
             || tensor_shapes.is_some()
+            || use_shape_comments_and_stubs.is_some()
             || strict_callable_subtyping.is_some()
             || strict_partial_subtyping.is_some()
             || spec_compliant_overloads.is_some()
@@ -576,6 +631,9 @@ impl ConfigOverrideArgs {
         if let Some(x) = &self.use_ignore_files {
             config.use_ignore_files = *x;
         }
+        if let Some(x) = &self.script_command {
+            config.script_command = Some(x.clone());
+        }
         if let Some(x) = &self.untyped_def_behavior {
             config.root.untyped_def_behavior = Some(*x);
         }
@@ -658,6 +716,9 @@ impl ConfigOverrideArgs {
         if let Some(x) = &self.pytorch_efficiency_lints {
             config.root.pytorch_efficiency_lints = Some(*x);
         }
+        if let Some(x) = self.use_shape_comments_and_stubs {
+            config.use_shape_comments_and_stubs = Some(x);
+        }
         if let Some(x) = &self.strict_callable_subtyping {
             config.root.strict_callable_subtyping = Some(*x);
         }
@@ -695,11 +756,20 @@ impl ConfigOverrideArgs {
         };
         let root_errors = config.root.errors.get_or_insert_default();
         apply_error_settings(root_errors);
-        for sub_config in config.sub_configs.iter_mut() {
-            let sub_config_errors = sub_config.settings.errors.get_or_insert_default();
-            apply_error_settings(sub_config_errors);
+        // A sub-config without `errors` inherits the root's, so it gets the overrides
+        // from there. Giving it its own map would hide a later matching sub-config's.
+        // Legacy settings are resolved first because they can give a sub-config a map.
+        for sub_config in &mut config.sub_configs {
+            sub_config.settings.resolve_legacy_settings();
+            if let Some(errors) = &mut sub_config.settings.errors {
+                apply_error_settings(errors);
+            }
         }
         let mut errors = config.configure_at(project_root);
+        if let Some(names) = self.environment.module_names() {
+            let source_db = ModuleNamesSourceDatabase::new(names.dupe(), config.get_sys_info());
+            config.fallback_source_db = Some(ArcId::new(Box::new(source_db)));
+        }
         if self.tensor_shapes.is_some() {
             errors.push(ConfigError::warn(anyhow::anyhow!(
                 "`--tensor-shapes` is deprecated and has no effect. Tensor shape support is enabled when `shape_extensions` is resolvable."
@@ -742,7 +812,33 @@ impl ConfigOverrideArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use pyrefly_python::module_path::ModulePath;
+    use pyrefly_util::globs::Glob;
+
     use super::*;
+    use crate::base::ConfigBase;
+    use crate::config::SubConfig;
+
+    #[test]
+    fn use_shape_comments_and_stubs_flag() {
+        for (flag, enabled) in [
+            ("--use-shape-comments-and-stubs=false", false),
+            ("--use-shape-comments-and-stubs=true", true),
+            ("--use-shape-comments-and-stubs", true),
+        ] {
+            let args =
+                ConfigOverrideArgs::parse_from(["pyrefly", "--skip-interpreter-query", flag]);
+            assert!(args.has_overrides());
+            let config =
+                ConfigFile::parse_config(&format!("use-shape-comments-and-stubs = {}\n", !enabled))
+                    .unwrap();
+            let (config, errors) = args.override_config(config);
+            assert!(errors.is_empty());
+            assert_eq!(config.use_shape_comments_and_stubs(), enabled);
+        }
+    }
 
     #[test]
     fn repeated_python_platform_flags_merge() {
@@ -800,5 +896,103 @@ mod tests {
 
             assert!(!config.interpreters.skip_interpreter_query);
         }
+    }
+
+    #[test]
+    fn sub_config_without_errors_does_not_shadow_later_sub_config_errors() {
+        let config = ConfigFile {
+            sub_configs: vec![
+                SubConfig {
+                    matches: Glob::new("src/**".to_owned()).unwrap(),
+                    settings: ConfigBase {
+                        check_unannotated_defs: Some(false),
+                        ..Default::default()
+                    },
+                },
+                SubConfig {
+                    matches: Glob::new("src/strict/**".to_owned()).unwrap(),
+                    settings: ConfigBase {
+                        errors: Some(ErrorDisplayConfig::new(HashMap::from([
+                            (ErrorKind::BadReturn, Severity::Warn),
+                            (ErrorKind::BadAssignment, Severity::Error),
+                        ]))),
+                        ..Default::default()
+                    },
+                },
+            ],
+            ..Default::default()
+        };
+        let args = ConfigOverrideArgs::parse_from([
+            "pyrefly",
+            "--skip-interpreter-query",
+            "--ignore",
+            "bad-assignment",
+        ]);
+        let (config, _) = args.override_config(config);
+        let strict = config.errors(&ModulePath::filesystem(PathBuf::from("src/strict/foo.py")));
+        assert_eq!(strict.severity(ErrorKind::BadReturn), Severity::Warn);
+        // CLI overrides reach sub-configs with and without their own `errors`, and beat
+        // their explicit settings.
+        assert_eq!(strict.severity(ErrorKind::BadAssignment), Severity::Ignore);
+        assert_eq!(
+            config
+                .errors(&ModulePath::filesystem(PathBuf::from("src/foo.py")))
+                .severity(ErrorKind::BadAssignment),
+            Severity::Ignore
+        );
+    }
+
+    #[test]
+    fn cli_error_flags_beat_sub_config_pytorch_efficiency_lints() {
+        let config = ConfigFile {
+            sub_configs: vec![SubConfig {
+                matches: Glob::new("src/**".to_owned()).unwrap(),
+                settings: ConfigBase {
+                    pytorch_efficiency_lints: Some(true),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let args = ConfigOverrideArgs::parse_from([
+            "pyrefly",
+            "--skip-interpreter-query",
+            "--ignore",
+            "pytorch-efficiency-lints",
+        ]);
+        let (config, _) = args.override_config(config);
+        assert_eq!(
+            config
+                .errors(&ModulePath::filesystem(PathBuf::from("src/foo.py")))
+                .severity(ErrorKind::PytorchEfficiencyLints),
+            Severity::Ignore
+        );
+    }
+
+    #[test]
+    fn cli_preset_replaces_only_root_preset() {
+        let config = ConfigFile::parse_config(
+            r#"
+            preset = "basic"
+            [[sub-config]]
+            matches = "sub/**"
+            preset = "default"
+            "#,
+        )
+        .unwrap();
+        let args = ConfigOverrideArgs::parse_from([
+            "pyrefly",
+            "--skip-interpreter-query",
+            "--preset",
+            "off",
+        ]);
+        let (config, _) = args.override_config(config);
+        let severity = |path: &str| {
+            config
+                .errors(&ModulePath::filesystem(PathBuf::from(path)))
+                .severity(ErrorKind::BadReturn)
+        };
+        assert_eq!(severity("other/foo.py"), Severity::Ignore);
+        assert_eq!(severity("sub/foo.py"), Severity::Error);
     }
 }

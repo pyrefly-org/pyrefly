@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::cell::Cell;
 use std::cell::LazyCell;
 use std::cell::RefCell;
 use std::fmt;
@@ -29,14 +30,8 @@ use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::literal::LitStyle;
 use pyrefly_types::literal::Literal;
 use pyrefly_types::series::SeriesSchema;
-use pyrefly_types::shape_index::IndexOp;
-use pyrefly_types::shape_index::index_shape_int;
-use pyrefly_types::shape_index::index_shape_multi;
-use pyrefly_types::shape_index::index_shape_slice;
-use pyrefly_types::shape_index::index_shape_tensor;
 use pyrefly_types::shaped_array::IntTuple;
 use pyrefly_types::shaped_array::IntTupleView;
-use pyrefly_types::shaped_array::ShapedArrayType;
 use pyrefly_types::shaped_array::shape_to_tuple_carrier;
 use pyrefly_types::shaped_array::tuple_carrier_to_shape;
 use pyrefly_types::shaped_array::type_to_dim;
@@ -73,7 +68,6 @@ use ruff_python_ast::FStringPartRef;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::InterpolatedStringElement;
 use ruff_python_ast::InterpolatedStringElements;
-use ruff_python_ast::Keyword;
 use ruff_python_ast::Number;
 use ruff_python_ast::Operator;
 use ruff_python_ast::StringLiteralValue;
@@ -115,6 +109,7 @@ use crate::binding::narrow::int_from_slice;
 use crate::binding::shape_type::ShapeCommentMode;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
+use crate::error::collector::ModuleDiagnostics;
 use crate::error::context::ErrorContext;
 use crate::error::context::TypeCheckContext;
 use crate::error::context::TypeCheckKind;
@@ -128,17 +123,14 @@ use crate::types::class::Class;
 use crate::types::class::ClassType;
 use crate::types::facet::FacetKind;
 use crate::types::literal::Lit;
-use crate::types::param_spec::ParamSpec;
 use crate::types::quantified::Quantified;
 use crate::types::quantified::QuantifiedKind;
+use crate::types::quantified::TypeVarLike;
 use crate::types::sentinel::Sentinel;
 use crate::types::special_form::SpecialForm;
 use crate::types::tuple::Tuple;
 use crate::types::type_info::TypeInfo;
-use crate::types::type_var::PreInferenceVariance;
 use crate::types::type_var::Restriction;
-use crate::types::type_var::TypeVar;
-use crate::types::type_var_tuple::TypeVarTuple;
 use crate::types::types::AnyStyle;
 use crate::types::types::Type;
 
@@ -159,8 +151,8 @@ pub struct ArgumentCache {
 #[derive(Debug)]
 struct CachedArgument {
     ty: TypeInfo,
-    errors: ErrorCollector,
-    hint_errors: ErrorCollector,
+    errors: ModuleDiagnostics,
+    hint_errors: ModuleDiagnostics,
     traces: Option<TraceSideEffects>,
 }
 
@@ -454,57 +446,6 @@ impl Display for ConditionRedundantReason {
 
 pub(crate) const MAX_TUPLE_LENGTH: usize = 256;
 
-fn is_integer_index_scalar_type(ty: &Type) -> bool {
-    match ty {
-        Type::Literal(lit) => matches!(lit.value, Lit::Int(_)),
-        Type::ClassType(cls) => cls.is(KnownClass::Int),
-        Type::Int(_) => true,
-        Type::Union(union) => {
-            !union.members.is_empty() && union.members.iter().all(is_integer_index_scalar_type)
-        }
-        _ => false,
-    }
-}
-
-fn classify_shaped_array_index_type(ty: &Type) -> Option<IndexOp> {
-    match ty {
-        Type::None => Some(IndexOp::NewAxis),
-        Type::ShapedArray(index) => {
-            let shape_index = index.tuple_carrier_shape_arg_index()?;
-            let targs = index.base_class.targs().as_slice();
-            targs
-                .get(shape_index)
-                .expect("registered shape index must reference a type argument");
-            let mut scalar_types = targs
-                .iter()
-                .enumerate()
-                .filter_map(|(i, ty)| (i != shape_index).then_some(ty));
-            let scalar_type = scalar_types.next()?;
-            if scalar_types.next().is_some() || !is_integer_index_scalar_type(scalar_type) {
-                return None;
-            }
-            index
-                .shape()
-                .as_concrete()
-                .map(|dims| IndexOp::ShapedArrayIndex(dims.to_vec()))
-        }
-        Type::Tuple(Tuple::Concrete(elements))
-            if elements.iter().all(is_integer_index_scalar_type) =>
-        {
-            Some(IndexOp::Fancy(Int::Literal(elements.len() as i64)))
-        }
-        Type::Tuple(Tuple::Unbounded(element)) if is_integer_index_scalar_type(element) => {
-            Some(IndexOp::Fancy(Int::Int))
-        }
-        Type::ClassType(cls) if cls.is(KnownClass::List) => match cls.targs().as_slice() {
-            [element] if is_integer_index_scalar_type(element) => Some(IndexOp::Fancy(Int::Int)),
-            _ => None,
-        },
-        _ if is_integer_index_scalar_type(ty) => Some(IndexOp::Int),
-        _ => None,
-    }
-}
-
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn synthesized_functional_class_type(&self, call: &ExprCall) -> Option<Type> {
         let anon_key = Key::Anon(call.range());
@@ -609,7 +550,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 Ok(parsed) => parsed,
                 Err(msg) => {
                     errors
-                        .error_builder(range, ErrorKind::InvalidArgument, msg)
+                        .error_builder(range, ErrorKind::InvalidFormatSpec, msg)
                         .emit();
                     return;
                 }
@@ -637,7 +578,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors
                     .error_builder(
                         range,
-                        ErrorKind::BadArgumentType,
+                        ErrorKind::InvalidFormatSpec,
                         format!(
                             "Incompatible types in string interpolation (expression has type `{}`, placeholder has type `{}`)",
                             self.for_display(actual.clone()),
@@ -701,7 +642,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors
                     .error_builder(
                         range,
-                        ErrorKind::InvalidArgument,
+                        ErrorKind::InvalidFormatSpec,
                         format!(
                             "Invalid format specification `{spec}` for type `{}`: {reason}",
                             self.for_display(actual.clone()),
@@ -714,7 +655,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors
             .error_builder(
                 range,
-                ErrorKind::InvalidArgument,
+                ErrorKind::InvalidFormatSpec,
                 format!(
                     "The type `{}` doesn't support format specifiers",
                     self.for_display(actual.clone()),
@@ -828,6 +769,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .into_ty()
     }
 
+    /// Infer the normal type and observe elements of non-empty, unprojected list/set/dict displays.
+    /// The observation keeps string and bytes literals; other expressions leave it unset.
+    /// This entry point has no type-form context, expected-type check, or argument cache.
+    pub(super) fn expr_infer_for_iteration(
+        &self,
+        x: &Expr,
+        errors: &ErrorCollector,
+    ) -> (Type, Option<Type>) {
+        let iteration_element = Cell::new(None);
+        let ty = self
+            .expr_infer_without_shape_comment_impl(x, None, errors, None, Some(&iteration_element))
+            .into_ty();
+        (ty, iteration_element.take())
+    }
+
     /// Infer a type for an expression, with an optional type hint that influences the inferred type.
     /// Convenience wrapper around `expr_with_options`.
     pub fn expr_infer_with_hint(
@@ -914,9 +870,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if let Some(cached) = cache.outcomes.borrow().get(&key)
             && (cached.traces.is_some() || !self.current().tracing_enabled())
         {
-            errors.extend_from(&cached.errors);
+            cached.errors.replay(errors);
             if let Some(errors) = hint.as_ref().and_then(HintRef::errors) {
-                errors.extend_from(&cached.hint_errors);
+                cached.hint_errors.replay(errors);
             }
             if let Some(traces) = &cached.traces {
                 self.trace_state().replay_traces(traces);
@@ -929,25 +885,28 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let (ty, traces) = self.trace_state().capture_traces(|| {
             self.expr_infer_impl(x, local_hint, &local_errors, type_form_context)
         });
-        errors.extend_from(&local_errors);
-        if let Some(errors) = hint.as_ref().and_then(HintRef::errors) {
-            errors.extend_from(&local_hint_errors);
-        }
         if !ty.has_facets()
             && !ty.ty().may_contain_placeholder_var()
             && !local_errors.has_hard()
             && !local_hint_errors.has_hard()
             && cache.outcomes.borrow().len() < MAX_HINT_WIDTH
         {
-            cache.outcomes.borrow_mut().insert(
-                key,
-                CachedArgument {
-                    ty: ty.clone(),
-                    errors: local_errors,
-                    hint_errors: local_hint_errors,
-                    traces,
-                },
-            );
+            let cached = CachedArgument {
+                ty: ty.clone(),
+                errors: local_errors.finish(),
+                hint_errors: local_hint_errors.finish(),
+                traces,
+            };
+            cached.errors.replay(errors);
+            if let Some(errors) = hint.as_ref().and_then(HintRef::errors) {
+                cached.hint_errors.replay(errors);
+            }
+            cache.outcomes.borrow_mut().insert(key, cached);
+        } else {
+            errors.extend(local_errors);
+            if let Some(errors) = hint.as_ref().and_then(HintRef::errors) {
+                errors.extend(local_hint_errors);
+            }
         }
         ty
     }
@@ -983,6 +942,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         hint: Option<HintRef>,
         errors: &ErrorCollector,
         type_form_context: Option<TypeFormContext<'_>>,
+    ) -> TypeInfo {
+        self.expr_infer_without_shape_comment_impl(x, hint, errors, type_form_context, None)
+    }
+
+    fn expr_infer_without_shape_comment_impl(
+        &self,
+        x: &Expr,
+        hint: Option<HintRef>,
+        errors: &ErrorCollector,
+        type_form_context: Option<TypeFormContext<'_>>,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> TypeInfo {
         // Assignment values and branches of conditional and boolean expressions are checked separately.
         let mut check_deprecation = !matches!(x, Expr::Named(..) | Expr::If(..) | Expr::BoolOp(..));
@@ -1058,7 +1028,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // All other expressions operate at the `Type` level only, so we avoid the overhead of
             // wrapping and unwrapping `TypeInfo` by computing the result as a `Type` and only wrapping
             // at the end.
-            _ => TypeInfo::of_ty(self.expr_infer_impl_helper(x, hint, errors, type_form_context)),
+            _ => TypeInfo::of_ty(self.expr_infer_impl_helper(
+                x,
+                hint,
+                errors,
+                type_form_context,
+                iteration_element,
+            )),
         };
         if check_deprecation {
             self.check_for_deprecated_call(res.ty(), x.range(), errors);
@@ -1075,6 +1051,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         hint: Option<HintRef>,
         errors: &ErrorCollector,
         type_form_context: Option<TypeFormContext<'_>>,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         match x {
             Expr::Name(..) | Expr::Attribute(..) | Expr::Named(..) | Expr::Subscript(..) => {
@@ -1156,7 +1133,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     hint,
                     errors,
                     errors,
-                    |cur_hint, callable_errors, _| {
+                    (),
+                    |(), cur_hint, callable_errors, _| {
                         let _lambda_context = self.enter_lambda_binding_context(
                             param_ids
                                 .iter()
@@ -1266,6 +1244,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             return_hint,
                             callable_errors,
                             None,
+                            None,
                         );
                         match ret {
                             Type::Any(AnyStyle::Implicit) => {
@@ -1276,7 +1255,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     "The return type of this lambda is unknown; it is inferred as an implicit `Any`".to_owned(),
                                 );
                             }
-                            Type::Any(AnyStyle::Error) => self.error_unknown_from_error(
+                            Type::Any(AnyStyle::Error | AnyStyle::MissingImport) => self.error_unknown_from_error(
                                 callable_errors,
                                 lambda.body.range(),
                                 "The return type of this lambda",
@@ -1329,11 +1308,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     self.infer_with_decomposed_hint(
                         hint,
                         |hint| self.decompose_list(hint),
-                        |elt_hint, hint| self.list_literal_infer(x, elt_hint, hint, errors),
+                        |elt_hint, hint| {
+                            self.list_literal_infer(x, elt_hint, hint, errors, iteration_element)
+                        },
                     )
                 }
             }
-            Expr::Dict(x) => self.dict_infer(&x.items, hint, x.range, errors),
+            Expr::Dict(x) => self.dict_infer(&x.items, hint, x.range, errors, iteration_element),
             Expr::Set(x) => self.infer_with_decomposed_hint(
                 hint,
                 |hint| self.decompose_set(hint),
@@ -1350,6 +1331,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             &x.elts,
                             HintRef::with_ty_opt(hint, elem_hint.as_ref()),
                             errors,
+                            iteration_element,
                         );
                         self.heap
                             .mk_class_type(self.stdlib.set(self.unions(elem_tys)))
@@ -1406,6 +1388,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             key_hint,
                             errors,
                             HintCoercion::BestEffort,
+                            None,
                         ),
                         None => self.heap.mk_any_error(),
                     };
@@ -1621,7 +1604,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.check_pytorch_redundant_to_call(callee.expr, &callee.ty, errors);
         self.check_sqlalchemy_keyword_call(callee.expr, errors);
         if let Some(d) = self.call_to_dict(&callee.ty, &callee.expr.arguments) {
-            self.dict_infer(&d, hint, callee.expr.range(), errors)
+            self.dict_infer(&d, hint, callee.expr.range(), errors, None)
         } else if let Some(ty) = self
             .anonymous_typed_dict_get_or_setdefault_with_literal(
                 &callee.expr.func,
@@ -1690,6 +1673,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         coercion: HintCoercion,
     ) -> Type {
         let ty = self.expr_infer_with_hint(x, hint, errors);
+        self.promote_with_hint(ty, x.range(), hint, coercion)
+    }
+
+    fn promote_with_hint(
+        &self,
+        ty: Type,
+        range: TextRange,
+        hint: Option<HintRef>,
+        coercion: HintCoercion,
+    ) -> Type {
         if let Some(hint) = hint {
             let use_hint = |want| match coercion {
                 HintCoercion::Enforced { errors, tcc } => {
@@ -1698,7 +1691,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     // source location; unlike errors, that write is not rolled back when a
                     // speculative union branch is later rejected, so the IDE may show the
                     // expected type from a branch we did not pick. Batch checking is unaffected.
-                    self.check_type(&ty, want, x.range(), errors, tcc);
+                    self.check_type(&ty, want, range, errors, tcc);
                     true
                 }
                 // Use a best-effort hint only if it is compatible.
@@ -1719,15 +1712,30 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         ty.promote(self.stdlib)
     }
 
+    fn observe_iteration_element(&self, ty: &Type, elements: Option<&mut Vec<Type>>) {
+        if let Some(elements) = elements {
+            elements.push(self.distribute_over_union(ty, |ty| match ty {
+                // String and bytes literals retain the length of the value being unpacked.
+                Type::Literal(lit) if matches!(lit.value, Lit::Str(_) | Lit::Bytes(_)) => {
+                    ty.clone()
+                }
+                _ => ty.clone().promote(self.stdlib),
+            }));
+        }
+    }
+
     fn dict_key_infer_with_hint(
         &self,
         x: &Expr,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
         hint_coercion: HintCoercion,
+        iteration_keys: Option<&mut Vec<Type>>,
     ) -> Type {
         let has_hint = hint.is_some();
-        let key_ty = self.expr_infer_with_hint_promote(x, hint, errors, hint_coercion);
+        let ty = self.expr_infer_with_hint(x, hint, errors);
+        self.observe_iteration_element(&ty, iteration_keys);
+        let key_ty = self.promote_with_hint(ty, x.range(), hint, hint_coercion);
         if has_hint {
             key_ty
         } else if matches!(key_ty, Type::LiteralString(_)) {
@@ -2211,6 +2219,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         hint: Option<HintRef>,
         range: TextRange,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         let flattened_items = Ast::flatten_dict_items(items);
         if let Some(hint) = hint {
@@ -2253,7 +2262,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         // Note that we don't need to filter out the TypedDict options here; any non-`dict` options
         // are ignored when decomposing the hint.
-        self.dict_items_infer(range, flattened_items, hint, errors)
+        self.dict_items_infer(range, flattened_items, hint, errors, iteration_element)
     }
 
     /// Infers a type for a dictionary literal with the specified items & an optional contextual hint
@@ -2273,6 +2282,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         items: Vec<&DictItem>,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         self.infer_with_decomposed_hint(
             hint,
@@ -2287,7 +2297,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             },
             |decomposed_hints, hint| {
                 let (key_hint, value_hint) = decomposed_hints.unwrap_or_default();
-                self.dict_items_infer_inner(range, &items, hint, key_hint, value_hint, errors)
+                self.dict_items_infer_inner(
+                    range,
+                    &items,
+                    hint,
+                    key_hint,
+                    value_hint,
+                    errors,
+                    iteration_element,
+                )
             },
         )
     }
@@ -2300,6 +2318,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         key_hint: Option<Type>,
         value_hint: Option<Type>,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         if items.is_empty() {
             let key_ty = key_hint.unwrap_or_else(|| {
@@ -2337,6 +2356,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 .any(|x| x.key.is_some() && !x.value.is_none_literal_expr());
             let mut key_tys = Vec::new();
             let mut value_tys = Vec::new();
+            let mut iteration_keys = iteration_element.map(|_| Vec::with_capacity(items.len()));
             items.iter().for_each(|x| match &x.key {
                 Some(key) => {
                     let key_t = self.dict_key_infer_with_hint(
@@ -2349,6 +2369,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         HintCoercion::new(hint.as_ref(), &|| {
                             TypeCheckContext::of_kind(TypeCheckKind::DictKey)
                         }),
+                        iteration_keys.as_mut(),
                     );
                     let value_t = self.expr_infer_with_hint_promote(
                         &x.value,
@@ -2392,6 +2413,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 None => {
                     let ty = self.expr_infer(&x.value, errors);
+                    let mapping_types = iteration_keys
+                        .as_ref()
+                        .and_then(|_| self.unwrap_mapping_for_unpacking(&ty));
+                    if let Some((key, _)) = &mapping_types
+                        && let Some(keys) = &mut iteration_keys
+                    {
+                        keys.push(key.clone());
+                    }
                     // If the unpacked value is an anonymous typed dict, merge its fields.
                     // Later fields override earlier ones with the same name.
                     if can_create_anonymous_typed_dict
@@ -2404,7 +2433,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 value_tys.push(field.ty.clone());
                             }
                         }
-                    } else if let Some((key_t, value_t)) = self.unwrap_mapping_for_unpacking(&ty) {
+                    } else if let Some((key_t, value_t)) =
+                        mapping_types.or_else(|| self.unwrap_mapping_for_unpacking(&ty))
+                    {
                         // Non-anonymous-typed-dict unpacking disables anonymous typed dict creation
                         can_create_anonymous_typed_dict = false;
                         if !key_t.is_error() {
@@ -2427,15 +2458,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         }
                     } else {
                         can_create_anonymous_typed_dict = false;
-                        self.error(
+                        let ty = self.error(
                             errors,
                             x.value.range(),
                             ErrorKind::InvalidArgument,
                             format!("Expected a mapping, got {}", self.for_display(ty)),
                         );
+                        if let Some(keys) = &mut iteration_keys {
+                            keys.push(ty);
+                        }
                     }
                 }
             });
+            if let Some(element) = iteration_element
+                && let Some(keys) = iteration_keys
+            {
+                element.set(Some(self.unions(keys)));
+            }
             let any_field_has_open_placeholder = typed_dict_fields_map.values().any(|field| {
                 field
                     .ty
@@ -2919,10 +2958,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let attr_errors = self.error_collector();
         let result = self.attr_infer(base, &x.attr.id, x.range, &attr_errors, None);
         // An error `Any` is reported where it arises, not at every access it flows through: a
-        // failed access, such as a missing attribute, is itself the cause, and an access on a base
-        // that is already an error `Any` only propagates it.
-        let from_error_here =
-            !attr_errors.has_hard() && !matches!(base.ty(), Type::Any(AnyStyle::Error));
+        // failed access, such as a missing attribute, is itself the cause. Reading a base that is
+        // already an error `Any`, or a narrowed facet that stands in for a missing attribute, only
+        // propagates an error that was already reported. A declared attribute whose own type is an
+        // error is not missing, so reading it keeps reporting even once it has been narrowed.
+        let from_error_here = result.ty().is_error()
+            && !attr_errors.has_hard()
+            && !base.ty().is_error()
+            && !(base
+                .type_at_facet(&FacetKind::Attribute(x.attr.id.clone()))
+                .is_some_and(Type::is_error)
+                && self.attr_error_from_missing(base.ty(), &x.attr.id));
         errors.extend(attr_errors);
         match result.ty() {
             // Like pyright, every access whose type is an implicit `Any` is reported, including
@@ -2938,11 +2984,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ),
                 );
             }
-            Type::Any(AnyStyle::Error) if from_error_here => self.error_unknown_from_error(
-                errors,
-                x.attr.range,
-                format!("The type of attribute `{}`", x.attr.id),
-            ),
+            Type::Any(AnyStyle::Error | AnyStyle::MissingImport) if from_error_here => self
+                .error_unknown_from_error(
+                    errors,
+                    x.attr.range,
+                    format!("The type of attribute `{}`", x.attr.id),
+                ),
             Type::Any(AnyStyle::Explicit) => self.error_explicit_any_use(
                 errors,
                 x.attr.range,
@@ -3138,25 +3185,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         })
     }
 
-    fn literal_bool_infer(&self, x: &Expr, errors: &ErrorCollector) -> bool {
-        let ty = self.expr_infer(x, errors);
-        match ty {
-            Type::Literal(lit) if let Lit::Bool(b) = lit.value => b,
-            _ => {
-                self.error(
-                    errors,
-                    x.range(),
-                    ErrorKind::InvalidLiteral,
-                    format!(
-                        "Expected literal `True` or `False`, got `{}`",
-                        self.for_display(ty)
-                    ),
-                );
-                false
-            }
-        }
-    }
-
     pub fn sentinel_from_call(
         &self,
         assignment_name: Identifier,
@@ -3221,10 +3249,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             match &kw.arg {
                 Some(id) => match id.id.as_str() {
                     "repr" => {
+                        // The `Sentinel` constructor accepts `repr: str | None`.
                         let got = self.expr_infer(&kw.value, errors);
-                        if !self
-                            .is_subset_eq(&got, &self.heap.mk_class_type(self.stdlib.str().clone()))
-                        {
+                        if !self.is_subset_eq(
+                            &got,
+                            &self
+                                .heap
+                                .mk_optional(self.heap.mk_class_type(self.stdlib.str().clone())),
+                        ) {
                             self.error(
                                 errors,
                                 kw.range,
@@ -3256,404 +3288,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         Sentinel::new(sentinel_name, nesting_context, self.module().dupe())
     }
 
-    pub fn typevar_from_call(
-        &self,
-        name: Identifier,
-        x: &ExprCall,
-        kind: QuantifiedKind,
-        errors: &ErrorCollector,
-    ) -> TypeVar {
-        let construct = kind.to_string();
-        let mut arg_name = false;
-        let mut restriction = None;
-        let mut default: Option<&Expr> = None;
-        let mut variance = None;
-
-        let check_name_arg = |arg: &Expr| {
-            if let Expr::StringLiteral(lit) = arg {
-                if lit.value.to_str() != name.id.as_str() {
-                    self.error(
-                        errors,
-                        x.range(),
-                        ErrorKind::InvalidTypeVar,
-                        format!(
-                            "{construct} must be assigned to a variable named `{}`",
-                            lit.value.to_str()
-                        ),
-                    );
-                }
-            } else {
-                self.error(
-                    errors,
-                    arg.range(),
-                    ErrorKind::InvalidTypeVar,
-                    format!("Expected first argument of {construct} to be a string literal"),
-                );
-            }
-        };
-
-        let mut try_set_variance = |kw: &Keyword, v: PreInferenceVariance| {
-            if self.literal_bool_infer(&kw.value, errors) {
-                if variance.is_some() {
-                    self.error(
-                        errors,
-                        kw.range,
-                        ErrorKind::InvalidTypeVar,
-                        "Contradictory variance specifications".to_owned(),
-                    );
-                } else {
-                    variance = Some(v);
-                }
-            }
-        };
-
-        let mut iargs = x.arguments.args.iter();
-        if let Some(arg) = iargs.next() {
-            check_name_arg(arg);
-            arg_name = true;
-        }
-
-        let constraints: Vec<Type> = iargs
-            .map(|arg| self.expr_untype(arg, TypeFormContext::TypeVarConstraint, errors))
-            .collect();
-        if !constraints.is_empty() {
-            restriction = Some(Restriction::Constraints(constraints));
-        }
-
-        for kw in &x.arguments.keywords {
-            match &kw.arg {
-                Some(id) => match id.id.as_str() {
-                    "bound" => {
-                        let bound =
-                            self.expr_untype(&kw.value, TypeFormContext::TypeVarConstraint, errors);
-                        if restriction.is_some() {
-                            self.error(
-                                errors,
-                                kw.range,
-                                ErrorKind::InvalidTypeVar,
-                                format!("{construct} cannot have both constraints and bound"),
-                            );
-                            restriction = Some(Restriction::Unrestricted);
-                        } else if self.reject_legacy_shape_extension_bound(
-                            &bound,
-                            kw.value.range(),
-                            errors,
-                        ) {
-                            restriction = Some(Restriction::Unrestricted);
-                        } else {
-                            restriction = Some(Restriction::Bound(bound));
-                        }
-                    }
-                    "default" => {
-                        default = Some(&kw.value);
-                    }
-                    "covariant" => try_set_variance(kw, PreInferenceVariance::Covariant),
-                    "contravariant" => try_set_variance(kw, PreInferenceVariance::Contravariant),
-                    "invariant" => try_set_variance(kw, PreInferenceVariance::Invariant),
-                    "infer_variance" => try_set_variance(kw, PreInferenceVariance::Undefined),
-                    "name" => {
-                        if arg_name {
-                            self.error(
-                                errors,
-                                kw.range,
-                                ErrorKind::InvalidTypeVar,
-                                "Multiple values for argument `name`".to_owned(),
-                            );
-                        } else {
-                            check_name_arg(&kw.value);
-                            arg_name = true;
-                        }
-                    }
-                    _ => {
-                        self.error(
-                            errors,
-                            kw.range,
-                            ErrorKind::InvalidTypeVar,
-                            format!("Unexpected keyword argument `{}` to {construct}", id.id),
-                        );
-                    }
-                },
-                _ => {
-                    self.error(
-                        errors,
-                        kw.range,
-                        ErrorKind::InvalidTypeVar,
-                        format!("Cannot pass unpacked keyword arguments to {construct}"),
-                    );
-                }
-            }
-        }
-
-        if !arg_name {
-            self.error(
-                errors,
-                x.range(),
-                ErrorKind::InvalidTypeVar,
-                "Missing `name` argument".to_owned(),
-            );
-        }
-        // If we ended up with a single constraint, emit an error and treat as unrestricted.
-        if let Some(Restriction::Constraints(cs)) = &restriction
-            && cs.len() < 2
-        {
-            self.error(
-                errors,
-                x.range(),
-                ErrorKind::InvalidTypeVar,
-                format!(
-                    "Expected at least 2 constraints in {construct} `{}`, got {}",
-                    name.id,
-                    cs.len(),
-                ),
-            );
-            restriction = Some(Restriction::Unrestricted);
-        }
-        let restriction = restriction.unwrap_or(Restriction::Unrestricted);
-        let mut default_value = None;
-        if let Some(default_expr) = default {
-            let default_ty = if let Some(default) =
-                self.parse_int_tuple_type_var_default(default_expr, &restriction, errors)
-            {
-                default
-            } else {
-                self.expr_untype(
-                    default_expr,
-                    TypeFormContext::quantified_kind_default(kind),
-                    errors,
-                )
-            };
-            default_value = Some(self.validate_type_var_default(
-                &name.id,
-                kind,
-                &default_ty,
-                default_expr.range(),
-                &restriction,
-                errors,
-            ));
-        }
-
-        let variance = variance.unwrap_or(PreInferenceVariance::Invariant);
-
-        TypeVar::new_with_kind(
-            name,
-            self.module().dupe(),
-            kind,
-            restriction,
-            default_value,
-            variance,
-        )
-    }
-
-    pub fn paramspec_from_call(
-        &self,
-        name: Identifier,
-        x: &ExprCall,
-        errors: &ErrorCollector,
-    ) -> ParamSpec {
-        // TODO: check and complain on extra args, keywords
-        let mut arg_name = false;
-
-        let check_name_arg = |arg: &Expr| {
-            if let Expr::StringLiteral(lit) = arg {
-                if lit.value.to_str() != name.id.as_str() {
-                    self.error(
-                        errors,
-                        x.range(),
-                        ErrorKind::InvalidParamSpec,
-                        format!(
-                            "ParamSpec must be assigned to a variable named `{}`",
-                            lit.value.to_str()
-                        ),
-                    );
-                }
-            } else {
-                self.error(
-                    errors,
-                    arg.range(),
-                    ErrorKind::InvalidParamSpec,
-                    "Expected first argument of ParamSpec to be a string literal".to_owned(),
-                );
-            }
-        };
-
-        if let Some(arg) = x.arguments.args.first() {
-            check_name_arg(arg);
-            arg_name = true;
-        }
-        let mut default = None;
-        for kw in &x.arguments.keywords {
-            match &kw.arg {
-                Some(id) => match id.id.as_str() {
-                    "name" => {
-                        if arg_name {
-                            self.error(
-                                errors,
-                                kw.range,
-                                ErrorKind::InvalidParamSpec,
-                                "Multiple values for argument `name`".to_owned(),
-                            );
-                        } else {
-                            check_name_arg(&kw.value);
-                            arg_name = true;
-                        }
-                    }
-                    "default" => {
-                        default = Some((
-                            self.expr_untype(&kw.value, TypeFormContext::ParamSpecDefault, errors),
-                            kw.range(),
-                        ));
-                    }
-                    _ => {
-                        self.error(
-                            errors,
-                            kw.range,
-                            ErrorKind::InvalidParamSpec,
-                            format!("Unexpected keyword argument `{}` to ParamSpec", id.id),
-                        );
-                    }
-                },
-                _ => {
-                    self.error(
-                        errors,
-                        kw.range,
-                        ErrorKind::InvalidParamSpec,
-                        "Cannot pass unpacked keyword arguments to ParamSpec".to_owned(),
-                    );
-                }
-            }
-        }
-
-        if !arg_name {
-            self.error(
-                errors,
-                x.range(),
-                ErrorKind::InvalidParamSpec,
-                "Missing `name` argument".to_owned(),
-            );
-        }
-        let mut default_value = None;
-        if let Some((default_ty, default_range)) = default {
-            default_value = Some(self.validate_type_var_default(
-                &name.id,
-                QuantifiedKind::ParamSpec,
-                &default_ty,
-                default_range,
-                &Restriction::Unrestricted,
-                errors,
-            ));
-        }
-        ParamSpec::new(name, self.module().dupe(), default_value)
-    }
-
-    pub fn typevartuple_from_call(
-        &self,
-        name: Identifier,
-        x: &ExprCall,
-        errors: &ErrorCollector,
-    ) -> TypeVarTuple {
-        let mut arg_name = false;
-        let check_name_arg = |arg: &Expr| {
-            if let Expr::StringLiteral(lit) = arg {
-                if lit.value.to_str() != name.id.as_str() {
-                    self.error(
-                        errors,
-                        x.range(),
-                        ErrorKind::InvalidTypeVarTuple,
-                        format!(
-                            "TypeVarTuple must be assigned to a variable named `{}`",
-                            lit.value.to_str()
-                        ),
-                    );
-                }
-            } else {
-                self.error(
-                    errors,
-                    arg.range(),
-                    ErrorKind::InvalidTypeVarTuple,
-                    "Expected first argument of TypeVarTuple to be a string literal".to_owned(),
-                );
-            }
-        };
-        if let Some(arg) = x.arguments.args.first() {
-            check_name_arg(arg);
-            arg_name = true;
-        }
-        if let Some(arg) = x.arguments.args.get(1) {
-            self.error(
-                errors,
-                arg.range(),
-                ErrorKind::InvalidTypeVarTuple,
-                "Unexpected positional argument to TypeVarTuple".to_owned(),
-            );
-        }
-        let mut default = None;
-        for kw in &x.arguments.keywords {
-            match &kw.arg {
-                Some(id) => match id.id.as_str() {
-                    "name" => {
-                        if arg_name {
-                            self.error(
-                                errors,
-                                kw.range,
-                                ErrorKind::InvalidTypeVarTuple,
-                                "Multiple values for argument `name`".to_owned(),
-                            );
-                        } else {
-                            check_name_arg(&kw.value);
-                            arg_name = true;
-                        }
-                    }
-                    "default" => {
-                        default = Some((
-                            self.expr_untype(
-                                &kw.value,
-                                TypeFormContext::TypeVarTupleDefault,
-                                errors,
-                            ),
-                            kw.range(),
-                        ));
-                    }
-                    _ => {
-                        self.error(
-                            errors,
-                            kw.range,
-                            ErrorKind::InvalidTypeVarTuple,
-                            format!("Unexpected keyword argument `{}` to TypeVarTuple", id.id),
-                        );
-                    }
-                },
-                _ => {
-                    self.error(
-                        errors,
-                        kw.range,
-                        ErrorKind::InvalidTypeVarTuple,
-                        "Cannot pass unpacked keyword arguments to TypeVarTuple".to_owned(),
-                    );
-                }
-            }
-        }
-        if !arg_name {
-            self.error(
-                errors,
-                x.range(),
-                ErrorKind::InvalidTypeVarTuple,
-                "Missing `name` argument".to_owned(),
-            );
-        }
-        let mut default_value = None;
-        if let Some((default_ty, default_range)) = default {
-            default_value = Some(self.validate_type_var_default(
-                &name.id,
-                QuantifiedKind::TypeVarTuple,
-                &default_ty,
-                default_range,
-                &Restriction::Unrestricted,
-                errors,
-            ));
-        }
-        TypeVarTuple::new(name, self.module().dupe(), default_value)
-    }
-
     /// Infer an ordinary list after contextual-hint decomposition.
     fn list_literal_infer(
         &self,
@@ -3661,6 +3295,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         elt_hint: Option<Type>,
         hint: Option<HintRef>,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Type {
         if list.is_empty() {
             let elem_ty = elt_hint.unwrap_or_else(|| {
@@ -3674,6 +3309,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 &list.elts,
                 HintRef::with_ty_opt(hint, elt_hint.as_ref()),
                 errors,
+                iteration_element,
             );
             self.heap
                 .mk_class_type(self.stdlib.list(self.unions(elem_tys)))
@@ -3686,6 +3322,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         elts: &[Expr],
         elt_hint: Option<HintRef>,
         errors: &ErrorCollector,
+        iteration_element: Option<&Cell<Option<Type>>>,
     ) -> Vec<Type> {
         let star_hint = LazyCell::new(|| {
             elt_hint.map(|hint| {
@@ -3695,18 +3332,30 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 )
             })
         });
-        elts.map(|x| match x {
+        let mut iteration_types = iteration_element.map(|_| Vec::with_capacity(elts.len()));
+        let elem_tys = elts.map(|x| match x {
             Expr::Starred(ExprStarred { value, .. }) => {
-                let unpacked_ty = self.expr_infer_with_hint_promote(
-                    value,
-                    HintRef::with_ty_opt(elt_hint, star_hint.as_ref()),
-                    errors,
+                let hint = HintRef::with_ty_opt(elt_hint, star_hint.as_ref());
+                // Only starred expansion carries the root observation into a child display.
+                let (unpacked_ty, observed) = if iteration_element.is_some() {
+                    self.expr_infer_for_iteration(value, errors)
+                } else {
+                    (self.expr_infer_with_hint(value, hint, errors), None)
+                };
+                let unpacked_ty = self.promote_with_hint(
+                    unpacked_ty,
+                    value.range(),
+                    hint,
                     HintCoercion::BestEffort,
                 );
                 if let Some(iterable_ty) = self.unwrap_iterable(&unpacked_ty) {
+                    self.observe_iteration_element(
+                        observed.as_ref().unwrap_or(&iterable_ty),
+                        iteration_types.as_mut(),
+                    );
                     iterable_ty
                 } else {
-                    self.error(
+                    let ty = self.error(
                         errors,
                         x.range(),
                         ErrorKind::NotIterable,
@@ -3714,11 +3363,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             "Expected an iterable, got `{}`",
                             self.for_display(unpacked_ty)
                         ),
-                    )
+                    );
+                    self.observe_iteration_element(&ty, iteration_types.as_mut());
+                    ty
                 }
             }
-            _ => self.expr_infer_with_hint_promote(x, elt_hint, errors, HintCoercion::BestEffort),
-        })
+            _ => {
+                let ty = self.expr_infer_with_hint(x, elt_hint, errors);
+                self.observe_iteration_element(&ty, iteration_types.as_mut());
+                self.promote_with_hint(ty, x.range(), elt_hint, HintCoercion::BestEffort)
+            }
+        });
+        if let Some(element) = iteration_element
+            && let Some(types) = iteration_types
+        {
+            element.set(Some(self.unions(types)));
+        }
+        elem_tys
     }
 
     fn is_enum_class_type(&self, ty: &Type) -> bool {
@@ -3906,7 +3567,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     let mut failures = Vec::new();
                     for member in specialized {
                         let snapshot = self.solver().snapshot_reachable_vars(&roots);
-                        let member_errors = if matches!(index_ty, Type::Any(AnyStyle::Error)) {
+                        let member_errors = if matches!(index_ty, Type::Any(AnyStyle::Error | AnyStyle::MissingImport)) {
                             self.error_swallower()
                         } else {
                             self.error_collector()
@@ -4093,16 +3754,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ),
                     }
                 }
-                // Shaped-array type parsing for registered array classes.
-                Type::ClassDef(ref cls) if self.is_shaped_array_class(cls) => {
-                    Type::type_of(self.parse_registered_shaped_array_type(
-                        cls,
-                        xs,
-                        range,
-                        type_form_context,
-                        errors,
-                    ))
-                }
                 Type::ClassDef(ref cls) if self.is_int_tuple_class(cls) => {
                     self.parse_int_tuple_type(xs, type_form_context, errors)
                 }
@@ -4170,7 +3821,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ),
                 Type::Type(f) if matches!(&*f, Type::Quantified(q) if q.is_type_var()) => {
                     // Repeated match because pattern guards cannot move out of bindings.
-                    let Type::Quantified(quantified) = *f else { unreachable!("guarded by matches! above") };
+                    let Type::Quantified(quantified) = *f else {
+                        unreachable!("guarded by matches! above")
+                    };
                     let quantified = *quantified;
                     let base_display_ty =
                         self.heap.mk_type_of(self.heap.mk_quantified(quantified.clone()));
@@ -4299,35 +3952,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         Some(&|| ErrorContext::Index(self.for_display(base.clone()))),
                     )
-                }
-                // Tensor indexing: tensor[0] reduces dimensionality
-                Type::ShapedArray(ref shaped_array_type)
-                    if self.uses_builtin_shaped_array_indexing(
-                        shaped_array_type.base_class.class_object(),
-                    ) =>
-                {
-                    self.infer_shaped_array_index(shaped_array_type, slice, range, errors)
-                }
-                // Shaped arrays that opt out of built-in indexing use their declared method.
-                Type::ShapedArray(_) => {
-                    let receiver = target.with_base(&base).getitem_receiver();
-                    self.call_method_or_error(
-                        receiver,
-                        &dunder::GETITEM,
-                        range,
-                        &[CallArg::expr(slice)],
-                        &[],
-                        errors,
-                        Some(&|| ErrorContext::Index(self.for_display(receiver.clone()))),
-                    )
-                }
-                // Shaped arrays that have not gone through annotation
-                // canonicalization still use tensor indexing logic.
-                Type::ClassType(ref cls)
-                    if self.uses_builtin_shaped_array_indexing(cls.class_object()) =>
-                {
-                    let shaped_array_type = self.shaped_array_classtype_to_shaped_array_type(cls);
-                    self.infer_shaped_array_index(&shaped_array_type, slice, range, errors)
                 }
                 Type::ClassType(ref cls) | Type::SelfType(ref cls)
                     if let Some(tuple) = self.as_tuple(cls)
@@ -4609,204 +4233,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         })
     }
 
-    /// Handle tensor indexing operations
-    /// - Integer index: reduces dimensionality by 1 (removes first dimension)
-    /// - Slice: preserves dimensionality (keeps all dimensions)
-    fn infer_shaped_array_index(
-        &self,
-        shaped_array_type: &ShapedArrayType,
-        index: &Expr,
-        range: TextRange,
-        errors: &ErrorCollector,
-    ) -> Type {
-        // Convert a slice bound expression to a dimension type.
-        // For unary negation (-expr), we preserve the Mul(-1, ...) wrapper
-        // without canonicalizing, so adjust_negative can detect negative bounds
-        // even after the distributive law would otherwise distribute -1 across sums.
-        let to_dim = |expr: &Expr| -> Int {
-            // Detect syntactic unary minus: -(inner)
-            if let Expr::UnaryOp(x) = expr
-                && x.op == UnaryOp::USub
-            {
-                let inner_ty = self.expr_infer(&x.operand, errors);
-                let inner_dim = match type_to_dim(&inner_ty) {
-                    Some(Int::Literal(val)) => {
-                        // Literal negation: just negate the value directly
-                        return Int::Literal(-val);
-                    }
-                    Some(dim) => dim,
-                    None => return Int::Int,
-                };
-                // Wrap in Mul(-1, ...) WITHOUT canonicalizing.
-                // This preserves the structural signal for adjust_negative.
-                // The final canonicalization happens in `IntTuple`.
-                return Int::Mul(Box::new(Int::Literal(-1)), Box::new(inner_dim));
-            }
-            let ty = self.expr_infer(expr, errors);
-            type_to_dim(&ty).unwrap_or(Int::Int)
-        };
-
-        let classify = |expr: &Expr, inferred: Option<&Type>| -> Option<IndexOp> {
-            match expr {
-                Expr::Slice(ExprSlice {
-                    lower, upper, step, ..
-                }) => {
-                    let start = lower.as_ref().map(|e| to_dim(e));
-                    let stop = upper.as_ref().map(|e| to_dim(e));
-                    let step_val = step.as_ref().map(|e| to_dim(e));
-                    Some(IndexOp::Slice {
-                        start,
-                        stop,
-                        step: step_val,
-                    })
-                }
-                Expr::List(ExprList { elts, .. })
-                    if elts.iter().all(|elt| !matches!(elt, Expr::Starred(_)))
-                        && elts.iter().all(|elt| {
-                            matches!(
-                                classify_shaped_array_index_type(&self.expr_infer(elt, errors)),
-                                Some(IndexOp::Int)
-                            )
-                        }) =>
-                {
-                    Some(IndexOp::Fancy(Int::Literal(elts.len() as i64)))
-                }
-                _ => match inferred {
-                    Some(ty) => classify_shaped_array_index_type(ty),
-                    None => classify_shaped_array_index_type(&self.expr_infer(expr, errors)),
-                },
-            }
-        };
-
-        match index {
-            // Slice operation: tensor[start:stop:step]
-            Expr::Slice(ExprSlice {
-                lower, upper, step, ..
-            }) => {
-                let start = lower.as_ref().map(|e| to_dim(e));
-                let stop = upper.as_ref().map(|e| to_dim(e));
-                let step_val = step.as_ref().map(|e| to_dim(e));
-                match index_shape_slice(&shaped_array_type.shape(), start, stop, step_val) {
-                    Ok(shape) => self
-                        .shaped_array_with_shape(shaped_array_type, shape)
-                        .to_type(),
-                    Err(err) => self.error(errors, range, ErrorKind::BadIndex, err.to_string()),
-                }
-            }
-            // Bare ellipsis: tensor[...] - preserves entire shape
-            Expr::EllipsisLiteral(_) => shaped_array_type.clone().to_type(),
-            // None index: tensor[None] - inserts a new dimension of size 1 at the front
-            Expr::NoneLiteral(_) => {
-                match index_shape_multi(&shaped_array_type.shape(), &[IndexOp::NewAxis], &[], false)
-                {
-                    Ok(shape) => self
-                        .shaped_array_with_shape(shaped_array_type, shape)
-                        .to_type(),
-                    Err(err) => self.error(errors, range, ErrorKind::BadIndex, err.to_string()),
-                }
-            }
-            // Tuple index: tensor[:, -1, :] - apply each index to corresponding dimension
-            Expr::Tuple(ExprTuple { elts, .. }) => {
-                // Check for ellipsis and validate at most one
-                let mut ellipsis_pos: Option<usize> = None;
-                for (i, elt) in elts.iter().enumerate() {
-                    if matches!(elt, Expr::EllipsisLiteral(_)) {
-                        if ellipsis_pos.is_some() {
-                            return self.error(
-                                errors,
-                                range,
-                                ErrorKind::BadIndex,
-                                "Multiple ellipsis not allowed in tensor index".to_owned(),
-                            );
-                        }
-                        ellipsis_pos = Some(i);
-                    }
-                }
-
-                // Split indices at ellipsis into pre and post groups
-                let (pre_exprs, post_exprs) = match ellipsis_pos {
-                    Some(pos) => (&elts[..pos], &elts[pos + 1..]),
-                    None => (&elts[..], &elts[0..0]),
-                };
-
-                // Classify all index expressions into IndexOps
-                let pre_ops: Option<Vec<IndexOp>> =
-                    pre_exprs.iter().map(|expr| classify(expr, None)).collect();
-                let post_ops: Option<Vec<IndexOp>> =
-                    post_exprs.iter().map(|expr| classify(expr, None)).collect();
-                let (Some(pre_ops), Some(post_ops)) = (pre_ops, post_ops) else {
-                    return self.shaped_array_shapeless(shaped_array_type).to_type();
-                };
-
-                match index_shape_multi(
-                    &shaped_array_type.shape(),
-                    &pre_ops,
-                    &post_ops,
-                    ellipsis_pos.is_some(),
-                ) {
-                    Ok(shape) => self
-                        .shaped_array_with_shape(shaped_array_type, shape)
-                        .to_type(),
-                    Err(err) => self.error(errors, range, ErrorKind::BadIndex, err.to_string()),
-                }
-            }
-            _ => {
-                let index_ty = self.expr_infer(index, errors);
-                if let Type::Tuple(tuple) = &index_ty {
-                    let Tuple::Concrete(elements) = tuple else {
-                        return self.shaped_array_shapeless(shaped_array_type).to_type();
-                    };
-                    let Some(ops) = elements
-                        .iter()
-                        .map(classify_shaped_array_index_type)
-                        .collect::<Option<Vec<_>>>()
-                    else {
-                        return self.shaped_array_shapeless(shaped_array_type).to_type();
-                    };
-                    return match index_shape_multi(&shaped_array_type.shape(), &ops, &[], false) {
-                        Ok(shape) => self
-                            .shaped_array_with_shape(shaped_array_type, shape)
-                            .to_type(),
-                        Err(err) => self.error(errors, range, ErrorKind::BadIndex, err.to_string()),
-                    };
-                }
-
-                match classify(index, Some(&index_ty)) {
-                    Some(IndexOp::Int) => match index_shape_int(&shaped_array_type.shape()) {
-                        Ok(shape) => self
-                            .shaped_array_with_shape(shaped_array_type, shape)
-                            .to_type(),
-                        Err(err) => self.error(errors, range, ErrorKind::BadIndex, err.to_string()),
-                    },
-                    Some(IndexOp::ShapedArrayIndex(idx_dims)) => {
-                        match index_shape_tensor(&shaped_array_type.shape(), &idx_dims) {
-                            Ok(shape) => self
-                                .shaped_array_with_shape(shaped_array_type, shape)
-                                .to_type(),
-                            Err(err) => {
-                                self.error(errors, range, ErrorKind::BadIndex, err.to_string())
-                            }
-                        }
-                    }
-                    Some(op @ IndexOp::Fancy(_)) | Some(op @ IndexOp::NewAxis) => {
-                        match index_shape_multi(&shaped_array_type.shape(), &[op], &[], false) {
-                            Ok(shape) => self
-                                .shaped_array_with_shape(shaped_array_type, shape)
-                                .to_type(),
-                            Err(err) => {
-                                self.error(errors, range, ErrorKind::BadIndex, err.to_string())
-                            }
-                        }
-                    }
-                    Some(IndexOp::Slice { .. }) => {
-                        unreachable!("slice indices are handled before generic index dispatch")
-                    }
-                    None => self.shaped_array_shapeless(shaped_array_type).to_type(),
-                }
-            }
-        }
-    }
-
     fn is_pytorch_tensor_type(ty: &Type) -> bool {
         fn is_torch_tensor_class(cls: &ClassType) -> bool {
             matches!(
@@ -4817,28 +4243,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
         match ty {
             Type::ClassType(cls) => is_torch_tensor_class(cls),
-            Type::ShapedArray(shaped_array) => is_torch_tensor_class(&shaped_array.base_class),
             _ => false,
         }
-    }
-
-    /// Check if a class should use shaped-array type parsing.
-    pub(crate) fn is_shaped_array_class(&self, cls: &Class) -> bool {
-        self.shaped_array_shape_for_class(cls).is_some()
-    }
-
-    pub(crate) fn shaped_array_shape_arg_index(&self, cls: &ClassType) -> Option<usize> {
-        let shape_param = self.shaped_array_shape_for_class_type(cls)?;
-        self.get_class_tparams(cls.class_object())?
-            .iter()
-            .position(|param| param == &shape_param)
-    }
-
-    pub(crate) fn shaped_array_shape_arg(&self, cls: &ClassType) -> Option<Type> {
-        let shape_idx = self.shaped_array_shape_arg_index(cls)?;
-        let mut shape_arg = cls.targs().as_slice().get(shape_idx)?.clone();
-        self.expand_mut(&mut shape_arg);
-        Some(shape_arg)
     }
 
     pub(crate) fn shape_arg_to_int_tuple(&self, shape_arg: &Type) -> Option<IntTuple> {
@@ -4854,112 +4260,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 is_int_tuple_bound(&upper_bound, &int_type)
                     .then(|| IntTuple::unpacked(Vec::new(), shape_arg.clone(), Vec::new()))
             })
-    }
-
-    pub(crate) fn shaped_array_classtype_to_shaped_array_type(
-        &self,
-        cls: &ClassType,
-    ) -> ShapedArrayType {
-        // Derive the index and argument from a single metadata lookup rather
-        // than re-resolving through `shaped_array_shape_arg_index`/`_arg`, which
-        // would force the (expensive) class shape metadata two more times.
-        let shape_param = self
-            .shaped_array_shape_for_class_type(cls)
-            .expect("registered shaped-array class should have shape metadata");
-        let shape_idx = self
-            .get_class_tparams(cls.class_object())
-            .iter()
-            .flat_map(|tparams| tparams.iter())
-            .position(|param| param == &shape_param)
-            .expect("shaped-array metadata should refer to a class type parameter");
-        let mut shape_arg = cls
-            .targs()
-            .as_slice()
-            .get(shape_idx)
-            .expect("class type should have an argument for each type parameter")
-            .clone();
-        self.expand_mut(&mut shape_arg);
-        match shape_param.kind() {
-            QuantifiedKind::TypeVar | QuantifiedKind::IntVar => {
-                let shape = self
-                    .shape_arg_to_int_tuple(&shape_arg)
-                    .unwrap_or_else(IntTuple::shapeless);
-                let mut base_class = cls.clone();
-                let shape_arg = base_class
-                    .targs_mut()
-                    .as_mut()
-                    .get_mut(shape_idx)
-                    .expect("class type should have an argument for each type parameter");
-                *shape_arg = shape.to_shape_arg_type();
-                ShapedArrayType::new(base_class, shape).with_tuple_carrier_shape_arg(shape_idx)
-            }
-            QuantifiedKind::TypeVarTuple => unreachable!(
-                "shaped-array metadata validation rejects TypeVarTuple shape parameters"
-            ),
-            QuantifiedKind::ParamSpec => {
-                unreachable!("shaped-array metadata validation rejects ParamSpec shape parameters")
-            }
-        }
-    }
-
-    /// Build a shaped-array type with a new semantic shape.
-    ///
-    /// Registered arrays store their shape in the metadata-selected class type
-    /// argument; unregistered arrays store it inline. Non-shape class arguments
-    /// such as `DType` are preserved.
-    pub(crate) fn shaped_array_with_shape(
-        &self,
-        tensor: &ShapedArrayType,
-        shape: IntTuple,
-    ) -> ShapedArrayType {
-        match self.shaped_array_shape_for_class_type(&tensor.base_class) {
-            Some(shape_param) => match shape_param.kind() {
-                QuantifiedKind::TypeVar | QuantifiedKind::IntVar => {
-                    let shape_idx = self
-                        .shaped_array_shape_arg_index(&tensor.base_class)
-                        .expect("shaped-array metadata should refer to a class type parameter");
-                    let mut tensor = tensor.clone();
-                    // A registered shaped-array class stores its shape in the
-                    // carrier argument at `shape_idx`, so `TupleCarrier` is the
-                    // coherent style regardless of the input's prior style (e.g. a
-                    // stale `Unknown`): we normalize it to match where the shape
-                    // now actually lives.
-                    tensor.set_tuple_carrier_shape_arg(shape_idx);
-                    tensor.set_shape(shape);
-                    tensor
-                }
-                QuantifiedKind::TypeVarTuple => unreachable!(
-                    "shaped-array metadata validation rejects TypeVarTuple shape parameters"
-                ),
-                QuantifiedKind::ParamSpec => {
-                    unreachable!(
-                        "shaped-array metadata validation rejects ParamSpec shape parameters"
-                    )
-                }
-            },
-            None => {
-                // A `TupleCarrier` shape lives in a registered class argument, so
-                // such a tensor always takes the `Some` branch above; only inline
-                // arrays (no registration metadata) reach here. Assert that
-                // invariant, since `new` produces an inline shape and would
-                // otherwise silently drop a carrier index -- which participates in
-                // `ShapedArrayType` identity / `Eq` / `Hash`.
-                assert!(
-                    tensor.tuple_carrier_shape_arg_index().is_none(),
-                    "a tuple-carrier shaped array reached the unregistered-class branch"
-                );
-                ShapedArrayType::new(tensor.base_class.clone(), shape)
-            }
-        }
-    }
-
-    /// Build a shapeless shaped-array type while keeping the raw tuple carrier
-    /// coherent. A plain `ShapedArrayType::shapeless` would leave the old carrier
-    /// (e.g. an unknown-rank `S`) on `base_class`, so `.shape` would stale-read the
-    /// pre-operation shape. Routing through `shaped_array_with_shape` rewrites the
-    /// carrier to the shapeless form too.
-    fn shaped_array_shapeless(&self, tensor: &ShapedArrayType) -> ShapedArrayType {
-        self.shaped_array_with_shape(tensor, IntTuple::shapeless())
     }
 
     /// Check if a class is a Int class (shape_extensions.Int)
@@ -5047,13 +4347,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if context.allows_explicit_int_wrapper()
                 && matches!(base, Type::ClassDef(ref cls) if self.is_int_class(cls))
             {
-                let wrapper_errors = self.error_collector();
-                let wrapped = self.expr_untype(expr, type_form_context, &wrapper_errors);
-                errors.extend(wrapper_errors);
+                let wrapped = self.try_parse_int_type(
+                    Ast::unpack_slice(&x.slice),
+                    expr.range(),
+                    type_form_context,
+                    errors,
+                );
                 return match wrapped {
-                    Type::Int(_) => Ok(wrapped),
-                    Type::Any(AnyStyle::Explicit | AnyStyle::Implicit) => Ok(gradual_size()),
-                    _ => Err(DimensionExprError::InvalidExplicitIntWrapper),
+                    Ok(ty) => match self.untype(ty, expr.range(), errors) {
+                        ty @ Type::Int(_) => Ok(ty),
+                        Type::Any(_) => Ok(gradual_size()),
+                        _ => Err(DimensionExprError::InvalidExplicitIntWrapper),
+                    },
+                    Err(()) => Err(DimensionExprError::InvalidExplicitIntWrapper),
                 };
             }
         }
@@ -5139,7 +4445,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 Ok(Type::Quantified(q))
                             }
                             Some(ty @ Type::TypeVar(_)) => Ok(ty),
-                            Some(ty) if ty.is_error() => Ok(ty),
+                            Some(ty @ Type::Any(_)) => Ok(ty),
                             _ => {
                                 self.error(
                                     errors,
@@ -5323,13 +4629,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         type_form_context: TypeFormContext<'_>,
         errors: &ErrorCollector,
     ) -> Result<Vec<Type>, DimensionExprError> {
-        self.parse_dimension_list_with_context(
+        let dimension_errors = self.error_collector();
+        let result = self.parse_dimension_list_with_context(
             args,
             type_form_context,
-            errors,
+            &dimension_errors,
             DimensionExprContext::DslArgument,
             true,
-        )
+        );
+        let failed = dimension_errors.has_hard();
+        errors.extend(dimension_errors);
+        if failed {
+            // Preserve the specific wrapper/raw-IntVar failure; only an apparent success
+            // with parse errors becomes the generic speculative-dimension failure.
+            result.and(Err(DimensionExprError::Invalid))
+        } else {
+            result
+        }
     }
 
     fn parse_dimension_list_with_context(
@@ -5669,20 +4985,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
 
         match Ast::unpack_slice(&subscript.slice) {
-            [arg] => self
-                .validate_int_tuple_splat_carrier(
-                    // Inherit the ambient context so a type-level DSL call with an
-                    // `IntTuple` result (e.g. `broadcast(...)`) is parsed as the carrier.
-                    // The carrier is a shape position like `Int`/`IntTuple` arguments.
-                    self.expr_untype(
-                        arg,
-                        TypeFormContext::ShapeTypeArgument(&type_form_context),
-                        errors,
-                    ),
-                    arg.range(),
-                    errors,
-                )
-                .map(Some),
+            [arg] => {
+                let parse_errors = self.error_collector();
+                let ty = self.expr_untype(
+                    arg,
+                    TypeFormContext::ShapeTypeArgument(&type_form_context),
+                    &parse_errors,
+                );
+                let failed = parse_errors.has_hard();
+                errors.extend(parse_errors);
+                if failed {
+                    Err(())
+                } else {
+                    self.validate_int_tuple_splat_carrier(ty, arg.range(), errors)
+                        .map(Some)
+                }
+            }
             args => {
                 self.error(
                     errors,
@@ -5707,11 +5025,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) -> Result<Type, ()> {
         match argument {
-            // The carrier already failed to resolve; its diagnostic is
-            // reported, so fail quietly without a cascading second error.
-            argument if argument.is_error() => Err(()),
-            // Explicit `Any` is gradual: admit it as an unknown shape rather
-            // than erroring.
+            // Any is a gradual carrier, independently of how it was obtained.
             Type::Any(_) => Ok(self.bare_int_tuple_carrier()),
             Type::IntTuple(shape) => match shape.view() {
                 IntTupleView::Concrete(_) => Ok(shape_to_tuple_carrier(&shape)),
@@ -5739,18 +5053,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 );
                 Err(())
             }
-        }
-    }
-
-    /// Return whether a tuple-carrier shape contains an unbounded tuple segment.
-    fn has_unbounded_tuple_carrier(ty: &Type) -> bool {
-        match ty {
-            Type::Tuple(Tuple::Unbounded(_)) => true,
-            Type::Tuple(Tuple::Unpacked(unpacked)) => {
-                Self::has_unbounded_tuple_carrier(unpacked.middle())
-            }
-            Type::Unpack(inner) => Self::has_unbounded_tuple_carrier(inner),
-            _ => false,
         }
     }
 
@@ -5789,7 +5091,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ) {
                 Ok(Some(middle_ty)) => middle_ty,
                 Ok(None) => {
-                    let got = self.expr_untype(value, TypeFormContext::type_argument(), errors);
+                    let parse_errors = self.error_collector();
+                    let got =
+                        self.expr_untype(value, TypeFormContext::type_argument(), &parse_errors);
+                    let failed = parse_errors.has_hard();
+                    errors.extend(parse_errors);
+                    if failed {
+                        return None;
+                    }
                     // Bare splats mirror `*Elements[...]`: tuple and `IntTuple` carriers plus
                     // type variables bound by them. Like bare `Int[N] + 1` arithmetic, there is
                     // no deferred-annotation guard yet; `Elements[...]` remains the spelling
@@ -5799,13 +5108,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             Ok(middle_ty) => middle_ty,
                             Err(()) => return None,
                         }
-                    } else if got.is_error() {
-                        // The name already failed to resolve; fail quietly
-                        // without a cascading second error.
-                        return None;
                     } else if matches!(got, Type::Any(_)) {
-                        // Explicit `Any` is gradual: admit it as an unknown
-                        // shape rather than erroring.
                         self.bare_int_tuple_carrier()
                     } else {
                         self.error(
@@ -5858,181 +5161,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         )
     }
 
-    /// Parse a registered shaped-array annotation.
-    ///
-    /// The registered shape parameter is a single ordinary type argument that
-    /// carries a tuple (e.g. `ndarray[Shape, DType]`). We specialize the class
-    /// normally and project the carrier into a shape via
-    /// `shaped_array_classtype_to_shaped_array_type`.
-    fn parse_registered_shaped_array_type(
-        &self,
-        cls: &Class,
-        args: &[Expr],
-        range: TextRange,
-        type_form_context: TypeFormContext<'_>,
-        errors: &ErrorCollector,
-    ) -> Type {
-        let shape_param = self
-            .shaped_array_shape_for_class(cls)
-            .expect("registered shaped-array class should have shape metadata");
-
-        let tparams = self.get_class_tparams(cls);
-        let shape_idx = tparams
-            .iter()
-            .flat_map(|tparams| tparams.iter())
-            .position(|param| param == &shape_param)
-            .expect("shaped-array metadata should refer to a class type parameter");
-        match shape_param.kind() {
-            QuantifiedKind::TypeVar | QuantifiedKind::IntVar => {}
-            QuantifiedKind::TypeVarTuple => unreachable!(
-                "shaped-array metadata validation rejects TypeVarTuple shape parameters"
-            ),
-            QuantifiedKind::ParamSpec => {
-                unreachable!("shaped-array metadata validation rejects ParamSpec shape parameters")
-            }
-        }
-        let validate_shape_slot = shape_idx < args.len()
-            && args.len() <= tparams.as_ref().map_or(0, |tparams| tparams.len());
-        let shape_param_accepts_int_tuple = matches!(
-            shape_param.upper_bound(self.stdlib, self.heap),
-            Type::IntTuple(_)
-        );
-        let shape_validation_arg = |carrier: &Type| {
-            if shape_param_accepts_int_tuple {
-                self.heap.mk_int_tuple(IntTuple::shapeless())
-            } else {
-                carrier.clone()
-            }
-        };
-        let mut shape_arg_carrier = None;
-        let mut shape_arg_failed_to_parse = false;
-        let type_argument_context = TypeFormContext::TypeArgument(&type_form_context);
-        let shape_type_argument_context = TypeFormContext::ShapeTypeArgument(&type_form_context);
-        let class_targs: Vec<Type> = args
-            .iter()
-            .enumerate()
-            .map(|(i, arg)| match arg {
-                Expr::List(ExprList { elts, .. }) if i == shape_idx => {
-                    match self.parse_int_tuple_shape_args(elts, shape_type_argument_context, errors)
-                    {
-                        Some(shape) => {
-                            let carrier = shape_to_tuple_carrier(&shape);
-                            shape_arg_carrier = Some(shape.to_shape_arg_type());
-                            shape_validation_arg(&carrier)
-                        }
-                        None => {
-                            shape_arg_failed_to_parse = true;
-                            Type::any_error()
-                        }
-                    }
-                }
-                _ => {
-                    if i == shape_idx
-                        && !self.bindings().shape_declarations.comment_targets.contains_key(&arg.range())
-                        && let Type::ClassDef(cls) = self.expr_infer(arg, &self.error_swallower())
-                        && self.is_int_tuple_class(&cls)
-                    {
-                        let carrier = self.bare_int_tuple_carrier();
-                        shape_arg_carrier = Some(IntTuple::shapeless().to_shape_arg_type());
-                        shape_validation_arg(&carrier)
-                    } else {
-                        let arg_context = if i == shape_idx {
-                            shape_type_argument_context
-                        } else {
-                            type_argument_context
-                        };
-                        match self.expr_untype(arg, arg_context, errors) {
-                            ty if i == shape_idx && ty.is_error() => {
-                                shape_arg_failed_to_parse = true;
-                                ty
-                            }
-                            Type::TypeLevelDslCall(call) if i == shape_idx => {
-                                if call.result_domain() == Some(TypeShapeDslDomain::IntTuple) {
-                                    let ty = Type::TypeLevelDslCall(call);
-                                    shape_arg_carrier = Some(ty);
-                                    shape_validation_arg(
-                                        &IntTuple::shapeless().to_shape_arg_type(),
-                                    )
-                                } else {
-                                    shape_arg_failed_to_parse = true;
-                                    self.error(
-                                        errors,
-                                        arg.range(),
-                                        ErrorKind::InvalidAnnotation,
-                                        "Expected a type-level shape DSL call with an `IntTuple` result in a shaped-array shape argument, got an `Int` result"
-                                            .to_owned(),
-                                    );
-                                    Type::any_error()
-                                }
-                            }
-                            Type::IntTuple(shape) if i == shape_idx => {
-                                let carrier = if shape.is_shapeless() {
-                                    self.bare_int_tuple_carrier()
-                                } else {
-                                    shape_to_tuple_carrier(&shape)
-                                };
-                                shape_arg_carrier = Some(shape.to_shape_arg_type());
-                                shape_validation_arg(&carrier)
-                            }
-                            ty => {
-                                if validate_shape_slot
-                                    && i == shape_idx
-                                    && Self::has_unbounded_tuple_carrier(&ty)
-                                {
-                                    self.error(
-                                        errors,
-                                        arg.range(),
-                                        ErrorKind::InvalidAnnotation,
-                                        "Unbounded tuple types cannot be used as shaped-array shape carriers"
-                                            .to_owned(),
-                                    );
-                                    Type::any_error()
-                                } else if i == shape_idx && matches!(ty, Type::Tuple(_)) {
-                                    if let Some(shape) = tuple_carrier_to_shape(&ty) {
-                                        shape_arg_carrier = Some(shape.to_shape_arg_type());
-                                        shape_validation_arg(&ty)
-                                    } else {
-                                        self.error(
-                                            errors,
-                                            arg.range(),
-                                            ErrorKind::InvalidAnnotation,
-                                            format!(
-                                                "Invalid shaped-array shape carrier `{}`",
-                                                self.for_display(ty)
-                                            ),
-                                        );
-                                        Type::any_error()
-                                    }
-                                } else {
-                                    ty
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-            .collect();
-        if args.len() <= tparams.as_ref().map_or(0, |tparams| tparams.len())
-            && shape_arg_failed_to_parse
-        {
-            return Type::any_error();
-        }
-        let mut base_class =
-            self.specialize_nontypeddict_to_classtype(cls, class_targs, range, errors);
-        if let Some(carrier) = shape_arg_carrier
-            && let Some(shape_arg) = base_class.targs_mut().as_mut().get_mut(shape_idx)
-        {
-            *shape_arg = carrier;
-        }
-        if let Some(Type::TypeLevelDslCall(call)) = base_class.targs().as_slice().get(shape_idx)
-            && call.result_domain() == Some(TypeShapeDslDomain::IntTuple)
-        {
-            return Type::ClassType(base_class);
-        }
-        self.shaped_array_classtype_to_shaped_array_type(&base_class)
-            .to_type()
-    }
-
     pub(crate) fn parse_int_tuple_type(
         &self,
         args: &[Expr],
@@ -6053,7 +5181,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         range: TextRange,
         type_form_context: TypeFormContext<'_>,
         errors: &ErrorCollector,
-    ) -> Type {
+    ) -> Result<Type, ()> {
         if args.len() != 1 {
             self.error(
                 errors,
@@ -6065,25 +5193,40 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     args.len()
                 ),
             );
-            return Type::any_error();
+            return Err(());
         }
 
         let argument_context = TypeFormContext::ShapeTypeArgument(&type_form_context);
-        let Some(dims) = self.parse_dimension_list(args, argument_context, errors) else {
-            return Type::any_error();
-        };
+        let dims = self
+            .parse_dimension_list(args, argument_context, errors)
+            .ok_or(())?;
         let dim = dims.into_iter().next().expect(
             "parse_dimension_list returns a non-empty list for a single validated argument",
         );
         // `Int[Any]` desugars to plain `Any` since it's maximally gradual.
         if matches!(dim, Type::Any(_)) {
-            return dim;
+            return Ok(dim);
         }
         let Some(symint) = Int::from_type(&dim) else {
             unreachable!("Int::from_type failed on non-Any dimension: {:?}", dim);
         };
         let size = canonicalize(self.heap.mk_int(symint));
-        self.heap.mk_type_of(size)
+        Ok(self.heap.mk_type_of(size))
+    }
+
+    pub(super) fn try_parse_int_type(
+        &self,
+        args: &[Expr],
+        range: TextRange,
+        type_form_context: TypeFormContext<'_>,
+        errors: &ErrorCollector,
+    ) -> Result<Type, ()> {
+        let parse_errors = self.error_collector();
+        let result =
+            self.parse_single_int_type("Int", args, range, type_form_context, &parse_errors);
+        let failed = parse_errors.has_hard();
+        errors.extend(parse_errors);
+        if failed { result.and(Err(())) } else { result }
     }
 
     /// Parse Int[3], Int[N], Int[N+1] into `Type::Int(...)`.
@@ -6094,7 +5237,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         type_form_context: TypeFormContext<'_>,
         errors: &ErrorCollector,
     ) -> Type {
-        self.parse_single_int_type("Int", args, range, type_form_context, errors)
+        self.try_parse_int_type(args, range, type_form_context, errors)
+            .unwrap_or_else(|()| Type::any_error())
     }
 
     /// Return the reason why we think `ty` is suspicious to use as a branching condition

@@ -17,6 +17,7 @@ use pyrefly_types::lit_int::LitInt;
 use pyrefly_types::literal::LitStyle;
 use pyrefly_types::quantified::Quantified;
 use pyrefly_types::quantified::QuantifiedKind;
+use pyrefly_types::quantified::TypeVarLike;
 use pyrefly_types::simplify::intersect;
 use pyrefly_types::type_var::Restriction;
 use pyrefly_util::prelude::VecExt;
@@ -1227,8 +1228,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 | Type::Int(_)
                 | Type::SelfType(_)
                 | Type::Quantified(_)
-                | Type::ShapedArray(_)
-                | Type::NNModule(_)
                 | Type::DataFrame(_)
                 | Type::Series(_)
                 | Type::Intersect(_) => {

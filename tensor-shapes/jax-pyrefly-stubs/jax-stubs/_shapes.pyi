@@ -318,22 +318,74 @@ def svd_vt_shape(shape: IntTuple, full_matrices: bool) -> IntTuple:
         return dsl.concat(batch, dsl.IntTuple((n, n)))
     return dsl.concat(batch, dsl.IntTuple((dsl.Int.gradual(), n)))
 
+# Arithmetic gives both axis-normalization branches the same DSL value domain.
+# Negative bounds use subtraction because the DSL cannot negate Flag integers.
 @type_shape_dsl_function
-def reshape_shape(shape: IntTuple, newshape: int | tuple[int, ...] | None) -> IntTuple:
-    # `None` is not a legal argument to `reshape`. The arm exists because an
-    # `int | tuple[int, ...]` parameter cannot be iterated after narrowing with
-    # `is_int_value` alone -- the DSL function silently evaluates to `Unknown`.
-    # Leading with the `None` check is what makes the narrowing work. The Torch
-    # stubs use the same workaround in `conv_shape`.
-    if newshape is None:
-        return dsl.Invalid("reshape requires a shape")
-    if dsl.is_int_value(newshape):
-        dims = (newshape,)
+def lax_all_gather_shape(shape: IntTuple, axis: int, tiled: bool) -> IntTuple:
+    if tiled:
+        rank = len(shape)
     else:
-        dims = newshape
+        rank = len(shape) + 1
+    if axis < 0 - rank or axis >= rank:
+        return dsl.Invalid("all_gather axis out of bounds")
+    if axis < 0:
+        normalized = axis + rank
+    else:
+        normalized = axis + 0
+    # Axis names carry no group size; only the communicated dimension is gradual.
+    if tiled:
+        return dsl.IntTuple(
+            dsl.Int.gradual() if i == normalized else shape[i]
+            for i in range(len(shape))
+        )
+    return dsl.concat(
+        dsl.concat(shape[:normalized], dsl.IntTuple((dsl.Int.gradual(),))),
+        shape[normalized:],
+    )
+
+@type_shape_dsl_function
+def lax_psum_scatter_shape(shape: IntTuple, axis: int, tiled: bool) -> IntTuple:
+    rank = len(shape)
+    if axis < 0:
+        normalized = axis + rank
+    else:
+        normalized = axis + 0
+    if normalized < 0 or normalized >= rank:
+        return dsl.Invalid("psum_scatter dimension out of bounds")
+    if tiled:
+        return dsl.IntTuple(
+            dsl.Int.gradual() if i == normalized else shape[i] for i in range(rank)
+        )
+    return dsl.IntTuple(shape[i] for i in range(rank) if i != normalized)
+
+@type_shape_dsl_function
+def lax_reshape_shape(
+    shape: IntTuple,
+    new_sizes: IntTuple,
+    dimensions: int | tuple[int, ...] | None,
+) -> IntTuple:
+    if any(dsl.is_concrete_int(size) and size < 0 for size in new_sizes):
+        return dsl.Invalid("lax.reshape sizes must be non-negative")
+    total = dsl.prod(shape)
+    target = dsl.prod(new_sizes)
+    if dsl.is_concrete_int(total) and dsl.is_concrete_int(target) and total != target:
+        return dsl.Invalid("reshape target element count does not match the input")
+    if dimensions is not None:
+        if dsl.is_int_value(dimensions):
+            return dsl.Invalid("reshape dimensions must be a permutation")
+        if len(dimensions) != len(shape):
+            return dsl.Invalid("reshape dimensions must cover every input axis")
+        if any(axis < 0 or axis >= len(shape) for axis in dimensions):
+            return dsl.Invalid("reshape dimension out of bounds")
+        if any(dimensions.count(axis) > 1 for axis in dimensions):
+            return dsl.Invalid("duplicate reshape dimension")
+    return new_sizes
+
+@type_shape_dsl_function
+def reshape_shape(shape: IntTuple, dims: IntTuple) -> IntTuple:
     if any(dsl.is_concrete_int(dim) and dim < -1 for dim in dims):
         return dsl.Invalid("reshape sizes must be -1 or non-negative")
-    inferred = tuple(dim for dim in dims if dsl.is_concrete_int(dim) and dim == -1)
+    inferred = tuple(1 for dim in dims if dsl.is_concrete_int(dim) and dim == -1)
     if len(inferred) > 1:
         return dsl.Invalid("reshape accepts at most one -1")
     known_shape = dsl.IntTuple(
@@ -344,7 +396,7 @@ def reshape_shape(shape: IntTuple, newshape: int | tuple[int, ...] | None) -> In
     if len(inferred) == 0:
         if dsl.is_concrete_int(total) and dsl.is_concrete_int(known) and total != known:
             return dsl.Invalid("reshape target element count does not match the input")
-        return dsl.IntTuple(dim for dim in dims)
+        return dims
     if dsl.is_concrete_int(known):
         if known == 0:
             return dsl.Invalid("could not infer size for dimension -1")
@@ -356,6 +408,11 @@ def reshape_shape(shape: IntTuple, newshape: int | tuple[int, ...] | None) -> In
             for dim in dims
         )
     )
+
+@type_shape_dsl_function
+def reshape_scalar_shape(shape: IntTuple, dim: Int) -> IntTuple:
+    dims = dsl.IntTuple((dim,))
+    return reshape_shape(shape, dims)
 
 @type_shape_dsl_function
 def tile_shape(shape: IntTuple, repeats: int | tuple[int, ...] | None) -> IntTuple:

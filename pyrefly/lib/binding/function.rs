@@ -76,6 +76,9 @@ use crate::binding::bindings::BindingsBuilder;
 use crate::binding::bindings::InitializationStatus;
 use crate::binding::bindings::LegacyTParamCollector;
 use crate::binding::classmethod::FunctionDecorators;
+use crate::binding::expr::Evaluation;
+use crate::binding::expr::StaticUsage;
+use crate::binding::expr::TypeExpressionContext;
 use crate::binding::expr::Usage;
 use crate::binding::pattern::match_case_always_matches;
 use crate::binding::scope::FlowStyle;
@@ -433,9 +436,10 @@ impl<'a> BindingsBuilder<'a> {
                     continue;
                 };
                 let mut names = Vec::new();
-                let usage = Usage::StaticTypeInformation {
-                    is_annotation: true,
-                };
+                let usage = Usage::Static(
+                    StaticUsage::TypeExpression(TypeExpressionContext::Other),
+                    Evaluation::Eager,
+                );
                 if !is_simple_type_expr(&expr, &mut names)
                     || names.into_iter().any(|x| {
                         matches!(
@@ -446,7 +450,7 @@ impl<'a> BindingsBuilder<'a> {
                 {
                     continue;
                 }
-                self.ensure_type(&mut expr, Some(&mut *legacy));
+                self.ensure_type(&mut expr, Some(&mut *legacy), Evaluation::Eager);
                 self.docstring_type_ranges.push(expr.range());
                 bound_types.insert(start, expr.clone());
                 expr
@@ -466,7 +470,7 @@ impl<'a> BindingsBuilder<'a> {
         override_func: Option<Idx<KeyUndecoratedFunction>>,
         tparams_builder: Option<&mut LegacyTParamCollector>,
     ) -> (TextRange, Idx<KeyAnnotation>) {
-        self.ensure_type(&mut x, tparams_builder);
+        self.ensure_type(&mut x, tparams_builder, self.annotation_evaluation());
         (
             x.range(),
             self.insert_binding(
@@ -504,7 +508,9 @@ impl<'a> BindingsBuilder<'a> {
         // We need to bind all the parameters expressions _after_ the type params, but before the parameter names,
         // which might shadow some types.
         for (param, default) in Ast::parameters_iter_mut(&mut x.parameters) {
-            self.ensure_type_opt(param.annotation.as_deref_mut(), Some(&mut legacy));
+            if let Some(annotation) = param.annotation.as_deref_mut() {
+                self.ensure_type(annotation, Some(&mut legacy), self.annotation_evaluation());
+            }
             if let Some(default) = default {
                 self.ensure_expr_opt(default.as_deref_mut(), usage);
             }
@@ -1061,7 +1067,7 @@ impl<'a> BindingsBuilder<'a> {
         if x.name.id.is_empty() {
             self.ensure_and_bind_decorators(
                 mem::take(&mut x.decorator_list),
-                &mut Usage::NonPinningValue(None),
+                &mut Usage::Unchecked,
             );
             return;
         }
@@ -1149,11 +1155,9 @@ impl<'a> BindingsBuilder<'a> {
                 decorators: decorators.decorators,
                 legacy_tparams: legacy_tparams.into_boxed_slice(),
                 parent: parent.dupe(),
-                shape_dsl_def: shape_metadata.shape_dsl_def,
                 // The solver validates a type-level DSL function by inferring expressions in
                 // its body, which only have bindings if the body was bound.
                 type_shape_dsl_def: shape_metadata.type_shape_dsl_def.filter(|_| is_body_bound),
-                uses_shape_dsl_ir_name: shape_metadata.uses_shape_dsl_ir_name,
             },
         );
 

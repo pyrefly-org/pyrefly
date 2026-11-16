@@ -7153,7 +7153,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
                         EinsumClassification::Supported(equation) => {
                             evaluate_einsum(&equation, operands)
                         }
-                        EinsumClassification::Unsupported(_) => {
+                        EinsumClassification::Unsupported => {
                             return DslOutcome::Value(DslValue::Unknown);
                         }
                         EinsumClassification::Invalid(error) => {
@@ -7565,12 +7565,9 @@ impl StructurallyValidatedTypeShapeDslFunction {
                     unreachable!("validated IntTuple product expression is a call")
                 };
                 match self.evaluate_expression(&call.arguments.args[0], environment, budget) {
-                    DslOutcome::Value(DslValue::Shape(shape)) => match shape.product() {
-                        // TODO(stroxler): Preserve a gradual product as a gradual dimension once
-                        // callers can distinguish an unknown equality check from a proven match.
-                        Int::Int => DslOutcome::Value(DslValue::Unknown),
-                        product => DslOutcome::Value(DslValue::Dimension(product)),
-                    },
+                    DslOutcome::Value(DslValue::Shape(shape)) => {
+                        DslOutcome::Value(DslValue::Dimension(shape.product()))
+                    }
                     DslOutcome::Value(DslValue::Unknown) => DslOutcome::Value(DslValue::Unknown),
                     DslOutcome::ExplicitGradual => {
                         unreachable!("validated IntTuple product operand cannot return gradual")

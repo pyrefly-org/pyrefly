@@ -10,8 +10,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::hash::Hasher;
 use std::mem;
+use std::slice;
 use std::sync::Arc;
 
 use dupe::Dupe;
@@ -43,8 +43,6 @@ use crate::class::ClassType;
 use crate::data_frame::DataFrameSchema;
 use crate::dimension;
 use crate::dimension::Int;
-use crate::equality::TypeEq;
-use crate::equality::TypeEqCtx;
 use crate::function::Deprecation;
 use crate::function::FuncMetadata;
 use crate::function::Function;
@@ -62,10 +60,10 @@ use crate::module::ModuleType;
 use crate::named_ints::NamedInts;
 use crate::param_spec::ParamSpec;
 use crate::quantified::Quantified;
+use crate::quantified::TypeVarLike;
 use crate::sentinel::Sentinel;
 use crate::series::SeriesSchema;
 use crate::shaped_array::IntTuple;
-use crate::shaped_array::ShapedArrayType;
 use crate::simplify::unions;
 use crate::special_form::SpecialForm;
 use crate::stdlib::Stdlib;
@@ -451,16 +449,24 @@ pub enum AnyStyle {
     /// There was an error, so we made up `Any`.
     /// If this `Any` is used in an error position, don't report another error.
     Error,
+    /// An import could not be resolved. Retains error recovery behavior while identifying
+    /// signatures that depend on unavailable imports.
+    MissingImport,
 }
 
 impl AnyStyle {
+    /// Whether this `Any` is recovery from a diagnostic.
+    pub fn is_error(self) -> bool {
+        matches!(self, Self::Error | Self::MissingImport)
+    }
+
     /// Downgrade an explicit `Any` to an implicit one, for a type that is derived from an `Any`
     /// rather than being the user's `Any` itself, so that the derived type is not reported as a
     /// use of an annotation the user wrote. An operation on an `Any` operand keeps the operand's
     /// style instead of downgrading it: see `Type::merge_any_operands`.
     pub fn propagate(self) -> Type {
         match self {
-            Self::Implicit | Self::Error => Type::Any(self),
+            Self::Implicit | Self::Error | Self::MissingImport => Type::Any(self),
             Self::Explicit => Type::Any(Self::Implicit),
         }
     }
@@ -470,6 +476,7 @@ impl AnyStyle {
     /// implicit `Any` beats an explicit one for the same reason.
     pub fn merge(self, other: Self) -> Type {
         match (self, other) {
+            (Self::MissingImport, _) | (_, Self::MissingImport) => Type::Any(Self::MissingImport),
             (Self::Error, _) | (_, Self::Error) => Type::Any(Self::Error),
             (Self::Implicit, _) | (_, Self::Implicit) => Type::Any(Self::Implicit),
             (Self::Explicit, Self::Explicit) => Type::Any(Self::Explicit),
@@ -760,7 +767,10 @@ pub enum Forallable {
 }
 
 impl Forallable {
-    pub fn forall(self, tparams: Arc<TParams>) -> Type {
+    pub fn forall(mut self, tparams: Arc<TParams>) -> Type {
+        if let Self::Function(func) = &mut self {
+            func.initialize_unresolved_imports(Some(tparams.as_ref()));
+        }
         if tparams.is_empty() {
             self.as_type()
         } else {
@@ -781,7 +791,10 @@ impl Forallable {
 
     pub fn as_type(self) -> Type {
         match self {
-            Self::Function(func) => Type::Function(Box::new(func)),
+            Self::Function(mut func) => {
+                func.initialize_unresolved_imports(None);
+                Type::Function(Box::new(func))
+            }
             Self::Callable(callable) => Type::Callable(Box::new(callable)),
             Self::TypeAlias(ta) => Type::TypeAlias(Box::new(ta)),
         }
@@ -841,100 +854,6 @@ pub enum SuperObj {
 pub struct Union {
     pub members: Vec<Type>,
     pub display_name: IdentityIgnored<Option<(ModuleName, Name)>>,
-}
-
-/// An nn.Module instance with captured constructor arguments.
-///
-/// Analogous to how `ShapedArrayType` wraps `ClassType` + shape info, `NNModuleType`
-/// wraps `ClassType` + a field map of captured init args. This allows DSL forward
-/// functions to access constructor parameters (e.g., `kernel_size`, `stride`)
-/// directly from the type, without requiring every shape-relevant parameter to
-/// be a generic type param on the class.
-///
-/// Created by init DSL functions during `construct_class`. When `forward` is
-/// called on an NNModule instance, the fields are injected as `Val::Module`
-/// into the DSL's bound_args.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NNModuleType {
-    /// The underlying nn.Module subclass (e.g., MaxPool2d).
-    pub class: ClassType,
-    /// Captured init args (e.g., kernel_size → Int(3), stride → None).
-    /// Ordered by constructor parameter order.
-    pub fields: SmallMap<Name, Type>,
-}
-
-impl Hash for NNModuleType {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.class.hash(state);
-        self.fields.len().hash(state);
-        for (k, v) in self.fields.iter() {
-            k.hash(state);
-            v.hash(state);
-        }
-    }
-}
-
-impl PartialOrd for NNModuleType {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for NNModuleType {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.class.cmp(&other.class).then_with(|| {
-            let len_cmp = self.fields.len().cmp(&other.fields.len());
-            if len_cmp != Ordering::Equal {
-                return len_cmp;
-            }
-            for ((k1, v1), (k2, v2)) in self.fields.iter().zip(other.fields.iter()) {
-                let c = k1.cmp(k2).then_with(|| v1.cmp(v2));
-                if c != Ordering::Equal {
-                    return c;
-                }
-            }
-            Ordering::Equal
-        })
-    }
-}
-
-impl Visit<Type> for NNModuleType {
-    fn recurse<'a>(&'a self, f: &mut dyn FnMut(&'a Type)) {
-        self.class.recurse(f);
-        for (_, ty) in self.fields.iter() {
-            f(ty);
-        }
-    }
-}
-
-impl VisitMut<Type> for NNModuleType {
-    fn recurse_mut(&mut self, f: &mut dyn FnMut(&mut Type)) {
-        self.class.recurse_mut(f);
-        for (_, ty) in self.fields.iter_mut() {
-            f(ty);
-        }
-    }
-}
-
-impl TypeEq for NNModuleType {
-    fn type_eq(&self, other: &Self, ctx: &mut TypeEqCtx) -> bool {
-        crate::equality::TypeEq::type_eq(&self.class, &other.class, ctx)
-            && self.fields.len() == other.fields.len()
-            && self
-                .fields
-                .iter()
-                .zip(other.fields.iter())
-                .all(|((k1, v1), (k2, v2))| {
-                    k1 == k2 && crate::equality::TypeEq::type_eq(v1, v2, ctx)
-                })
-    }
-}
-
-impl NNModuleType {
-    /// Create a new NNModuleType with the given class and captured fields.
-    pub fn new(class: ClassType, fields: SmallMap<Name, Type>) -> Self {
-        Self { class, fields }
-    }
 }
 
 // Note: The fact that Literal and LiteralString are at the front is important for
@@ -999,17 +918,10 @@ pub enum Type {
     /// For a TypedDict type `C`, `Partial[C]` represents an object with any subset of read-write
     /// keys from `C`, where each present key has the same value type as in `C`.
     PartialTypedDict(TypedDict),
-    /// Shaped-array type with shape information.
-    /// Example: Tensor[2, 3] represents a 2x3 tensor
-    ShapedArray(Box<ShapedArrayType>),
     /// First-class tensor shape tuple.
     IntTuple(Box<IntTuple>),
     /// Named integer values captured by the experimental shape extensions.
     NamedInts(Box<NamedInts>),
-    /// nn.Module instance with captured constructor arguments.
-    /// Wraps a ClassType + field map of init args, enabling DSL forward
-    /// functions to access shape-relevant constructor parameters directly.
-    NNModule(Box<NNModuleType>),
     /// DataFrame instance with an ordered column schema.
     DataFrame(Box<DataFrameSchema>),
     /// Series instance carrying its element dtype.
@@ -1132,10 +1044,8 @@ impl Visit for Type {
             Type::ClassType(x) => x.visit(f),
             Type::TypedDict(x) => x.visit(f),
             Type::PartialTypedDict(x) => x.visit(f),
-            Type::ShapedArray(x) => x.visit(f),
             Type::IntTuple(x) => x.visit(f),
             Type::NamedInts(x) => x.visit(f),
-            Type::NNModule(x) => x.visit(f),
             Type::DataFrame(x) => x.visit(f),
             Type::Series(x) => x.visit(f),
             Type::Int(x) => x.visit(f),
@@ -1197,10 +1107,8 @@ impl VisitMut for Type {
             Type::ClassType(x) => x.visit_mut(f),
             Type::TypedDict(x) => x.visit_mut(f),
             Type::PartialTypedDict(x) => x.visit_mut(f),
-            Type::ShapedArray(x) => x.visit_mut(f),
             Type::IntTuple(x) => x.visit_mut(f),
             Type::NamedInts(x) => x.visit_mut(f),
-            Type::NNModule(x) => x.visit_mut(f),
             Type::DataFrame(x) => x.visit_mut(f),
             Type::Series(x) => x.visit_mut(f),
             Type::Int(x) => x.visit_mut(f),
@@ -1369,11 +1277,13 @@ impl Type {
         matches!(self, Type::Never(_))
     }
 
-    pub fn is_implicit_literal(&self) -> bool {
+    pub fn is_promotable(&self) -> bool {
         match self {
             Type::Literal(lit) => lit.style == LitStyle::Implicit,
             Type::LiteralString(LitStyle::Implicit) => true,
-            _ => false,
+            Type::Union(xs) => xs.members.iter().any(Type::is_promotable),
+            Type::Intersect(xs) => xs.0.iter().any(Type::is_promotable),
+            _ => self.is_truthiness_marker(),
         }
     }
 
@@ -1445,11 +1355,21 @@ impl Type {
     /// Whether an implicit `Any` appears anywhere within this type, including the
     /// type itself. Used to report a partially unknown type such as `list[Unknown]`.
     pub fn contains_implicit_any(&self) -> bool {
-        fn walk(ty: &Type, found: &mut bool) {
+        self.contains_any_style(AnyStyle::Implicit)
+    }
+
+    /// Whether unresolved-import recovery appears in this type's annotations, excluding
+    /// the metadata of a wrapped function whose signature is not exposed to callers.
+    pub fn contains_missing_import(&self) -> bool {
+        self.contains_any_style(AnyStyle::MissingImport)
+    }
+
+    fn contains_any_style(&self, style: AnyStyle) -> bool {
+        fn walk(ty: &Type, style: AnyStyle, found: &mut bool) {
             if *found {
                 return;
             }
-            if matches!(ty, Type::Any(AnyStyle::Implicit)) {
+            if matches!(ty, Type::Any(any_style) if *any_style == style) {
                 *found = true;
                 return;
             }
@@ -1459,14 +1379,14 @@ impl Type {
                 .is_some_and(|metadata| metadata.flags.wrapped.is_some())
             {
                 for (signature, _) in ty.toplevel_callable_signatures() {
-                    signature.visit(&mut |child| walk(child, found));
+                    signature.visit(&mut |child| walk(child, style, found));
                 }
             } else {
-                ty.recurse(&mut |child| walk(child, found));
+                ty.recurse(&mut |child| walk(child, style, found));
             }
         }
         let mut found = false;
-        walk(self, &mut found);
+        walk(self, style, &mut found);
         found
     }
 
@@ -1479,7 +1399,7 @@ impl Type {
     }
 
     pub fn is_error(&self) -> bool {
-        matches!(self, Type::Any(AnyStyle::Error))
+        matches!(self, Type::Any(style) if style.is_error())
     }
 
     /// Whether this is an implicit `Any` or a union with an implicit `Any` member. Like pyright's
@@ -2436,6 +2356,14 @@ impl Type {
         }
     }
 
+    /// Borrow the top-level union members, or a singleton slice for a non-union type.
+    pub fn as_unions(&self) -> &[Type] {
+        match self {
+            Type::Union(union) => &union.members,
+            _ => slice::from_ref(self),
+        }
+    }
+
     pub fn into_unions(self) -> Vec<Type> {
         match self {
             Type::Union(u) => u.members,
@@ -2460,6 +2388,17 @@ impl Type {
                 Ordering::Less => Type::union(vec![x, Type::None]),
                 Ordering::Greater => Type::union(vec![Type::None, x]),
             }
+        }
+    }
+
+    /// The legacy type variable that this type refers to, if it is a `TypeVar`, `ParamSpec`, or
+    /// `TypeVarTuple` that has not been resolved to a `Quantified`.
+    pub fn as_type_var_like(&self) -> Option<&dyn TypeVarLike> {
+        match self {
+            Type::TypeVar(t) => Some(t),
+            Type::ParamSpec(p) => Some(p),
+            Type::TypeVarTuple(t) => Some(t),
+            _ => None,
         }
     }
 
@@ -2568,10 +2507,8 @@ impl Type {
             | Type::ClassType(_)
             | Type::TypedDict(_)
             | Type::PartialTypedDict(_)
-            | Type::ShapedArray(_)
             | Type::IntTuple(_)
             | Type::NamedInts(_)
-            | Type::NNModule(_)
             | Type::DataFrame(_)
             | Type::Series(_)
             | Type::Int(_)
@@ -2655,7 +2592,6 @@ impl Type {
         match self {
             Type::Int(dim) => dim.materialize(),
             Type::IntTuple(tuple) => tuple.materialize(),
-            Type::ShapedArray(shaped) => shaped.materialize_inline_shape(),
             _ => {}
         }
         self.transform_toplevel_callable_signatures(|callable: &mut Callable, _| {
@@ -2989,8 +2925,18 @@ mod tests {
         // relies on that matching `AnyStyle::merge`. These agree only because the variants are
         // declared weakest-first; this guards the coupling so reordering them fails here rather
         // than silently changing which `Any` a union keeps.
-        for a in [AnyStyle::Explicit, AnyStyle::Implicit, AnyStyle::Error] {
-            for b in [AnyStyle::Explicit, AnyStyle::Implicit, AnyStyle::Error] {
+        for a in [
+            AnyStyle::Explicit,
+            AnyStyle::Implicit,
+            AnyStyle::Error,
+            AnyStyle::MissingImport,
+        ] {
+            for b in [
+                AnyStyle::Explicit,
+                AnyStyle::Implicit,
+                AnyStyle::Error,
+                AnyStyle::MissingImport,
+            ] {
                 assert_eq!(Type::Any(a.max(b)), a.merge(b));
             }
         }

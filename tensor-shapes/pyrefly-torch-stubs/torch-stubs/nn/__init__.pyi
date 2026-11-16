@@ -14,6 +14,7 @@ from typing import (
     Generic,
     Iterable,
     Iterator,
+    Literal,
     overload,
     Self,
     TYPE_CHECKING,
@@ -180,25 +181,51 @@ class Module:
     ) -> dict[str, Tensor]: ...
     def load_state_dict(
         self,
-        state_dict: dict[str, Tensor],
+        state_dict: Mapping[str, Any],
         strict: bool = True,
         assign: bool = False,
     ) -> Any: ...
+    @overload
     def _register_load_state_dict_pre_hook(
         self,
-        hook: Callable[[dict[str, Tensor], str], None],
-        with_module: bool = False,
-    ) -> Any:
-        """Register a hook to be called before loading state_dict."""
-        ...
+        hook: Callable[
+            [
+                dict[str, Any],
+                str,
+                dict[str, Any],
+                bool,
+                list[str],
+                list[str],
+                list[str],
+            ],
+            object,
+        ],
+        with_module: Literal[False] = False,
+    ) -> Any: ...
+    @overload
+    def _register_load_state_dict_pre_hook(
+        self,
+        hook: Callable[
+            [
+                Module,
+                dict[str, Any],
+                str,
+                dict[str, Any],
+                bool,
+                list[str],
+                list[str],
+                list[str],
+            ],
+            object,
+        ],
+        with_module: Literal[True],
+    ) -> Any: ...
 
 class Parameter[Shape: IntTuple = IntTuple](Tensor[Shape]):
     @overload
-    def __new__(
-        cls, data: Tensor[Shape], requires_grad: bool = True
-    ) -> Parameter[Shape]: ...
+    def __new__(cls, data: Tensor[Shape], requires_grad: bool = True) -> Self: ...
     @overload
-    def __new__(cls, data: None = None, requires_grad: bool = True) -> Parameter: ...
+    def __new__(cls, data: None = None, requires_grad: bool = True) -> Self: ...
     def __radd__[OtherShape: IntTuple = []](
         self, other: _TensorLike[OtherShape]
     ) -> Tensor[broadcast(OtherShape, Shape)]: ...

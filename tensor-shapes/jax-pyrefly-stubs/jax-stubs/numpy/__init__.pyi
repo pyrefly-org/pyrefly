@@ -69,6 +69,7 @@ from jax._shapes import (
     ravel_shape,
     reduce_shape,
     repeat_shape,
+    reshape_scalar_shape,
     reshape_shape,
     reverse_shape,
     roll_shape,
@@ -103,6 +104,7 @@ from jax._src.sharding_impls import (
     NamedSharding as _NamedSharding,
     PartitionSpec as _PartitionSpec,
 )
+from jax._src.typing import DuckTypedArray as _DuckTypedArray
 from jax.sharding import Sharding as _Sharding
 from jax.typing import DTypeLike
 from numpy import (
@@ -146,9 +148,9 @@ from . import fft as fft, linalg as linalg
 type _Shape = IntTuple
 type _Axis = int | tuple[int, ...] | None
 type _SingleAxis = int | None
-# The trailing `None` is not a legal argument to `reshape`. It is present because
+# The trailing `None` is not a legal argument to `broadcast_to`. It is present because
 # an `int | tuple[int, ...]` parameter cannot be iterated inside a DSL function
-# after narrowing with `is_int_value` alone. See `reshape_shape`, which rejects it.
+# after narrowing with `is_int_value` alone. See `broadcast_to_shape`, which rejects it.
 type _NewShape = int | tuple[int, ...] | None
 type _Scalar = bool | int | float | complex | np.number
 type _ShapedArrayLike[Shape: _Shape] = _Array[Shape] | np.ndarray[Shape]
@@ -315,8 +317,16 @@ def empty_like[Shape: _Shape = []](
     device: _Device | _Sharding | None = ...,
 ) -> _Array[Shape]: ...
 @overload
+def empty_like(
+    prototype: _ArrayLike[Any] | _DuckTypedArray,
+    dtype: DTypeLike | None = ...,
+    shape: None = None,
+    *,
+    device: _Device | _Sharding | None = ...,
+) -> _Array[IntTuple]: ...
+@overload
 def empty_like[N: IntVar](
-    prototype: _ArrayLike[Any],
+    prototype: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Int[N] = ...,
     *,
@@ -324,7 +334,7 @@ def empty_like[N: IntVar](
 ) -> _Array[[N]]: ...
 @overload
 def empty_like[Shape: _Shape](
-    prototype: _ArrayLike[Any],
+    prototype: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Shape = ...,
     *,
@@ -332,7 +342,7 @@ def empty_like[Shape: _Shape](
 ) -> _Array[Shape]: ...
 @overload
 def empty_like(
-    prototype: _ArrayLike[Any],
+    prototype: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Sequence[int] | int | None = None,
     *,
@@ -348,8 +358,17 @@ def zeros_like[Shape: _Shape = []](
     out_sharding: _NamedSharding | _PartitionSpec | None = ...,
 ) -> _Array[Shape]: ...
 @overload
+def zeros_like(
+    a: _ArrayLike[Any] | _DuckTypedArray,
+    dtype: DTypeLike | None = ...,
+    shape: None = None,
+    *,
+    device: _Device | _Sharding | None = ...,
+    out_sharding: _NamedSharding | _PartitionSpec | None = ...,
+) -> _Array[IntTuple]: ...
+@overload
 def zeros_like[N: IntVar](
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Int[N] = ...,
     *,
@@ -358,7 +377,7 @@ def zeros_like[N: IntVar](
 ) -> _Array[[N]]: ...
 @overload
 def zeros_like[Shape: _Shape](
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Shape = ...,
     *,
@@ -367,7 +386,7 @@ def zeros_like[Shape: _Shape](
 ) -> _Array[Shape]: ...
 @overload
 def zeros_like(
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Sequence[int] | int | None = None,
     *,
@@ -384,8 +403,17 @@ def ones_like[Shape: _Shape = []](
     out_sharding: _NamedSharding | _PartitionSpec | None = ...,
 ) -> _Array[Shape]: ...
 @overload
+def ones_like(
+    a: _ArrayLike[Any] | _DuckTypedArray,
+    dtype: DTypeLike | None = ...,
+    shape: None = None,
+    *,
+    device: _Device | _Sharding | None = ...,
+    out_sharding: _NamedSharding | _PartitionSpec | None = ...,
+) -> _Array[IntTuple]: ...
+@overload
 def ones_like[N: IntVar](
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Int[N] = ...,
     *,
@@ -394,7 +422,7 @@ def ones_like[N: IntVar](
 ) -> _Array[[N]]: ...
 @overload
 def ones_like[Shape: _Shape](
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Shape = ...,
     *,
@@ -403,7 +431,7 @@ def ones_like[Shape: _Shape](
 ) -> _Array[Shape]: ...
 @overload
 def ones_like(
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     dtype: DTypeLike | None = ...,
     shape: Sequence[int] | int | None = None,
     *,
@@ -421,8 +449,18 @@ def full_like[Shape: _Shape = []](
     out_sharding: _NamedSharding | _PartitionSpec | None = ...,
 ) -> _Array[Shape]: ...
 @overload
+def full_like(
+    a: _ArrayLike[Any] | _DuckTypedArray,
+    fill_value: Any,
+    dtype: DTypeLike | None = ...,
+    shape: None = None,
+    *,
+    device: _Device | _Sharding | None = ...,
+    out_sharding: _NamedSharding | _PartitionSpec | None = ...,
+) -> _Array[IntTuple]: ...
+@overload
 def full_like[N: IntVar](
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     fill_value: Any,
     dtype: DTypeLike | None = ...,
     shape: Int[N] = ...,
@@ -432,7 +470,7 @@ def full_like[N: IntVar](
 ) -> _Array[[N]]: ...
 @overload
 def full_like[Shape: _Shape](
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     fill_value: Any,
     dtype: DTypeLike | None = ...,
     shape: Shape = ...,
@@ -442,7 +480,7 @@ def full_like[Shape: _Shape](
 ) -> _Array[Shape]: ...
 @overload
 def full_like(
-    a: _ArrayLike[Any],
+    a: _ArrayLike[Any] | _DuckTypedArray,
     fill_value: Any,
     dtype: DTypeLike | None = ...,
     shape: Sequence[int] | int | None = None,
@@ -1209,7 +1247,7 @@ def matrix_transpose[Batch: IntTuple, M: IntVar, N: IntVar](
 # A single int or tuple, matching JAX: the free function is not variadic, so
 # `jnp.reshape(a, 2, 3)` is an error there. `Array.reshape` is the variadic one.
 @overload
-def reshape[NewShape: Flag[_NewShape], Shape: _Shape = []](
+def reshape[NewShape: _Shape, Shape: _Shape = []](
     a: _ArrayLike[Shape],
     shape: NewShape,
     order: str = ...,
@@ -1218,14 +1256,14 @@ def reshape[NewShape: Flag[_NewShape], Shape: _Shape = []](
     out_sharding: _NamedSharding | _PartitionSpec | None = ...,
 ) -> _Array[reshape_shape(Shape, NewShape)]: ...
 @overload
-def reshape[NewShape: _Shape](
-    a: _ArrayLike[Any],
-    shape: NewShape,
+def reshape[NewDim: Int, Shape: _Shape = []](
+    a: _ArrayLike[Shape],
+    shape: NewDim,
     order: str = ...,
     *,
     copy: bool | None = ...,
     out_sharding: _NamedSharding | _PartitionSpec | None = ...,
-) -> _Array[NewShape]: ...
+) -> _Array[reshape_scalar_shape(Shape, NewDim)]: ...
 @overload
 def reshape(
     a: _ArrayLike[Any],

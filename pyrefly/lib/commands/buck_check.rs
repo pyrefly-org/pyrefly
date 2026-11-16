@@ -154,7 +154,7 @@ fn compute_errors(
     config.extra_file_extensions = extra_file_extensions;
     config.interpreters.skip_interpreter_query = true;
     config.disable_search_path_heuristics = true;
-    config.preset = options.preset;
+    config.root.preset = options.preset;
     config.root.permissive_ignores = Some(true);
     config.root.ignore_errors_in_generated_code = Some(true);
 
@@ -210,8 +210,9 @@ fn compute_errors(
 
     let errors = transaction.as_ref().get_errors(&modules_to_check);
 
-    // Collect main errors (done once, shared with unused ignore check)
-    let collected = errors.collect_errors();
+    // Collect main errors (done once, shared with unused ignore check), in parallel on the
+    // state's thread pool, which the check has finished with.
+    let collected = transaction.as_ref().install(|| errors.collect_errors());
     let unused = errors.collect_unused_ignore_errors_for_display(&collected);
     let mut output_errors = collected.ordinary;
     output_errors.extend(collected.hints);

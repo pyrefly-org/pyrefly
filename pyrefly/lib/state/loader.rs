@@ -575,6 +575,51 @@ mod tests {
     }
 
     #[test]
+    fn test_use_shape_comments_and_stubs_bundled_cache() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::dir("requests", vec![TestPath::file("__init__.py")]),
+                TestPath::dir("requests-shape-stubs", vec![TestPath::file("__init__.pyi")]),
+            ],
+        );
+        let first = ModulePath::memory(root.join("first/main.py"));
+        let second = ModulePath::memory(root.join("second/main.py"));
+        for compatibility in [false, true] {
+            let mut config = ConfigFile::parse_config(&format!(
+                "use-shape-comments-and-stubs = {compatibility}\n\
+                 [[sub-config]]\n\
+                 matches = '**/second/**'\n",
+            ))
+            .unwrap();
+            config.python_environment.set_empty_to_default();
+            config.python_environment.site_package_path = Some(vec![root.to_path_buf()]);
+            config.disable_search_path_heuristics = true;
+            config.configure();
+            let config = ArcId::new(config);
+            for origins in [[&first, &second, &first], [&second, &first, &second]] {
+                let loader = LoaderFindCache::new(config.dupe());
+                for origin in origins {
+                    let path = loader
+                        .find_import(ModuleName::from_str("requests"), Some(origin), None)
+                        .finding()
+                        .unwrap();
+                    if compatibility {
+                        assert_eq!(
+                            path,
+                            ModulePath::filesystem(root.join("requests-shape-stubs/__init__.pyi"))
+                        );
+                    } else {
+                        assert!(path.is_bundled(), "opt-out must restore the bundled stub");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_tensor_shapes_missing_marker_uses_origin_independent_cache_entry() {
         let mut config = ConfigFile::default();
         config.python_environment.set_empty_to_default();

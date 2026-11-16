@@ -5,11 +5,74 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use crate::test::shape_dsl::legacy_shaped_array_env;
 use crate::test::shaped::shaped_env;
 use crate::test::util::TestEnv;
+use crate::test::util::shape_extensions_env;
 use crate::test::util::testcase_for_macro;
 use crate::testcase;
+
+testcase!(
+    test_shaped_comments_compatibility_opt_out,
+    shaped_env().disable_use_shape_comments_and_stubs(),
+    r#"
+# enable-shape-type-comments
+from typing import assert_type
+from arrays import ndarray
+from shape_extensions import Int, IntVar, Shaped, shape_vars
+
+# shapes: N
+def commented(
+    n: int,  # shaped: N
+) -> int:  # shaped: N + 1
+    ...
+
+def native[N: IntVar](n: Int[N]) -> Int[N + 1]: ...
+
+@shape_vars("N")
+def wrapped(x: Shaped[ndarray, "[N]"]) -> Shaped[ndarray, "[N + 1]"]: ...
+
+def check(x: ndarray[[3]]) -> None:
+    assert_type(commented(3), int)
+    assert_type(native(3), Int[4])
+    assert_type(wrapped(x), ndarray[[4]])
+"#,
+);
+
+testcase!(
+    test_shaped_comments_compatibility_opt_out_diagnostics,
+    shaped_env().disable_use_shape_comments_and_stubs(),
+    r#"
+# enable-shape-type-comments
+from typing import assert_type
+
+def f(
+    x: int,  # shaped: [3
+    y: int,  # shaped: .args[-1] = 3
+) -> None:
+    assert_type(x, int)
+    assert_type(y, int)
+    bad: str = x  # E: `int` is not assignable to `str`
+"#,
+);
+
+testcase!(
+    test_shaped_comments_compatibility_opt_out_dependency,
+    {
+        let mut env = shaped_env().disable_use_shape_comments_and_stubs();
+        env.add_with_path(
+            "library",
+            "library.pyi",
+            "# enable-shape-type-comments\ndef f() -> int: ...  # shaped: = str\n",
+        );
+        env
+    },
+    r#"
+from typing import assert_type
+from library import f
+
+assert_type(f(), int)
+"#,
+);
 
 #[test]
 fn test_shaped_comments_expression_depth_limit() {
@@ -697,14 +760,13 @@ def f() -> None: ...  # E: cannot combine
 );
 
 testcase!(
-    test_shaped_comments_registered_array,
-    legacy_shaped_array_env(),
+    test_shaped_comments_inttuple_generic_array,
+    shape_extensions_env(),
     r#"
 # enable-shape-type-comments
 from typing import assert_type
-from shape_extensions import IntTuple, shaped_array
+from shape_extensions import IntTuple
 
-@shaped_array(shape="Shape")
 class Array[Shape: IntTuple, DType = object]:
     shape: Shape
 
@@ -1069,20 +1131,19 @@ class Commented(
 );
 
 testcase!(
-    test_shaped_comments_base_registered_array,
-    legacy_shaped_array_env(),
+    test_shaped_comments_base_inttuple_generic_array,
+    shape_extensions_env(),
     r#"
 # enable-shape-type-comments
-from typing import Literal, assert_type
-from shape_extensions import IntTuple, shaped_array
-@shaped_array(shape="Shape")
+from typing import assert_type
+from shape_extensions import IntTuple
 class Array[Shape: IntTuple = IntTuple]:
     shape: Shape
 class Image(
     Array,  # shaped: [3, 4]
 ): ...
 def check(i: Image) -> None:
-    assert_type(i.shape, tuple[Literal[3], Literal[4]])
+    assert_type(i.shape, IntTuple[3, 4])
 "#,
 );
 
@@ -1117,14 +1178,13 @@ def check(fields: Fields) -> None:
 );
 
 testcase!(
-    test_shaped_comments_registered_array_dsl_and_bare_carrier,
-    legacy_shaped_array_env(),
+    test_shaped_comments_inttuple_generic_array_dsl_and_bare_carrier,
+    shape_extensions_env(),
     r#"
 # enable-shape-type-comments
 from typing import assert_type
-from shape_extensions import IntTuple, shaped_array, broadcast
+from shape_extensions import IntTuple, broadcast
 
-@shaped_array(shape="Shape")
 class Array[Shape: IntTuple, DType = object]: ...
 
 # shapes: *Left, *Right
@@ -1263,5 +1323,17 @@ def f(
 
 def check(x: ndarray[[3]], y: ndarray) -> None:
     assert_type(f(x, y), ndarray[[4]])
+"#,
+);
+
+// A shape comment is never evaluated, so it may refer to a field declared later in a class body.
+testcase!(
+    test_shaped_comments_class_body_forward_reference,
+    shaped_env(),
+    r#"
+# enable-shape-type-comments
+class C:
+    x: int  # shaped: type = D
+    class D: ...
 "#,
 );

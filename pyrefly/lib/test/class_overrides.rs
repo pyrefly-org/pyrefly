@@ -2457,11 +2457,11 @@ testcase!(
     test_override_method_without_self,
     r#"
 class A:
-    def foo() -> int:
+    def foo() -> int:  # E: Instance method `foo` must accept the instance as its first positional parameter
         return 42
 
 class B(A):
-    def foo() -> int:
+    def foo() -> int:  # E: Instance method `foo` must accept the instance as its first positional parameter
         return 100
     "#,
 );
@@ -3197,14 +3197,14 @@ class Base:
 
 class Derived(Base):
     @decorate
-    def callback(self, x: int) -> None: ...  # E: `Derived.callback` and `Base.callback` must both be descriptors
+    def callback(self, x: int) -> None: ...  # E: `Derived.callback` is read-only, but `Base.callback` is read-write
 
 class BaseNonCallable:
     x: int = 1
 
 class DerivedNonCallable(BaseNonCallable):
     @decorate
-    def x(self) -> int: ...  # E: `DerivedNonCallable.x` and `BaseNonCallable.x` must both be descriptors
+    def x(self) -> int: ...  # E: `(...) -> int`, which is not assignable to `int`
 "#,
 );
 
@@ -3313,4 +3313,15 @@ class Parent:
 class Child(Parent):
     features = (untyped(1).attr,)
 "#,
+);
+
+testcase!(
+    test_truthiness_marker_in_parent_attr_type,
+    r#"
+class A: ...
+class Parent:
+    x = A() or 42
+class Child(Parent):
+    x = A()
+    "#,
 );

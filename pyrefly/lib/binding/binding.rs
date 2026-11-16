@@ -24,7 +24,6 @@ use pyrefly_python::symbol_kind::SymbolKind;
 use pyrefly_types::function::BodyKind;
 use pyrefly_types::function::Deprecation;
 use pyrefly_types::heap::TypeHeap;
-use pyrefly_types::meta_shape_dsl::ShapeDslFunction;
 use pyrefly_types::special_form::SpecialForm;
 use pyrefly_types::type_alias::TypeAlias;
 use pyrefly_types::type_alias::TypeAliasIndex;
@@ -137,7 +136,7 @@ assert_words!(BindingAnnotation, 11);
 assert_words!(BindingClass, 11);
 assert_words!(BindingTParams, 9);
 assert_words!(BindingClassBaseType, 3);
-assert_words!(BindingClassMetadata, 14);
+assert_words!(BindingClassMetadata, 11);
 assert_words!(BindingDjangoRelations, 2);
 assert_bytes!(BindingClassMro, 4);
 assert_bytes!(BindingClassChecks, 4);
@@ -151,7 +150,7 @@ assert_words!(BindingYield, 4);
 assert_words!(BindingYieldFrom, 4);
 assert_words!(BindingDecorator, 9);
 assert_bytes!(BindingDecoratedFunction, 24);
-assert_words!(BindingUndecoratedFunction, 18);
+assert_words!(BindingUndecoratedFunction, 16);
 
 #[derive(Clone, Dupe, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AnyIdx {
@@ -678,7 +677,7 @@ impl Keyed for KeyUndecoratedFunction {
 }
 impl Keyed for KeyUndecoratedFunctionRange {
     type Value = BindingUndecoratedFunctionRange;
-    type Answer = UndecoratedFunctionRangeAnswer;
+    type Answer = EmptyAnswer;
     fn to_anyidx(idx: Idx<Self>) -> AnyIdx {
         AnyIdx::KeyUndecoratedFunctionRange(idx)
     }
@@ -1284,6 +1283,18 @@ pub enum ExceptClauseCatches {
     Everything,
 }
 
+/// The earlier cases' effect on a match subject at the point a later case is checked.
+#[derive(Clone, Debug)]
+pub struct MatchCaseNegations {
+    /// Negations from earlier unguarded cases, in the same subject coordinates as
+    /// the current case's narrow op.
+    pub op: NarrowOp,
+    pub range: TextRange,
+    /// The match subject before `op` applies, so diagnostics can name it when
+    /// `op` has already reduced the case subject to `Never`.
+    pub declared_subject_idx: Idx<Key>,
+}
+
 #[derive(Clone, Debug)]
 pub enum BindingExpect {
     /// An expression where we need to check for type errors, but don't need the result type.
@@ -1329,10 +1340,12 @@ pub enum BindingExpect {
         narrowing_subject: Option<NarrowingSubject>,
         narrow_ops_for_case: Box<(NarrowOp, TextRange)>,
         /// Negations from earlier unguarded cases in the same match, in the
-        /// same subject coordinates as `narrow_ops_for_case`. Reachability
-        /// narrows by the current pattern first, then applies these, so an
-        /// `Any` subject can first become `bool` and then subtract `int`.
-        prev_case_negations: Option<Box<(NarrowOp, TextRange)>>,
+        /// same subject coordinates as `narrow_ops_for_case`, plus the match
+        /// subject before those negations so diagnostics can name it.
+        /// Reachability narrows by the current pattern first, then applies
+        /// these, so an `Any` subject can first become `bool` and then
+        /// subtract `int`.
+        prev_case_negations: Option<Box<MatchCaseNegations>>,
         case_range: TextRange,
     },
     /// Code following one or more points in a suite that control passes only conditionally, such
@@ -1744,17 +1757,6 @@ pub struct KeyUndecoratedFunctionRange(pub FuncDefIndex);
 impl DisplayWith<ModuleInfo> for KeyUndecoratedFunctionRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, _: &ModuleInfo) -> fmt::Result {
         write!(f, "KeyUndecoratedFunctionRange({})", self.0)
-    }
-}
-
-/// Trivial answer type for KeyUndecoratedFunctionRange — just a copy of the
-/// binding value (the function's ShortIdentifier).
-#[derive(Clone, Debug, Visit, VisitMut, TypeEq, PartialEq, Eq)]
-pub struct UndecoratedFunctionRangeAnswer(pub ShortIdentifier);
-
-impl Display for UndecoratedFunctionRangeAnswer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UndecoratedFunctionRangeAnswer({:?})", self.0.range())
     }
 }
 
@@ -2179,15 +2181,8 @@ pub struct BindingUndecoratedFunction {
     pub legacy_tparams: Box<[Idx<KeyLegacyTypeParam>]>,
     pub decorators: Box<[Idx<KeyDecorator>]>,
     pub parent: NestingContext,
-    /// When the function is decorated with `@shape_dsl_function`, this holds the
-    /// parsed DSL IR so the solver can produce `FunctionKind::ShapeDsl`.
-    pub shape_dsl_def: Option<Arc<ShapeDslFunction>>,
     /// Parsed source for a user-defined type-level shape DSL function.
     pub type_shape_dsl_def: Option<Arc<ParsedTypeShapeDslFunction>>,
-    /// Identifier of the IR function passed as the first positional argument to
-    /// `@uses_shape_dsl(ir_fn)`. Extracted at binding time so the solver can
-    /// resolve it to a `FunctionKind::ShapeDsl` type.
-    pub uses_shape_dsl_ir_name: Option<ShortIdentifier>,
 }
 
 impl DisplayWith<Bindings> for BindingUndecoratedFunction {
@@ -2510,8 +2505,14 @@ pub struct ExhaustiveBinding {
 #[derive(Clone, Debug)]
 pub struct SuiteGate {
     pub condition: GateCondition,
-    /// Where this gate's dead region would begin, i.e. the statement following it.
+    /// Where this gate's dead region would begin: the first statement following it that is not a
+    /// `raise` or a failing `assert`.
     pub start: TextSize,
+    /// The expression statement at `start`, if that is what the region begins with. One of type
+    /// `Never` is a divergence marker like a `raise`, the shape `assert_never` takes, and is not
+    /// reported even when the gate is closed. The gate that statement opens covers whatever
+    /// follows it.
+    pub expr_at_start: Option<Idx<Key>>,
 }
 
 /// What must hold for control to pass a [`SuiteGate`].
@@ -2619,7 +2620,6 @@ pub struct ClassBodyUnknownName {
     pub class_key: Idx<KeyClass>,
     pub name: Identifier,
     pub suggestion: Option<Name>,
-    pub allow_class_body_forward_reference: bool,
 }
 
 /// Where and how to report a `FindError` for the module of a `Binding::Module`.
@@ -2675,12 +2675,14 @@ pub enum Binding {
     ReturnType(Box<ReturnType>),
     /// A value in an iterable expression from a comprehension.
     /// The `TextRange` is the position of the comprehension target, used for go-to-def.
-    IterableValueComprehension(Box<Expr>, IsAsync, TextRange),
+    /// The boolean indicates whether the target unpacks the iteration value.
+    IterableValueComprehension(Box<Expr>, IsAsync, TextRange, bool),
     /// A value in an iterable expression from a for-loop,
     /// e.g. `for x in items`. Keeps the optional annotation from the loop target.
+    /// The fourth argument indicates whether the target unpacks the iteration value.
     /// The last argument is whether the loop is in a class body, where the target defines a
     /// class attribute.
-    IterableValueLoop(Option<Idx<KeyAnnotation>>, Box<Expr>, IsAsync, bool),
+    IterableValueLoop(Option<Idx<KeyAnnotation>>, Box<Expr>, IsAsync, bool, bool),
     /// A value produced by entering a context manager.
     /// The second argument is the expression of the context manager and its range.
     /// The fourth argument indicates whether the context manager is async or not.
@@ -2931,10 +2933,10 @@ impl DisplayWith<Bindings> for Binding {
             }
             Self::ReturnImplicit(_) => write!(f, "ReturnImplicit(_)"),
             Self::ReturnType(_) => write!(f, "ReturnType(_)"),
-            Self::IterableValueComprehension(x, sync, _) => {
+            Self::IterableValueComprehension(x, sync, _, _) => {
                 write!(f, "IterableValueComprehension({}, {sync:?})", m.display(x))
             }
-            Self::IterableValueLoop(a, x, sync, _) => {
+            Self::IterableValueLoop(a, x, sync, _, _) => {
                 write!(
                     f,
                     "IterableValueLoop({}, {}, {sync:?})",
@@ -3174,14 +3176,12 @@ impl DisplayWith<Bindings> for Binding {
                     class_key,
                     name,
                     suggestion,
-                    allow_class_body_forward_reference,
                 } = x.as_ref();
                 write!(
                     f,
-                    "ClassBodyUnknownName({}, {}, allow_class_body_forward_reference={}",
+                    "ClassBodyUnknownName({}, {}",
                     m.display(ctx.idx_to_key(*class_key)),
                     name,
-                    allow_class_body_forward_reference,
                 )?;
                 if let Some(suggestion) = suggestion {
                     write!(f, ", {suggestion}")?;
@@ -3289,8 +3289,9 @@ impl Binding {
             | Binding::TypeLevelLambdaParameter(_)
             | Binding::FunctionParameter(_) => Some(SymbolKind::Parameter),
             Binding::PatternCapture(_) => Some(SymbolKind::Variable),
-            Binding::IterableValueComprehension(_, _, _)
-            | Binding::IterableValueLoop(_, _, _, _) => Some(SymbolKind::Variable),
+            Binding::IterableValueComprehension(..) | Binding::IterableValueLoop(..) => {
+                Some(SymbolKind::Variable)
+            }
             Binding::ContextValue(_, _, _, _, _) | Binding::ExceptionHandler(_, _, _) => {
                 Some(SymbolKind::Variable)
             }
@@ -3625,8 +3626,13 @@ pub enum ClassFieldDefinition {
     /// The definition field stores the Idx<Key> that points to the class binding.
     NestedClass { definition: Idx<Key> },
     /// Defined in some way other than assignment or a `def` form,
-    /// for example a name imported into a class body.
-    DefinedWithoutAssign { definition: Idx<Key> },
+    /// for example a name imported into a class body, or a sentinel assigned
+    /// under a bare `Final` or `ClassVar` annotation, whose qualifiers
+    /// must still apply to the field.
+    DefinedWithoutAssign {
+        definition: Idx<Key>,
+        annotation: Option<Idx<KeyAnnotation>>,
+    },
     /// Implicitly defined in a method, without any explicit reference
     /// in the class body.
     DefinedInMethod {
@@ -3833,14 +3839,6 @@ impl DisplayWith<Bindings> for BindingClassChecks {
     }
 }
 
-/// Information about a class that is marked as using array shapes (for shape typing).
-#[derive(Clone, Debug)]
-pub struct ShapedArrayMetadata {
-    pub shape_name: Name,
-    pub range: TextRange,
-    pub builtin_indexing: bool,
-}
-
 /// Binding for the class's metadata (anything obtained directly from base classes,
 /// except for the MRO which is kept separate to avoid cycles).
 #[derive(Clone, Debug)]
@@ -3862,11 +3860,6 @@ pub struct BindingClassMetadata {
     pub pydantic_before_validator_fields: Box<[Name]>,
     /// Django-specific field information.
     pub django_field_info: Box<DjangoFieldInfo>,
-    /// `__init__` parameter names to capture for shape inference, extracted from
-    /// `@uses_shape_dsl(..., capture_init=[...])` on a `forward` method.
-    pub capture_init: Option<Box<[Name]>>,
-    /// Shape parameter requested by `@shaped_array(shape="...")`.
-    pub shaped_array_metadata: Option<Box<ShapedArrayMetadata>>,
 }
 
 impl DisplayWith<Bindings> for BindingClassMetadata {

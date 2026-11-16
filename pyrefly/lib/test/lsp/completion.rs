@@ -10,11 +10,16 @@ use std::slice;
 use lsp_types::CompletionItem;
 use lsp_types::CompletionItemKind;
 use lsp_types::CompletionItemTag;
+use lsp_types::CompletionItemTextEdit;
+use lsp_types::Position;
+use lsp_types::Range;
+use lsp_types::TextEdit;
 use pretty_assertions::assert_eq;
 use pyrefly_build::handle::Handle;
 use pyrefly_python::sys_info::PythonVersion;
 use ruff_text_size::TextSize;
 
+use crate::lsp::wasm::completion::CompletionOptions;
 use crate::state::lsp::ImportFormat;
 use crate::state::require::Require;
 use crate::state::state::State;
@@ -2712,6 +2717,157 @@ def f():
 }
 
 #[test]
+fn completion_after_keyword_prefix_in_function_body() {
+    for (prefix, local, builtin) in [
+        ("as", "assertion", "classmethod"),
+        ("in", "initial", "int"),
+        ("is", "island", "isinstance"),
+    ] {
+        let code = format!("\ndef f({local}: int, unrelated: int):\n    {prefix}\n#     ^\n");
+        let items = completions_at_cursor(&code);
+        for keyword in ["assert", "async", "import", "is"] {
+            assert!(
+                items.iter().any(|item| {
+                    item.kind == Some(CompletionItemKind::Keyword) && item.label == keyword
+                }),
+                "expected keyword `{keyword}` after `{prefix}`, got {items:?}"
+            );
+        }
+        for name in [local, builtin] {
+            assert!(
+                items.iter().any(|item| item.label == name),
+                "expected `{name}` after `{prefix}`, got {items:?}"
+            );
+        }
+        for name in ["unrelated", "len"] {
+            assert!(
+                !items.iter().any(|item| item.label == name),
+                "unexpected `{name}` after `{prefix}`, got {items:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn completion_after_keyword_prefix_preserves_autoimport_behavior() {
+    for (prefix, local, auto_import, expected_incomplete, expected_autoimport) in [
+        ("as", "", true, true, false),
+        ("ass", "", true, false, true),
+        ("and", "", true, false, true),
+        ("and", "andromeda: int", true, true, false),
+        ("and_", "andromeda: int", true, false, true),
+        ("as", "", false, false, false),
+        ("and", "andromeda: int", false, false, false),
+    ] {
+        let code = format!("def f({local}):\n    {prefix}");
+        let (handles, state) = mk_multi_file_state(
+            &[
+                ("main", &code),
+                ("tools", "def and_tool(): pass\ndef assert_tool(): pass"),
+            ],
+            Require::Exports,
+            false,
+        );
+        let (items, is_incomplete) = state.transaction().completion_with_incomplete(
+            &handles["main"],
+            TextSize::of(code.as_str()),
+            ImportFormat::Absolute,
+            CompletionOptions {
+                auto_import,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!items.is_empty(), "expected completions in {code:?}");
+        assert_eq!(is_incomplete, expected_incomplete, "code: {code:?}");
+        assert_eq!(
+            items
+                .iter()
+                .any(|item| matches!(item.label.as_str(), "and_tool" | "assert_tool")),
+            expected_autoimport,
+            "code: {code:?}"
+        );
+    }
+}
+
+#[test]
+fn completion_after_keyword_prefix_in_inline_suite() {
+    for header in [
+        "def f():\n    if True:",
+        "def f():\n    while True:",
+        "def f():\n    for item in ():",
+        "def f():\n    with open('file'):",
+        "def f():\n    try:",
+        "def f():\n    try: pass\n    except:",
+        "def f():\n    try: pass\n    finally:",
+        "def f():\n    if False: pass\n    elif True:",
+        "def f():\n    if False: pass\n    else:",
+        "class C:\n    def f(self):",
+        "def f():\n    class C:",
+        "def f():\n    match 1:\n        case 1:",
+    ] {
+        let code = format!("{header} as");
+        let (handles, state) = mk_multi_file_state(&[("main", &code)], Require::Exports, false);
+        let items = state.transaction().completion(
+            &handles["main"],
+            TextSize::of(code.as_str()),
+            ImportFormat::Absolute,
+            true,
+            None,
+        );
+        assert!(
+            items.iter().any(|item| {
+                item.kind == Some(CompletionItemKind::Keyword) && item.label == "assert"
+            }),
+            "expected `assert` in {code:?}, got {items:?}"
+        );
+    }
+}
+
+#[test]
+fn completion_after_keyword_prefix_in_other_statement_positions() {
+    for code in [
+        "as\n# ^\n",
+        "class C:\n    as\n#     ^\n",
+        "if True:\n    as\n#     ^\n",
+        "def f():\n    if True:\n        as\n#         ^\n",
+        "def f():\n    # comment\n\n    as\n#     ^\n",
+        "def f():\n    pass; as\n#           ^\n",
+        "def f():\r\n    as\r\n#     ^\r\n",
+    ] {
+        let items = completions_at_cursor(code);
+        assert!(
+            items.iter().any(|item| {
+                item.kind == Some(CompletionItemKind::Keyword) && item.label == "assert"
+            }),
+            "expected `assert` in {code:?}, got {items:?}"
+        );
+    }
+}
+
+#[test]
+fn no_statement_completions_after_keyword_in_expression() {
+    for code in [
+        "def f(item):\n    value = item is\n#                  ^\n",
+        "def f():\n    return as\n#            ^\n",
+        "def f():\n    print(\n        as\n#         ^\n    )\n",
+        "def f():\n    value = {1: as}\n#                 ^\n",
+        "def f(items):\n    value = items[:as]\n#                    ^\n",
+        "def f():\n    value: as\n#            ^\n",
+        "def f():\n    value = lambda: as\n#                     ^\n",
+        "def f():\n    def g(value: as): pass\n#                  ^\n",
+    ] {
+        let items = completions_at_cursor(code);
+        for name in ["assert", "def", "return"] {
+            assert!(
+                !items.iter().any(|item| item.label == name),
+                "unexpected `{name}` in {code:?}, got {items:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn kwargs_completion_with_existing_args() {
     let code = r#"
 def foo(a: int, b: str, c: bool): ...
@@ -3176,6 +3332,258 @@ a.zz
     );
 }
 
+fn completions_at_cursor(code: &str) -> Vec<CompletionItem> {
+    let (handles, state) = mk_multi_file_state(&[("main", code)], Require::Exports, false);
+    let position = extract_cursors_for_test(code)[0];
+    state.transaction().completion(
+        &handles["main"],
+        position,
+        ImportFormat::Absolute,
+        true,
+        None,
+    )
+}
+
+/// The labels of the completions that rewrite the attribute access into a subscript.
+fn subscript_rewrite_labels(code: &str) -> Vec<String> {
+    completions_at_cursor(code)
+        .into_iter()
+        .filter(|item| item.text_edit.is_some())
+        .map(|item| item.label)
+        .collect()
+}
+
+// https://github.com/meta/pyrefly/issues/5478
+#[test]
+fn typed_dict_attribute_completion_rewrites_to_subscript() {
+    let code = r#"
+from typing import TypedDict
+
+class A(TypedDict):
+    f1: int
+    f2: str
+
+a: A
+a.
+# ^
+"#;
+    let completions = completions_at_cursor(code);
+    let f1 = completions
+        .iter()
+        .find(|item| item.label == "f1")
+        .expect("missing completion for TypedDict key `f1`");
+    assert_eq!(f1.kind, Some(CompletionItemKind::Field));
+    assert_eq!(f1.detail.as_deref(), Some("int"));
+    assert_eq!(f1.filter_text.as_deref(), Some(".f1"));
+    assert_eq!(
+        f1.text_edit,
+        Some(CompletionItemTextEdit::TextEdit(TextEdit {
+            range: Range::new(Position::new(8, 1), Position::new(8, 2)),
+            new_text: r#"["f1"]"#.to_owned(),
+        }))
+    );
+    assert_eq!(subscript_rewrite_labels(code), vec!["f1", "f2"]);
+    for method in ["get", "keys", "items"] {
+        assert!(
+            completions
+                .iter()
+                .any(|item| item.label == method && item.kind == Some(CompletionItemKind::Method)),
+            "missing dict method `{method}`"
+        );
+    }
+}
+
+#[test]
+fn typed_dict_attribute_completion_replaces_typed_prefix() {
+    let code = r#"
+from typing import TypedDict
+
+class A(TypedDict):
+    field: int
+
+a: A
+a.fi
+#   ^
+"#;
+    let completions = completions_at_cursor(code);
+    let field = completions
+        .iter()
+        .find(|item| item.label == "field")
+        .expect("missing completion for TypedDict key `field`");
+    assert_eq!(field.filter_text.as_deref(), Some(".field"));
+    assert_eq!(
+        field.text_edit,
+        Some(CompletionItemTextEdit::TextEdit(TextEdit {
+            range: Range::new(Position::new(7, 1), Position::new(7, 4)),
+            new_text: r#"["field"]"#.to_owned(),
+        }))
+    );
+}
+
+#[test]
+fn typed_dict_attribute_completion_includes_inherited_and_qualified_keys() {
+    let code = r#"
+from typing_extensions import NotRequired, ReadOnly, TypedDict
+
+class Base(TypedDict):
+    base: int
+
+class Child(Base):
+    child: str
+    optional: NotRequired[int]
+    frozen: ReadOnly[bytes]
+
+c: Child
+c.
+# ^
+"#;
+    assert_eq!(
+        subscript_rewrite_labels(code),
+        vec!["base", "child", "frozen", "optional"]
+    );
+}
+
+#[test]
+fn typed_dict_attribute_completion_quotes_non_identifier_keys() {
+    let code = r#"
+from typing import TypedDict
+
+Weird = TypedDict("Weird", {"two words": int, 'say "hi"': str})
+
+w: Weird
+w.
+# ^
+"#;
+    let new_texts: Vec<_> = completions_at_cursor(code)
+        .into_iter()
+        .filter_map(|item| match item.text_edit {
+            Some(CompletionItemTextEdit::TextEdit(edit)) => Some(edit.new_text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(new_texts, vec![r#"["say \"hi\""]"#, r#"["two words"]"#]);
+}
+
+#[test]
+fn typed_dict_attribute_completion_skips_non_typed_dict_bases() {
+    let code = r#"
+from typing import TypedDict
+
+class A(TypedDict):
+    f1: int
+
+class C:
+    f1: int
+
+c = C()
+c.
+# ^
+A.
+# ^
+"#;
+    let (handles, state) = mk_multi_file_state(&[("main", code)], Require::Exports, false);
+    for position in extract_cursors_for_test(code) {
+        let completions = state.transaction().completion(
+            &handles["main"],
+            position,
+            ImportFormat::Absolute,
+            true,
+            None,
+        );
+        assert!(!completions.is_empty());
+        assert!(
+            completions.iter().all(|item| item.text_edit.is_none()),
+            "{completions:?}"
+        );
+    }
+}
+
+#[test]
+fn typed_dict_attribute_completion_keeps_parentheses_around_the_base() {
+    let code = r#"
+from typing import TypedDict
+
+class A(TypedDict):
+    field: int
+
+a: A
+(a).fi
+#     ^
+"#;
+    let completions = completions_at_cursor(code);
+    let field = completions
+        .iter()
+        .find(|item| item.label == "field")
+        .expect("missing completion for TypedDict key `field`");
+    assert_eq!(field.filter_text.as_deref(), Some(".field"));
+    assert_eq!(
+        field.text_edit,
+        Some(CompletionItemTextEdit::TextEdit(TextEdit {
+            range: Range::new(Position::new(7, 3), Position::new(7, 6)),
+            new_text: r#"["field"]"#.to_owned(),
+        }))
+    );
+}
+
+#[test]
+fn typed_dict_attribute_completion_avoids_enclosing_f_string_quotes() {
+    let code = r#"
+from typing import TypedDict
+
+Keys = TypedDict("Keys", {"field": int, "fi'eld": int, 'fi"eld': int})
+
+k: Keys
+f"{k.fi}"
+#      ^
+f'{k.fi}'
+#      ^
+f"{f'{k.fi}'}"
+#         ^
+"#;
+    let (handles, state) = mk_multi_file_state(&[("main", code)], Require::Exports, false);
+    let new_texts: Vec<Vec<String>> = extract_cursors_for_test(code)
+        .into_iter()
+        .map(|position| {
+            state
+                .transaction()
+                .completion(
+                    &handles["main"],
+                    position,
+                    ImportFormat::Absolute,
+                    true,
+                    None,
+                )
+                .into_iter()
+                .filter_map(|item| match item.text_edit {
+                    Some(CompletionItemTextEdit::TextEdit(edit)) => Some(edit.new_text),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        new_texts,
+        vec![vec!["['field']"], vec![r#"["field"]"#], Vec::<&str>::new()]
+    );
+}
+
+#[test]
+fn typed_dict_attribute_completion_skips_value_patterns() {
+    let code = r#"
+from typing import TypedDict
+
+class A(TypedDict):
+    field: int
+
+a: A
+match 0:
+    case a.fi:
+#            ^
+        pass
+"#;
+    assert!(subscript_rewrite_labels(code).is_empty());
+}
+
 #[test]
 fn builtins_doesnt_autoimport() {
     let code = r#"
@@ -3495,6 +3903,134 @@ def f(a: A | list[A] | Box):
         for name in ["AA", "BB"] {
             let item = completions.iter().find(|item| item.label == name).unwrap();
             assert_eq!(item.sort_text.as_deref(), Some("0"), "case {current}");
+        }
+    }
+}
+
+#[test]
+fn completion_match_class_keyword_dataclass() {
+    let code = r#"
+from dataclasses import dataclass
+
+@dataclass
+class A:
+    a: int
+    b: int
+
+x = object()
+match x:
+    case A(  ): ...
+#           ^
+"#;
+    let (handles, state) = mk_multi_file_state(&[("main", code)], Require::Exports, false);
+    let handle = handles.get("main").unwrap();
+    let position = extract_cursors_for_test(code)[0];
+    let txn = state.transaction();
+    let completions = txn.completion(handle, position, ImportFormat::Absolute, true, None);
+    let completion_labels: Vec<_> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    for expected in ["a=", "b="] {
+        assert!(
+            completion_labels.contains(&expected),
+            "missing {expected} in completions: {:?}",
+            completion_labels
+        );
+    }
+}
+
+#[test]
+fn completion_match_class_argument_positions() {
+    for (pattern, expected, replacement) in [
+        ("A( | )", vec!["alpha=", "beta=", "gamma="], "A( alpha= )"),
+        ("A(al|)", vec!["alpha="], "A(alpha=)"),
+        ("A(be|, alpha=1)", vec!["beta="], "A(beta=, alpha=1)"),
+        ("A(alpha=1, be|)", vec!["beta="], "A(alpha=1, beta=)"),
+        (
+            "A(alpha=1, | )",
+            vec!["beta=", "gamma="],
+            "A(alpha=1, beta= )",
+        ),
+        ("A(1, | )", vec!["beta=", "gamma="], "A(1, beta= )"),
+        ("A(al|, 2)", vec!["alpha="], "A(alpha=, 2)"),
+        ("A(1, al|pha=2)", vec![], ""),
+        ("A(al|=1, beta=2)", vec!["alpha="], "A(alpha=1, beta=2)"),
+        ("A(al|pha=1, beta=2)", vec!["alpha="], "A(alpha=1, beta=2)"),
+        ("A(alpha| = 1)", vec!["alpha="], "A(alpha = 1)"),
+        ("A(beta|=2, alpha=1)", vec!["beta="], "A(beta=2, alpha=1)"),
+        ("C(1, | )", vec!["alpha=", "gamma="], "C(1, alpha= )"),
+        ("C(1, 2, | )", vec!["gamma="], "C(1, 2, gamma= )"),
+        ("A(alpha= | )", vec![], ""),
+        ("A(alpha=[ | ])", vec![], ""),
+        ("A(alpha={ | })", vec![], ""),
+        ("A(alpha=\" | \")", vec![], ""),
+        ("A(alpha=cap|)", vec![], ""),
+        ("A(alpha=( | ))", vec![], ""),
+        ("A(alpha=[cap|])", vec![], ""),
+        ("A([cap|])", vec![], ""),
+        ("A(alpha={\"key\": cap|})", vec![], ""),
+        ("A(_ as cap|)", vec![], ""),
+        ("A(alpha=B( | ))", vec!["inner="], "A(alpha=B( inner= ))"),
+        ("A(alpha=B(inn|))", vec!["inner="], "A(alpha=B(inner=))"),
+    ] {
+        let code = format!(
+            r#"
+from dataclasses import dataclass
+
+@dataclass
+class A:
+    alpha: object
+    beta: int
+    gamma: int
+
+@dataclass
+class B:
+    inner: int
+
+class Base:
+    __match_args__ = ("beta", "alpha")
+    beta: int
+
+class C(Base):
+    alpha: int
+    gamma: int
+
+match object():
+    case {pattern}: ...
+"#
+        );
+        let position = TextSize::try_from(code.find('|').unwrap()).unwrap();
+        let code = code.replacen('|', "", 1);
+        let (handles, state) = mk_multi_file_state(&[("main", &code)], Require::Exports, false);
+        let handle = &handles["main"];
+        let txn = state.transaction();
+        let completions = txn.completion(handle, position, ImportFormat::Absolute, true, None);
+        let mut labels: Vec<_> = completions
+            .iter()
+            .filter(|item| ["alpha=", "beta=", "gamma=", "inner="].contains(&item.label.as_str()))
+            .map(|item| item.label.as_str())
+            .collect();
+        labels.sort();
+        assert_eq!(labels, expected, "pattern: {pattern}");
+        if let Some(label) = expected.first() {
+            let item = completions
+                .iter()
+                .find(|item| item.label == *label)
+                .unwrap();
+            let Some(CompletionItemTextEdit::TextEdit(edit)) = &item.text_edit else {
+                panic!("Class argument completion must have a replacement edit: {pattern}");
+            };
+            let module = txn.get_module_info(handle).unwrap();
+            let range = module.from_lsp_range(edit.range, None);
+            let mut updated = code.clone();
+            updated.replace_range(
+                range.start().to_usize()..range.end().to_usize(),
+                &edit.new_text,
+            );
+            assert_eq!(
+                updated,
+                code.replace(&pattern.replace('|', ""), replacement),
+                "pattern: {pattern}"
+            );
         }
     }
 }

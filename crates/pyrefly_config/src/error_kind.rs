@@ -109,6 +109,8 @@ pub enum ShownSeverity {
 pub enum ErrorKind {
     /// Attempting to call a method marked with `@abstractmethod`.
     AbstractMethodCall,
+    /// An `@abstractmethod` has a non-placeholder implementation.
+    AbstractMethodWithImplementation,
     /// Raised when an assert_type() call fails.
     AssertType,
     /// Raised when an assert_type() call fails because the actual type is a subtype of the
@@ -293,6 +295,9 @@ pub enum ErrorKind {
     /// is reported under `BadClassDefinition` or `BadFunctionDefinition`
     /// instead, both of which default to `error`.
     InvalidDecorator,
+    /// An f-string format specification is incompatible with the value's static type
+    /// or the known builtin formatting rules.
+    InvalidFormatSpec,
     /// An error caused by incorrect inheritance in a class or type definition.
     /// e.g. a metaclass that is not a subclass of `type`.
     InvalidInheritance,
@@ -516,6 +521,8 @@ pub enum ErrorKind {
     UnreachableMatchCase,
     /// `__all__` is defined but cannot be statically analyzed.
     UnresolvableDunderAll,
+    /// Calling a signature whose types depend on unresolved imports.
+    UnresolvedImportSignature,
     /// Protocols decorated with `@runtime_checkable` can be used in `isinstance` checks
     /// The runtime only checks that an attribute with that name is present, so the
     /// type checker must warn if the types are not compatible.
@@ -644,6 +651,7 @@ impl ErrorKind {
     pub fn default_severity(self) -> Severity {
         // IMPORTANT: When updating these, also update error-kinds.mdx in the docs
         match self {
+            ErrorKind::AbstractMethodWithImplementation => Severity::Ignore,
             ErrorKind::AttributeAssignOnNever => Severity::Warn,
             ErrorKind::CoverageMissing => Severity::Warn,
             ErrorKind::CoveragePartial => Severity::Warn,
@@ -670,6 +678,7 @@ impl ErrorKind {
             ErrorKind::InvalidAbstractMethod => Severity::Ignore,
             ErrorKind::InvalidCast => Severity::Ignore,
             ErrorKind::InvalidDecorator => Severity::Warn,
+            ErrorKind::InvalidFormatSpec => Severity::Ignore,
             ErrorKind::MethodAssign => Severity::Ignore,
             ErrorKind::MisplacedIgnore => Severity::Warn,
             ErrorKind::MissingAttributePatchTarget => Severity::Warn,
@@ -718,6 +727,7 @@ impl ErrorKind {
             ErrorKind::UnreachableExceptClause => Severity::Warn,
             ErrorKind::UnreachableMatchCase => Severity::Warn,
             ErrorKind::UnresolvableDunderAll => Severity::Warn,
+            ErrorKind::UnresolvedImportSignature => Severity::Warn,
             ErrorKind::UnsupportedDynamicBase => Severity::Ignore,
             ErrorKind::UntypedClassDecorator => Severity::Ignore,
             ErrorKind::UntypedFunctionDecorator => Severity::Ignore,

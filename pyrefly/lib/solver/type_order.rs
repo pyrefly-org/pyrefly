@@ -105,10 +105,6 @@ impl<'solver, Ans: LookupAnswer> TypeOrder<'solver, Ans> {
         self.0.as_class_type_unchecked(class)
     }
 
-    pub fn shaped_array_shape_for_class_type(self, cls: &ClassType) -> Option<Quantified> {
-        self.0.shaped_array_shape_for_class_type(cls)
-    }
-
     pub fn has_metaclass(self, cls: &Class, metaclass: &ClassType) -> bool {
         let metadata = self.0.get_metadata_for_class(cls);
         self.0
@@ -217,6 +213,10 @@ impl<'solver, Ans: LookupAnswer> TypeOrder<'solver, Ans> {
 
     pub fn constructor_to_callable_for_class_def(self, cls: &Class) -> Type {
         self.0.constructor_to_callable_for_class_def(cls)
+    }
+
+    pub fn constructor_to_callable_for_type_of(self, inner: &Type) -> Option<Type> {
+        self.0.constructor_to_callable_for_type_of(inner)
     }
 
     pub fn instantiate_fresh_forall(self, forall: Forall<Forallable>) -> (QuantifiedHandle, Type) {

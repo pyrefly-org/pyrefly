@@ -18,7 +18,6 @@ use pyrefly_types::annotation::Annotation;
 use pyrefly_types::callable::Params;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::quantified::Quantified;
-use pyrefly_types::quantified::QuantifiedKind;
 use pyrefly_types::type_var::Restriction;
 use pyrefly_types::typed_dict::ExtraItem;
 use pyrefly_types::typed_dict::ExtraItems;
@@ -58,7 +57,6 @@ use crate::alt::types::class_metadata::InitDefaults;
 use crate::alt::types::class_metadata::Metaclass;
 use crate::alt::types::class_metadata::NamedTupleMetadata;
 use crate::alt::types::class_metadata::ProtocolMetadata;
-use crate::alt::types::class_metadata::ShapedArrayMetadata as SolvedShapedArrayMetadata;
 use crate::alt::types::class_metadata::SlotsInfo;
 use crate::alt::types::class_metadata::TotalOrderingMetadata;
 use crate::alt::types::class_metadata::TypedDictMetadata;
@@ -69,13 +67,13 @@ use crate::binding::base_class::BaseClass;
 use crate::binding::base_class::BaseClassExpr;
 use crate::binding::base_class::BaseClassGeneric;
 use crate::binding::base_class::BaseClassGenericKind;
+use crate::binding::binding::Binding;
 use crate::binding::binding::ClassFieldDefinition;
 use crate::binding::binding::ExprOrBinding;
 use crate::binding::binding::Key;
 use crate::binding::binding::KeyAnnotation;
 use crate::binding::binding::KeyClassField;
 use crate::binding::binding::KeyDecorator;
-use crate::binding::binding::ShapedArrayMetadata as ShapedArrayDecoratorMetadata;
 use crate::binding::django::DjangoFieldInfo;
 use crate::binding::pydantic::EXTRA;
 use crate::binding::pydantic::PydanticConfigDict;
@@ -195,8 +193,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         pydantic_config_dict: &PydanticConfigDict,
         pydantic_before_validator_fields: &[Name],
         django_field_info: &DjangoFieldInfo,
-        capture_init: Option<&[Name]>,
-        shaped_array_metadata: Option<&ShapedArrayDecoratorMetadata>,
         errors: &ErrorCollector,
     ) -> ClassMetadata {
         // Get class decorators.
@@ -295,24 +291,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if let Some(metaclass) = &mut calculated_metaclass {
             for targ in metaclass.get_mut().targs_mut().as_mut().iter_mut() {
                 if targ.contains_type_variable() {
-                    targ.transform_mut(&mut |ty| match ty {
-                        Type::Quantified(q) => *ty = q.as_gradual_type(),
-                        Type::TypeVar(t) => {
-                            *ty = Quantified::as_gradual_type_helper(t.kind(), t.default())
+                    targ.transform_mut(&mut |ty| {
+                        if let Type::Quantified(q) = ty {
+                            *ty = q.as_gradual_type();
+                        } else if let Some(x) = ty.as_type_var_like() {
+                            *ty = Quantified::as_gradual_type_helper(x.kind(), x.default());
                         }
-                        Type::TypeVarTuple(t) => {
-                            *ty = Quantified::as_gradual_type_helper(
-                                QuantifiedKind::TypeVarTuple,
-                                t.default(),
-                            )
-                        }
-                        Type::ParamSpec(p) => {
-                            *ty = Quantified::as_gradual_type_helper(
-                                QuantifiedKind::ParamSpec,
-                                p.default(),
-                            )
-                        }
-                        _ => {}
                     });
                 }
             }
@@ -476,7 +460,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .iter()
             .find_map(|(decorator, _)| decorator.deprecation.clone());
 
-        let explicit_slots = self.explicit_slots(cls);
+        let explicit_slots = self.explicit_slots(cls, metaclass, errors);
         let has_nonempty_explicit_slots = explicit_slots
             .slots_info()
             .is_some_and(|slots| !slots.names.is_empty());
@@ -508,17 +492,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 true
             }
         });
-        let total_ordering_metadata = decorators.iter().find_map(|(decorator, decorator_range)| {
-            decorator.ty.callee_kind().and_then(|kind| {
-                if kind == CalleeKind::Function(FunctionKind::TotalOrdering) {
-                    Some(TotalOrderingMetadata {
-                        location: *decorator_range,
-                    })
-                } else {
-                    None
-                }
+        let total_ordering_metadata = decorators
+            .iter()
+            .position(|(decorator, _)| {
+                decorator.ty.callee_kind()
+                    == Some(CalleeKind::Function(FunctionKind::TotalOrdering))
             })
-        });
+            .map(|decorator| TotalOrderingMetadata { decorator });
 
         // If this class inherits from a dataclass_transform-ed class or uses a metaclass decorated
         // with @dataclass_transform, record the defaults that we should use for dataclass parameters.
@@ -609,8 +589,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .as_ref()
             .map(|m| m.pydantic_model_kind.clone());
 
-        let shaped_array = self.shaped_array_metadata(cls, shaped_array_metadata, errors);
-
         ClassMetadata::new(
             bases,
             calculated_metaclass,
@@ -638,54 +616,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             is_factory_boy_factory,
             is_metaclass,
             explicit_slots,
-            capture_init.map(|names| names.to_vec()),
-            shaped_array,
         )
-    }
-
-    fn shaped_array_metadata(
-        &self,
-        cls: &Class,
-        metadata: Option<&ShapedArrayDecoratorMetadata>,
-        errors: &ErrorCollector,
-    ) -> Option<SolvedShapedArrayMetadata> {
-        let ShapedArrayDecoratorMetadata {
-            shape_name,
-            range,
-            builtin_indexing,
-        } = metadata?;
-        let tparams = self.get_class_tparams(cls);
-        match tparams.and_then(|tparams| tparams.iter().find(|param| param.name() == shape_name)) {
-            Some(param) if param.is_type_var() => Some(SolvedShapedArrayMetadata::new(
-                param.clone(),
-                *builtin_indexing,
-            )),
-            Some(param) => {
-                self.error(
-                    errors,
-                    *range,
-                    ErrorKind::InvalidAnnotation,
-                    format!(
-                        "Shape parameter `{}` must be a `TypeVar` or `IntVar`, got `{}`",
-                        shape_name, param.kind
-                    ),
-                );
-                None
-            }
-            None => {
-                self.error(
-                    errors,
-                    *range,
-                    ErrorKind::InvalidAnnotation,
-                    format!(
-                        "Shape parameter `{}` is not a type parameter of class `{}`",
-                        shape_name,
-                        cls.name()
-                    ),
-                );
-                None
-            }
-        }
     }
 
     fn check_init_subclass_keywords(
@@ -768,7 +699,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .find_map(|base| self.find_inherited_init_subclass(base, seen))
     }
 
-    fn explicit_slots(&self, cls: &Class) -> ExplicitSlots {
+    fn explicit_slots(
+        &self,
+        cls: &Class,
+        metaclass: Option<&ClassType>,
+        errors: &ErrorCollector,
+    ) -> ExplicitSlots {
         let key = KeyClassField(cls.index(), dunder::SLOTS.clone());
         let Some(idx) = self.bindings().key_to_idx_hashed_opt(Hashed::new(&key)) else {
             return ExplicitSlots::Absent;
@@ -798,10 +734,68 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Expr::StringLiteral(s) => Some(iter::once(Name::new(s.value.to_str())).collect()),
             _ => return ExplicitSlots::Unknown,
         };
-        match names {
-            Some(names) => ExplicitSlots::Known(SlotsInfo { names }),
-            None => ExplicitSlots::Unknown,
+        let Some(names) = names else {
+            return ExplicitSlots::Unknown;
+        };
+        // A metaclass other than `type` or `ABCMeta` may remove names from the namespace before it
+        // creates the class.
+        if cls.module().path().is_interface()
+            || metaclass.is_some_and(|m| !m.class_object().is(KnownClass::AbcMeta))
+        {
+            return ExplicitSlots::Known(SlotsInfo { names });
         }
+        for name in &names {
+            // CPython handles these names separately from ordinary slot descriptors.
+            if matches!(name.as_str(), "__dict__" | "__weakref__" | "__qualname__") {
+                continue;
+            }
+            let key = KeyClassField(cls.index(), name.clone());
+            let Some(idx) = self.bindings().key_to_idx_hashed_opt(Hashed::new(&key)) else {
+                continue;
+            };
+            let field = self.bindings().get::<KeyClassField>(idx);
+            // Only a name defined more than once in the body has an `Anywhere` binding. Report the
+            // first of its definitions that binds a value: a bare annotation neither binds one nor
+            // removes one.
+            let binds_value =
+                |key: Idx<Key>| !matches!(self.bindings().get(key), Binding::AnnotatedType(..));
+            let anywhere = Key::Anywhere(Box::new((name.clone(), field.range)));
+            let conflict_range = match self
+                .bindings()
+                .key_to_idx_hashed_opt(Hashed::new(&anywhere))
+            {
+                Some(idx) => {
+                    let Binding::Phi(_, branches) = self.bindings().get(idx) else {
+                        unreachable!("Anywhere bindings merge definitions with Phi")
+                    };
+                    branches
+                        .iter()
+                        .map(|branch| branch.value_key)
+                        .find(|key| binds_value(*key))
+                        .map(|key| self.bindings().idx_to_key(key).range())
+                }
+                None => match &field.definition {
+                    ClassFieldDefinition::AssignedInBody { .. }
+                    | ClassFieldDefinition::MethodLike { .. }
+                    | ClassFieldDefinition::NestedClass { .. } => Some(field.range),
+                    ClassFieldDefinition::DefinedWithoutAssign { definition, .. } => {
+                        binds_value(*definition).then_some(field.range)
+                    }
+                    ClassFieldDefinition::DeclaredByAnnotation { .. }
+                    | ClassFieldDefinition::DeclaredWithoutAnnotation
+                    | ClassFieldDefinition::DefinedInMethod { .. } => None,
+                },
+            };
+            if let Some(range) = conflict_range {
+                self.error(
+                    errors,
+                    range,
+                    ErrorKind::BadClassDefinition,
+                    format!("`{name}` in `__slots__` conflicts with a class variable"),
+                );
+            }
+        }
+        ExplicitSlots::Known(SlotsInfo { names })
     }
 
     fn initial_protocol_metadata(
@@ -1810,15 +1804,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 match self.untype_opt(ty.clone(), x.range(), &errors) {
                     None => BaseClassParseResult::InvalidType(ty, x.range()),
-                    Some(Type::ShapedArray(array))
-                        if self
-                            .bindings()
-                            .shape_declarations
-                            .commented_bases
-                            .contains_key(&x.range()) =>
-                    {
-                        parse_base_class_type(self.heap.mk_class_type(array.base_class))
-                    }
                     Some(ty) => parse_base_class_type(ty),
                 }
             }

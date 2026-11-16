@@ -17,11 +17,13 @@ use std::sync::Arc;
 use dupe::Dupe;
 use num_traits::ToPrimitive;
 use pyrefly_build::handle::Handle;
+use pyrefly_config::module_names::ModuleNames;
 use pyrefly_python::ast::Ast;
 use pyrefly_python::docstring::Docstring;
 use pyrefly_python::dunder;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePathDetails;
+use pyrefly_util::arc_id::ArcId;
 use pyrefly_util::visit::Visit;
 use regex::RegexBuilder;
 use ruff_python_ast::Alias;
@@ -121,18 +123,27 @@ fn find_preference_glean() -> FindPreference {
     }
 }
 
+/// Each prefix of `module_name`, from its top-level package to the module itself, with the
+/// range of the prefix's last component when the name starts at `position`.
+///
+/// For example, `a.b.c` gives `a`, `a.b` and `a.b.c`. Empty components are kept, so `a..c`
+/// gives `a`, `a.` and `a..c`.
 fn all_modules_with_range(
     module_name: ModuleName,
     position: TextSize,
 ) -> impl Iterator<Item = (String, TextRange)> {
     module_name.components().into_iter().scan(
-        ("".to_owned(), position),
+        (None::<String>, position),
         |(module, start), component| {
             let name = component.as_str();
             let range = TextRange::at(*start, TextSize::try_from(name.len()).unwrap());
-            *module = join_names(module, name);
+            let prefix = match module {
+                Some(parent) => format!("{parent}.{name}"),
+                None => name.to_owned(),
+            };
+            *module = Some(prefix.clone());
             *start = range.end() + TextSize::from(1);
-            Some((module.to_owned(), range))
+            Some((prefix, range))
         },
     )
 }
@@ -179,24 +190,17 @@ fn file_fact(module_info: &ModuleInfo) -> src::File {
 /// report records.
 #[derive(Default)]
 pub struct GleanNaming {
-    /// Module names by repository-relative file path (`--glean-module-names`).
-    module_names: HashMap<String, String>,
-    /// The values of `module_names`.
-    mapped_modules: HashSet<ModuleName>,
+    /// Module names of repository files, from `--module-names`.
+    module_names: Option<ArcId<ModuleNames>>,
     /// Repository-relative directory holding the stdlib sources that Pyrefly's bundled typeshed
     /// stdlib stubs describe (`--glean-stdlib-root`), e.g. `third-party/python/3.12/Lib`.
     stdlib_root: Option<String>,
 }
 
 impl GleanNaming {
-    pub fn new(module_names: HashMap<String, String>, stdlib_root: Option<String>) -> Self {
-        let mapped_modules = module_names
-            .values()
-            .map(|name| ModuleName::from_str(name))
-            .collect();
+    pub fn new(module_names: Option<ArcId<ModuleNames>>, stdlib_root: Option<String>) -> Self {
         Self {
             module_names,
-            mapped_modules,
             stdlib_root,
         }
     }
@@ -204,8 +208,8 @@ impl GleanNaming {
     /// The module name written to Glean for a module that Pyrefly resolves as `resolved`, given
     /// its source file, if it is a source file of the repository:
     /// - the file's entry in `module_names`, if it has one;
-    /// - otherwise, if `resolved` is also the name of a module in `module_names` or of a stdlib
-    ///   module, the name made from the file's path. Pyrefly can name a file that no import root
+    /// - otherwise, if `resolved` is unknown, a mapped name, or a stdlib name, the name made
+    ///   from the file's path. Pyrefly can name a file that no import root
     ///   covers after its file name alone, so a vendored copy `vendor/cpython/Lib/typing.py`
     ///   resolves as `typing`. Its declaration of `typing.Optional` would then match every
     ///   reference to the stdlib's `typing.Optional`, so it is named `vendor.cpython.Lib.typing`
@@ -215,14 +219,18 @@ impl GleanNaming {
         let Some(file) = file else {
             return resolved;
         };
-        if let Some(name) = self.module_names.get(file.key.as_str()) {
-            return ModuleName::from_str(name);
+        let module_names = self.module_names.as_deref();
+        if let Some(name) = module_names.and_then(|names| names.module_of_file(&file.key)) {
+            return name;
+        }
+        if resolved == ModuleName::unknown() {
+            return path_module_name(&file.key);
         }
         let is_stdlib_source = self
             .stdlib_root
             .as_ref()
             .is_some_and(|root| Path::new(&*file.key).starts_with(root));
-        let is_taken = self.mapped_modules.contains(&resolved)
+        let is_taken = module_names.is_some_and(|names| names.contains_module(resolved))
             || typeshed().is_ok_and(|stdlib| stdlib.has_module(resolved));
         if is_taken && !is_stdlib_source {
             path_module_name(&file.key)
@@ -302,7 +310,9 @@ fn stdlib_source_file(root: &str, stub_path: &Path) -> src::File {
     ))
 }
 
-fn gather_nonlocal_variables(body: &[Stmt]) -> (Arc<SmallSet<Name>>, Arc<SmallSet<Name>>) {
+pub(crate) fn gather_nonlocal_variables(
+    body: &[Stmt],
+) -> (Arc<SmallSet<Name>>, Arc<SmallSet<Name>>) {
     let mut globals = SmallSet::new();
     let mut nonlocals = SmallSet::new();
     for stmt in body {
@@ -415,6 +425,9 @@ struct Facts {
     containing_top_level_declarations: Vec<python::ContainingTopLevelDeclaration>,
     xrefs_via_name: Vec<python::XRefViaName>,
     xrefs_via_name_by_target: HashMap<python::Name, Vec<src::ByteSpan>>,
+    /// The spans of this file's references to each target, keyed by the target's
+    /// qualified name and, if it has one, the source file that declares it.
+    target_uses: HashMap<python::Target, Vec<src::ByteSpan>>,
     xrefs: Vec<python_xrefs::XRef>,
     declaration_docstrings: Vec<python::DeclarationDocstring>,
     name_to_sname: Vec<python::NameToSName>,
@@ -476,6 +489,7 @@ impl Facts {
             xrefs_via_name: vec![],
             xrefs: vec![],
             xrefs_via_name_by_target: HashMap::new(),
+            target_uses: HashMap::new(),
             declaration_docstrings: vec![],
             name_to_sname: vec![],
         }
@@ -1000,11 +1014,22 @@ impl GleanState<'_> {
                     let completions = |ty| solver.completions(ty, Some(attr_name), false, false);
                     // The class that defines `attr_name`, as found by the solver's own member
                     // lookup, so that an inherited member is named after its defining class.
-                    let defining_type = |ty: Type| match &ty {
-                        Type::ClassType(cls) | Type::SelfType(cls) => solver
+                    let defining_type = |ty: Type| {
+                        // A literal is an instance of its general class (e.g. `"a"` is a `str`),
+                        // so its members are named after that class.
+                        let cls = match &ty {
+                            Type::ClassType(cls) | Type::SelfType(cls) => cls.clone(),
+                            Type::Literal(lit) => {
+                                lit.value.general_class_type(solver.stdlib).clone()
+                            }
+                            Type::LiteralString(_) => solver.stdlib.str().clone(),
+                            _ => return ty,
+                        };
+                        solver
                             .get_class_member_with_defining_class(cls.class_object(), attr_name)
-                            .map_or(ty.clone(), |member| Type::ClassDef(member.defining_class)),
-                        _ => ty,
+                            .map_or(Type::ClassType(cls), |member| {
+                                Type::ClassDef(member.defining_class)
+                            })
                     };
 
                     let tys = match base_type.clone() {
@@ -1146,12 +1171,12 @@ impl GleanState<'_> {
         include_str_lit_xrefs: bool,
     ) -> Vec<(DefinitionLocation, TextRange)> {
         match expr {
-            Expr::Attribute(attr) if attr.ctx.is_load() => self
+            Expr::Attribute(attr) => self
                 .find_definition_for_expr_attribute(attr)
                 .into_iter()
                 .map(|name| (name, attr.attr.range()))
                 .collect(),
-            Expr::Name(name) if name.ctx.is_load() => self
+            Expr::Name(name) if name.ctx.is_load() || name.ctx.is_del() => self
                 .find_definition_for_expr_name(name, false)
                 .into_iter()
                 .map(|x| (x, name.range()))
@@ -1173,6 +1198,18 @@ impl GleanState<'_> {
     fn add_xref(&mut self, definition_location: DefinitionLocation, range: TextRange) {
         let source = to_span(range);
         let target_name = python::Name::new(definition_location.name);
+        let use_target = match &definition_location.file {
+            Some(file) => python::Target::local(python::DisambiguatedName::new(
+                target_name.clone(),
+                file.clone(),
+            )),
+            None => python::Target::external(target_name.clone()),
+        };
+        self.facts
+            .target_uses
+            .entry(use_target)
+            .or_default()
+            .push(source.clone());
         let target = python_xrefs::XRefDefinitionLocation {
             name: target_name.clone(),
             file: definition_location.file,
@@ -2132,6 +2169,12 @@ pub fn glean(
         })
         .collect();
 
+    let target_uses: Vec<python::TargetUses> = facts
+        .target_uses
+        .into_iter()
+        .map(|(target, spans)| python::TargetUses::new(target, file_fact.clone(), spans))
+        .collect();
+
     let xrefs_by_file = python_xrefs::XRefsByFile::new(file_fact.clone(), facts.xrefs);
 
     let mut entries = vec![
@@ -2151,6 +2194,7 @@ pub fn glean(
         facts.containing_top_level_declarations.glean_entry(),
         xrefs_via_name_by_file_fact.glean_entry(),
         xrefs_via_name_by_target.glean_entry(),
+        target_uses.glean_entry(),
         xrefs_by_file.glean_entry(),
         facts.declaration_docstrings.glean_entry(),
         facts.name_to_sname.glean_entry(),
@@ -2181,6 +2225,29 @@ mod tests {
             ModulePath::filesystem(PathBuf::from(path)),
             Arc::new(String::new()),
         )
+    }
+
+    #[test]
+    fn test_module_prefixes_name_the_parents_of_names_with_empty_components() {
+        let prefixes: Vec<String> =
+            all_modules_with_range(ModuleName::from_str("pkg..config.settings"), TextSize::ZERO)
+                .map(|(prefix, _)| prefix)
+                .collect();
+        assert_eq!(
+            prefixes,
+            ["pkg", "pkg.", "pkg..config", "pkg..config.settings"],
+            "the empty component between the two dots should be kept in every prefix"
+        );
+        for pair in prefixes.windows(2) {
+            assert_eq!(
+                create_sname(&pair[1]).key.parent,
+                Some(create_sname(&pair[0])),
+                "the parent SName of {:?} should be the SName of {:?}, so that \
+                 SNameToName can find the parent's name",
+                pair[1],
+                pair[0],
+            );
+        }
     }
 
     #[test]
@@ -2334,7 +2401,10 @@ mod tests {
     #[test]
     fn test_emitted_module_name() {
         let naming = GleanNaming::new(
-            HashMap::from([("fbcode/base/foo.py".to_owned(), "foo".to_owned())]),
+            Some(ArcId::new(ModuleNames::new(
+                HashMap::from([("fbcode/base/foo.py".to_owned(), "foo".to_owned())]),
+                Path::new(""),
+            ))),
             Some("third-party/python/3.12/Lib".to_owned()),
         );
         let emitted = |path: Option<&str>, resolved: &str| {
@@ -2351,9 +2421,34 @@ mod tests {
             "A file in the module map takes its name from the map"
         );
         assert_eq!(
+            emitted(Some("fbcode/base/foo.py"), "__unknown__"),
+            "foo",
+            "An explicit module mapping takes precedence over an unknown name"
+        );
+        assert_eq!(
             emitted(Some("fbcode/scripts/bar.py"), "bar"),
             "bar",
             "A free name is kept"
+        );
+        assert_eq!(
+            emitted(Some("arvr/vendor/a/__init__.py"), "__unknown__"),
+            "arvr.vendor.a",
+            "An unknown module uses its source path"
+        );
+        assert_eq!(
+            emitted(Some("arvr/vendor/b.py"), "__unknown__"),
+            "arvr.vendor.b",
+            "Unknown modules in different files have different names"
+        );
+        assert_eq!(
+            GleanNaming::default()
+                .emitted_module_name(
+                    Some(&src::File::new("arvr/vendor/b.py".to_owned())),
+                    ModuleName::unknown(),
+                )
+                .to_string(),
+            "arvr.vendor.b",
+            "Unknown modules use their source path without a module map"
         );
         assert_eq!(
             emitted(Some("fbcode/vendor/Lib/typing.py"), "typing"),

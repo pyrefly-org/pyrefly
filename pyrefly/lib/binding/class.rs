@@ -79,6 +79,8 @@ use crate::binding::bindings::CurrentIdx;
 use crate::binding::bindings::InitializedInClass;
 use crate::binding::bindings::LegacyTParamCollector;
 use crate::binding::django::collect_django_queryset_only;
+use crate::binding::expr::Evaluation;
+use crate::binding::expr::StaticUsage;
 use crate::binding::expr::Usage;
 use crate::binding::pydantic::PydanticConfigDict;
 use crate::binding::scope::ClassIndices;
@@ -240,7 +242,7 @@ impl<'a> BindingsBuilder<'a> {
         if x.name.id.is_empty() {
             self.ensure_and_bind_decorators(
                 mem::take(&mut x.decorator_list),
-                &mut Usage::NonPinningValue(None),
+                &mut Usage::Unchecked,
             );
             return;
         }
@@ -263,12 +265,10 @@ impl<'a> BindingsBuilder<'a> {
         let mut pydantic_config_dict = PydanticConfigDict::default();
         let docstring_range = Docstring::range_from_stmts(x.body.as_slice());
         let body = mem::take(&mut x.body);
-        let field_docstrings = self.extract_field_docstrings(&body);
+        let field_docstrings = Self::extract_field_docstrings(&body);
         let pydantic_before_validator_fields = self.extract_field_validator_fields(&body);
         let mut attrs_decorators = AttrsDecoratorMethods::default();
         collect_attrs_decorator_methods(&body, &mut attrs_decorators);
-        let capture_init = self.extract_capture_init(&body);
-        let shaped_array_metadata = self.extract_shaped_array_metadata(&x.decorator_list);
         // This uses the full statement range; see `ShapeDeclarations::enclosing_class`.
         self.shape_declarations
             .push_class(x.range, class_indices.class_idx);
@@ -291,24 +291,6 @@ impl<'a> BindingsBuilder<'a> {
                 self.type_params_with_owner(tp, owner)
             })
             .unwrap_or_default();
-        let shaped_array_metadata = match shaped_array_metadata {
-            Some(metadata) if x.type_params.is_none() => {
-                // TODO(stroxler): This restriction seems 100% fine with experiments, I see no reason
-                // to support legacy-style class tparams right now. We may eventually need to, at which point
-                // we'd have to move this check to solve time.
-                self.error(
-                    metadata.range,
-                    ErrorKind::InvalidAnnotation,
-                    format!(
-                        "Shape parameter `{}` must be a scoped (PEP-695-style) type parameter of class `{}`",
-                        metadata.shape_name, x.name.id
-                    ),
-                );
-                None
-            }
-            metadata => metadata,
-        };
-
         let mut legacy = LegacyTParamCollector::new(x.type_params.is_some());
         let bases = x.bases().map(|base| {
             let mut base = base.clone();
@@ -386,9 +368,7 @@ impl<'a> BindingsBuilder<'a> {
             self.ensure_type_with_usage(
                 &mut base,
                 legacy,
-                &mut Usage::StaticTypeInformation {
-                    is_annotation: false,
-                },
+                &mut Usage::Static(StaticUsage::Value, Evaluation::Eager),
             );
 
             if let Some(comment_range) = base_comment_range {
@@ -451,7 +431,7 @@ impl<'a> BindingsBuilder<'a> {
                     .is_some_and(|name| name.id == "extra_items")
                 {
                     // TypedDict's `extra_items` keyword is a type expression.
-                    self.ensure_type(&mut keyword.value, Some(&mut legacy));
+                    self.ensure_type(&mut keyword.value, Some(&mut legacy), Evaluation::Eager);
                 } else {
                     self.ensure_expr(&mut keyword.value, class_object.usage());
                 }
@@ -545,7 +525,8 @@ impl<'a> BindingsBuilder<'a> {
                         (false, annotation.is_some(), false)
                     }
                     ClassFieldDefinition::DeclaredByAnnotation { .. } => (false, true, true),
-                    ClassFieldDefinition::AssignedInBody { annotation, .. } => {
+                    ClassFieldDefinition::AssignedInBody { annotation, .. }
+                    | ClassFieldDefinition::DefinedWithoutAssign { annotation, .. } => {
                         (true, annotation.is_some(), true)
                     }
                     _ => (true, false, true),
@@ -696,8 +677,6 @@ impl<'a> BindingsBuilder<'a> {
                 pydantic_before_validator_fields: pydantic_before_validator_fields
                     .into_boxed_slice(),
                 django_field_info: Box::new(django_field_info),
-                capture_init: capture_init.map(|v| v.into_boxed_slice()),
-                shaped_array_metadata,
             },
         );
         self.insert_binding_idx(
@@ -715,8 +694,7 @@ impl<'a> BindingsBuilder<'a> {
     }
 
     /// Extracts docstrings for each field, mapping the field's range to the docstring's range.
-    fn extract_field_docstrings(
-        &self,
+    pub fn extract_field_docstrings(
         body: &[ruff_python_ast::Stmt],
     ) -> SmallMap<TextRange, TextRange> {
         use ruff_python_ast::Expr;
@@ -989,7 +967,7 @@ impl<'a> BindingsBuilder<'a> {
                 Expr::Tuple(ExprTuple { elts, .. }) => match elts.as_mut_slice() {
                     [Expr::StringLiteral(k), v] => {
                         if ensure_unmatched {
-                            self.ensure_type(v, None);
+                            self.ensure_type(v, None, Evaluation::Eager);
                         }
                         fields.push((k.value.to_string(), k.range(), Some(v.clone())));
                         None
@@ -1002,7 +980,7 @@ impl<'a> BindingsBuilder<'a> {
                         match value {
                             Some(value) => {
                                 if ensure_unmatched {
-                                    self.ensure_type(v, None);
+                                    self.ensure_type(v, None, Evaluation::Eager);
                                 }
                                 fields.push((value, n.range(), Some(v.clone())));
                                 None
@@ -1039,7 +1017,7 @@ impl<'a> BindingsBuilder<'a> {
     /// source, so anything an unread argument defines — a walrus target, say —
     /// is declared with no binding, and looking it up later panics.
     pub(crate) fn bind_unread_argument(&mut self, x: &mut Expr) {
-        self.ensure_expr(x, &mut Usage::NonPinningValue(None));
+        self.ensure_expr(x, &mut Usage::Unchecked);
     }
 
     /// Like `bind_unread_argument`, for the keyword arguments of a functional
@@ -1207,8 +1185,6 @@ impl<'a> BindingsBuilder<'a> {
                 pydantic_config_dict: PydanticConfigDict::default(),
                 pydantic_before_validator_fields: Box::default(),
                 django_field_info: Box::default(),
-                capture_init: None,
-                shaped_array_metadata: None,
             },
         );
         self.insert_binding_idx(
@@ -1588,7 +1564,7 @@ impl<'a> BindingsBuilder<'a> {
         self.ensure_expr(func, class_object.usage());
         self.ensure_expr(new_type_name, class_object.usage());
         self.check_functional_definition_name(&name.id, new_type_name, ErrorKind::InvalidArgument);
-        self.ensure_type(base, None);
+        self.ensure_type(base, None, Evaluation::Eager);
         self.bind_unread_keywords(keywords);
         self.synthesize_class_def(
             class_name,
@@ -1629,7 +1605,7 @@ impl<'a> BindingsBuilder<'a> {
                         if let Some(key) = &mut item.key {
                             self.ensure_expr(key, class_object.usage());
                         }
-                        self.ensure_type(&mut item.value, None);
+                        self.ensure_type(&mut item.value, None, Evaluation::Eager);
                         match (&item.key, &item.value) {
                             (Some(Expr::StringLiteral(k)), v) => {
                                 Some((k.value.to_string(), k.range(), Some(v.clone()), None))

@@ -245,17 +245,32 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     return converted;
                 }
                 let class_obj = cls.class_object();
-                // BaseModel's built-in hook preserves model validation. Other hooks may accept any input.
+                let metadata = self.get_metadata_for_class(class_obj);
+                // BaseModel's built-in hook preserves model validation. Other hooks, model
+                // validators that replace the raw input, and `from_attributes` may accept any
+                // input.
                 if self
                     .get_non_synthesized_class_member_and_defining_class(
                         class_obj,
                         &GET_PYDANTIC_CORE_SCHEMA,
                     )
                     .is_some_and(|member| !member.defining_class.is(KnownClass::PydanticBaseModel))
+                    || metadata.dataclass_metadata().is_some_and(|dataclass| {
+                        dataclass.pydantic_validator_replaces_all_input()
+                            || dataclass
+                                .init_defaults
+                                .pydantic_validation_flags
+                                .may_validate_from_attributes()
+                    })
                 {
                     return self.heap.mk_any_explicit();
                 }
-                let metadata = self.get_metadata_for_class(class_obj);
+                // Pydantic validates a `NewType` with the schema of its base type.
+                if metadata.is_new_type()
+                    && let Some(base) = self.get_base_types_for_class(class_obj).iter().next()
+                {
+                    return self.expand_type_for_lax_mode(&self.heap.mk_class_type(base.clone()));
+                }
                 if metadata.is_pydantic_model()
                     || metadata.dataclass_metadata().is_some_and(|dataclass| {
                         matches!(

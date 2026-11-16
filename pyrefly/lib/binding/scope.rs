@@ -74,16 +74,17 @@ use crate::binding::bindings::BindingsBuilder;
 use crate::binding::bindings::CurrentIdx;
 use crate::binding::bindings::InitializationStatus;
 use crate::binding::bindings::InitializedInClass;
-use crate::binding::bindings::InitializedInFlow;
 use crate::binding::bindings::UnsetNodeId;
 use crate::binding::bindings::UnsetNodes;
 use crate::binding::classmethod::ClassmethodReceiverState;
+use crate::binding::expr::Evaluation;
 use crate::binding::expr::Usage;
 use crate::binding::function::SelfAssignments;
 use crate::binding::narrow::ExcludedNonePair;
 use crate::binding::narrow::ExcludedNonePairs;
 use crate::binding::narrow::NarrowOps;
 use crate::export::definitions::Definition;
+use crate::export::definitions::DefinitionSites;
 use crate::export::definitions::DefinitionStyle;
 use crate::export::definitions::Definitions;
 use crate::export::definitions::MutableCaptureKind;
@@ -105,7 +106,7 @@ pub enum NameReadInfo {
         idx: Idx<Key>,
         /// The most recent value binding, before any flow narrowing.
         value_idx: Option<Idx<Key>>,
-        initialized: InitializedInFlow,
+        initialized: InitializationStatus,
     },
     /// The name is an anywhere-style lookup. If it came from a non-barrier scope
     /// relative to the current one, this means it is uninitialized; otherwise we
@@ -113,7 +114,7 @@ pub enum NameReadInfo {
     /// below it) and treat the read as initialized.
     Anywhere {
         key: Key,
-        initialized: InitializedInFlow,
+        initialized: InitializationStatus,
         is_module_scope: bool,
         implicit_builtin_module: Option<ModuleName>,
     },
@@ -255,10 +256,8 @@ struct StaticInfo {
     /// Both fit in padding `StaticInfo` already had, so they cost nothing.
     char_len: u32,
     char_mask: u32,
-    /// True while every definition site is a `def` or `class` statement. A conditionally
-    /// defined method or nested class is not reported as a possibly uninitialized class
-    /// attribute.
-    definition_only: bool,
+    /// Whether the definition sites bind a value.
+    sites: DefinitionSites,
 }
 
 #[derive(Clone, Debug)]
@@ -369,7 +368,7 @@ impl StaticStyle {
                     Self::MutableCapture(MutableCapture {
                         kind: *kind,
                         original,
-                        has_value_definition: definition.has_value_definition,
+                        has_value_definition: definition.sites.binds_value(),
                     })
                 }
                 DefinitionStyle::Annotated(.., ann) => {
@@ -461,7 +460,7 @@ impl Static {
         range: TextRange,
         style: StaticStyle,
         last_range: TextRange,
-        definition_only: bool,
+        sites: DefinitionSites,
     ) {
         // Parse recovery produces empty names, such as a nameless type parameter. The
         // static scope never holds them, because `bind_name` never binds them.
@@ -477,7 +476,7 @@ impl Static {
                     last_range,
                     char_len,
                     char_mask,
-                    definition_only,
+                    sites,
                 });
             }
             Entry::Occupied(mut e) => {
@@ -486,7 +485,7 @@ impl Static {
                 if last_range.start() > found.last_range.start() {
                     found.last_range = last_range;
                 }
-                found.definition_only &= definition_only;
+                found.sites = found.sites.merge(sites);
                 if matches!(style, StaticStyle::PossibleLegacyTParam) {
                     // Static scopes are keyed by name, so `foo.T` and `foo.P` must share the
                     // `foo` entry. The caller links their bindings before each upsert, making
@@ -573,7 +572,7 @@ impl Static {
             // same name in this scope.
             let range = definition.range;
             let last_range = definition.last_range;
-            let definition_only = definition.definition_only;
+            let sites = definition.sites;
             let style = StaticStyle::of_definition(
                 name.as_ref(),
                 definition,
@@ -582,7 +581,7 @@ impl Static {
                 module_info.name(),
                 get_annotation_idx,
             );
-            self.upsert(name, range, style, last_range, definition_only);
+            self.upsert(name, range, style, last_range, sites);
         }
         for (module, range, wildcard) in all_wildcards {
             // Builtins are a fallback, so they should never shadow an existing definition.
@@ -598,7 +597,7 @@ impl Static {
                     range,
                     StaticStyle::MergeableImport,
                     range,
-                    false,
+                    DefinitionSites::SomeValue,
                 )
             }
         }
@@ -624,7 +623,7 @@ impl Static {
                 name.range,
                 StaticStyle::SingleDef(None),
                 name.range,
-                false,
+                DefinitionSites::SomeValue,
             )
         };
         Ast::expr_lvalue(x, &mut add);
@@ -734,8 +733,8 @@ fn propagate_new_flow_entries(
 ) {
     for (name, info) in source.iter() {
         if let Some(existing) = target.get(name) {
-            if matches!(existing.initialized(), InitializedInFlow::No)
-                && !matches!(info.initialized(), InitializedInFlow::No)
+            if existing.initialized() == InitializationStatus::Uninitialized
+                && info.initialized() != InitializationStatus::Uninitialized
             {
                 target.insert(name.clone(), info.clone());
             }
@@ -864,18 +863,16 @@ impl FlowInfo {
         self.value.as_mut()
     }
 
-    fn initialized(&self) -> InitializedInFlow {
+    fn initialized(&self) -> InitializationStatus {
         self.value()
-            .map_or(InitializedInFlow::Yes, |v| match &v.style {
-                FlowStyle::MaybeInitialized(nodes) => {
-                    InitializedInFlow::DeferredCheck(nodes.clone())
-                }
+            .map_or(InitializationStatus::Initialized, |v| match &v.style {
+                FlowStyle::MaybeInitialized(nodes) => InitializationStatus::Deferred(nodes.clone()),
                 FlowStyle::Uninitialized
                 | FlowStyle::ClassField {
                     initial_value: None,
-                } => InitializedInFlow::No,
-                FlowStyle::PossiblyUninitialized => InitializedInFlow::Conditionally,
-                _ => InitializedInFlow::Yes,
+                } => InitializationStatus::Uninitialized,
+                FlowStyle::PossiblyUninitialized => InitializationStatus::PossiblyUninitialized,
+                _ => InitializationStatus::Initialized,
             })
     }
 }
@@ -1280,7 +1277,10 @@ impl ReturnAttributeInitialization {
         );
         // List the attributes that only `other` lists, unless being unlisted here already makes
         // them uninitialized.
-        if self.unlisted != InitializationStatus::Uninitialized {
+        if !matches!(
+            self.unlisted,
+            InitializationStatus::PossiblyUninitialized | InitializationStatus::Uninitialized
+        ) {
             for name in other.attributes.keys() {
                 if !self.attributes.contains_key(name) {
                     self.attributes.insert(name.clone(), self.unlisted.clone());
@@ -2961,7 +2961,7 @@ impl Scopes {
             range,
             StaticStyle::ImplicitBuiltinImport(module),
             range,
-            false,
+            DefinitionSites::SomeValue,
         );
         Key::Import(Box::new((name.into_key().clone(), range)))
     }
@@ -3181,7 +3181,7 @@ impl Scopes {
             // `name` is absent from lexical scope, so it may resolve to an implicit builtin.
             match self.look_up_name_for_read(
                 Hashed::new(name),
-                &Usage::NonPinningValue(None),
+                &Usage::Inspection,
                 lookup,
                 current_module,
             ) {
@@ -3208,7 +3208,7 @@ impl Scopes {
             name.range,
             style,
             name.range,
-            false,
+            DefinitionSites::SomeValue,
         )
     }
 
@@ -3237,6 +3237,13 @@ impl Scopes {
     /// intercept the raw runtime value of a pre-PEP-695 legacy type variable
     /// to turn it into a quantified type parameter.
     pub fn add_possible_legacy_tparam_to_current_static(&mut self, name: &Identifier) {
+        // The function or class body cannot see an enclosing class scope, so it must not see
+        // a class-bound name through this entry.
+        if self.iter_rev().nth(1).is_some_and(|parent| {
+            matches!(parent.kind, ScopeKind::Class(_)) && parent.stat.0.contains_key(&name.id)
+        }) {
+            return;
+        }
         self.add_to_current_static(name, StaticStyle::PossibleLegacyTParam)
     }
 
@@ -3323,6 +3330,8 @@ impl Scopes {
         }
     }
 
+    /// Does the module have `from __future__ import annotations`?
+    /// Most callers should use `BindingsBuilder::annotation_evaluation`.
     pub fn has_future_annotations(&self) -> bool {
         // Look up through scopes to find the module scope's flag
         for scope in self.iter_rev() {
@@ -3696,7 +3705,11 @@ impl Scopes {
                         );
                         // List the attributes this flow assigns, unless being unlisted already
                         // makes them uninitialized.
-                        if returns.unlisted != InitializationStatus::Uninitialized {
+                        if !matches!(
+                            returns.unlisted,
+                            InitializationStatus::PossiblyUninitialized
+                                | InitializationStatus::Uninitialized
+                        ) {
                             for name in current.keys() {
                                 if !returns.attributes.contains_key(name) {
                                     returns
@@ -3707,9 +3720,11 @@ impl Scopes {
                         }
                         returns.attributes.retain(|name, status| {
                             let here = match current.get(name) {
-                                None | Some(InitializationStatus::Uninitialized) => {
-                                    (Some(&missing), None)
-                                }
+                                None
+                                | Some(
+                                    InitializationStatus::PossiblyUninitialized
+                                    | InitializationStatus::Uninitialized,
+                                ) => (Some(&missing), None),
                                 here => (here, previous_stmt_expr),
                             };
                             *status = InitializationStatus::merge(
@@ -3905,31 +3920,35 @@ impl Scopes {
                         },
                         _ => ClassFieldDefinition::DefinedWithoutAssign {
                             definition: value.idx,
+                            annotation: static_info.annotation(),
                         },
                     };
                     let initialized = match &value.style {
-                        _ if static_info.definition_only => InitializedInFlow::Yes,
-                        FlowStyle::PossiblyUninitialized => InitializedInFlow::Conditionally,
+                        // A bare annotation is initialized by the methods that assign it, which
+                        // are merged below. If no recognized method assigns it,
+                        // `uninitialized-instance-variable` reports it instead. Any assignment
+                        // to the instance created in `__new__` counts as initializing it.
+                        _ if matches!(
+                            definition,
+                            ClassFieldDefinition::DeclaredByAnnotation {
+                                initialized_in_recognized_method: true,
+                                initialized_on_new_instance: false,
+                                ..
+                            }
+                        ) =>
+                        {
+                            InitializationStatus::Uninitialized
+                        }
+                        _ if static_info.sites == DefinitionSites::OnlyDefOrClass => {
+                            InitializationStatus::Initialized
+                        }
+                        FlowStyle::PossiblyUninitialized => {
+                            InitializationStatus::PossiblyUninitialized
+                        }
                         FlowStyle::MaybeInitialized(nodes) => {
-                            InitializedInFlow::DeferredCheck(nodes.clone())
+                            InitializationStatus::Deferred(nodes.clone())
                         }
-                        _ => InitializedInFlow::Yes,
-                    };
-                    // A bare annotation is initialized by the methods that assign it, which
-                    // are merged below. If no recognized method assigns it,
-                    // `uninitialized-instance-variable` reports it instead. Any assignment
-                    // to the instance created in `__new__` counts as initializing it.
-                    let initialized = if matches!(
-                        definition,
-                        ClassFieldDefinition::DeclaredByAnnotation {
-                            initialized_in_recognized_method: true,
-                            initialized_on_new_instance: false,
-                            ..
-                        }
-                    ) {
-                        InitializationStatus::Uninitialized
-                    } else {
-                        InitializationStatus::from(initialized)
+                        _ => InitializationStatus::Initialized,
                     };
                     field_definitions.insert_hashed(
                         name.owned(),
@@ -4192,25 +4211,6 @@ impl Scopes {
     /// Look up the information needed to create a binding for a read of a name
     /// in the current scope stack.
     ///
-    /// The `usage` parameter determines lookup behavior:
-    /// - For `Usage::StaticTypeInformation`: Skips class-scope overload definitions so that
-    ///   annotations in overload signatures are not accidentally resolved to other overloads.
-    ///   That is, in:
-    ///   ```python
-    ///   class A: ...
-    ///   class B: ...
-    ///       @overload
-    ///       def A(self) -> A: ...
-    ///       @overload
-    ///       def A(self) -> A: ...
-    ///       def A(self): ...
-    ///   ```
-    ///   we want the `A` return annotation in the second overload signature to resolve to class `A`,
-    ///   not the first overload. (Note that this is intentionally divergent from the runtime and
-    ///   different from how name lookup usually works.) In all other cases, if the name of a type
-    ///   is locally shadowed by a non-type definition, we error if it is then used in an annotation.
-    /// - For other usages: Normal lookup behavior.
-    ///
     /// When the name is not found in any lexical scope, this falls back to implicit builtins and
     /// reports `NameReadInfo::ImplicitBuiltin` (the builtin is not materialized here; the caller
     /// decides what to do with it). This is the single name-read entry point: callers match on
@@ -4231,15 +4231,14 @@ impl Scopes {
                  static_barrier,
              }| {
                 let is_class = matches!(scope.kind, ScopeKind::Class(_));
-                // Class body scopes are dynamic, not static, so if we don't find a name in the
-                // current flow we keep looking. In every other kind of scope, anything the Python
-                // compiler has identified as local shadows enclosing scopes, so we should prefer
-                // inner static lookups to outer flow lookups.
-                let static_info = if is_class {
-                    None
-                } else {
-                    scope.stat.0.get_hashed(name)
-                };
+                // Class body scopes are dynamic, not static, so if an eager read doesn't find a
+                // name in the current flow we keep looking. A postponed read happens after the
+                // class body has run, so it sees every name the body binds. In every other kind
+                // of scope, anything the Python compiler has identified as local shadows
+                // enclosing scopes, so we should prefer inner static lookups to outer flow lookups.
+                let static_info = scope.stat.0.get_hashed(name).filter(|static_info| {
+                    !is_class || (usage.is_postponed() && static_info.sites.binds_value())
+                });
 
                 if static_barrier
                 && matches!(scope.kind, ScopeKind::Annotation { class_scope: true })
@@ -4268,36 +4267,23 @@ impl Scopes {
                 }
 
                 let flow_info = scope.flow.get_info_hashed(name);
-                let is_class_overload = is_class
-                    && flow_info.is_some_and(|info| {
-                        info.value().is_some_and(|value| {
-                            matches!(
-                                value.style,
-                                FlowStyle::FunctionDef {
-                                    is_overload: true,
-                                    ..
-                                }
-                            )
-                        })
-                    });
                 if let Some(flow_info) = flow_info
                     && flow_barrier < FlowBarrier::BlockFlow
-                    && !(usage.is_static() && is_class_overload)
                 {
                     let initialized = if flow_barrier == FlowBarrier::AllowFlowUnchecked {
                         // Just assume the name is initialized without checking.
-                        InitializedInFlow::Yes
+                        InitializationStatus::Initialized
                     } else {
                         flow_info.initialized()
                     };
                     // Because class body scopes are dynamic, if we're in a non-stub file
                     // and we know that the name is definitely not initialized, we should skip it.
-                    if is_class && matches!(initialized, InitializedInFlow::No) {
+                    if is_class && initialized == InitializationStatus::Uninitialized {
                         if self.is_interface {
                             return Some(NameReadInfo::Flow {
                                 idx: flow_info.idx(),
                                 value_idx: flow_info.value().map(|value| value.idx),
-                                initialized: InitializedInFlow::Yes,
+                                initialized: InitializationStatus::Initialized,
                             });
                         }
                         return None;
@@ -4327,14 +4313,16 @@ impl Scopes {
                         // flow, it is not initialized. PossibleLegacyTParam scope entries are an
                         // exception because they are synthesized scope entries that don't exist at all
                         // in the runtime; we treat them as always initialized to avoid false positives
-                        // for uninitialized local checks in class bodies.
+                        // for uninitialized local checks in class bodies. A class-scope entry is
+                        // only found by a postponed read, which runs after the class body.
                         initialized: if static_info.implicit_builtin_module().is_some()
+                            || is_class
                             || flow_barrier > FlowBarrier::AllowFlowChecked
                             || matches!(static_info.style, StaticStyle::PossibleLegacyTParam)
                         {
-                            InitializedInFlow::Yes
+                            InitializationStatus::Initialized
                         } else {
-                            InitializedInFlow::No
+                            InitializationStatus::Uninitialized
                         },
                         is_module_scope: matches!(scope.kind, ScopeKind::Module),
                         implicit_builtin_module: static_info.implicit_builtin_module(),
@@ -4380,7 +4368,7 @@ impl Scopes {
                                 last_range: TextRange::default(),
                                 char_len,
                                 char_mask,
-                                definition_only: false,
+                                sites: DefinitionSites::SomeValue,
                             }))
                         })
                     },
@@ -4691,8 +4679,8 @@ impl<'a> BindingsBuilder<'a> {
                 let (before_value, after_value) = (before.value()?, after.value()?);
                 if before_value.idx != after_value.idx
                     || before_value.style != after_value.style
-                    || !matches!(before.initialized(), InitializedInFlow::Yes)
-                    || !matches!(after.initialized(), InitializedInFlow::Yes)
+                    || before.initialized() != InitializationStatus::Initialized
+                    || after.initialized() != InitializationStatus::Initialized
                     || !matches!(
                         self.idx_to_binding(before_value.idx),
                         Some(Binding::FunctionParameter(_) | Binding::NameAssign(_))
@@ -4844,10 +4832,10 @@ impl<'a> BindingsBuilder<'a> {
         let mut branch_idxs = SmallSet::with_capacity(merge_branches.len());
         let mut branch_infos = Vec::with_capacity(merge_branches.len());
         let mut styles = Vec::with_capacity(merge_branches.len());
-        // For each value, the position of its style, and the termination keys of the branches
-        // that carry it, or `None` once one of them has no key.
-        let mut styled_values: SmallMap<Idx<Key>, (usize, Option<Vec<Idx<Key>>>)> =
-            SmallMap::with_capacity(merge_branches.len());
+        // For each distinct value and style, the value, the position of its style, and the
+        // termination keys of the branches that carry it, or `None` once one of them has no key.
+        let mut styled_values: Vec<(Idx<Key>, usize, Option<Vec<Idx<Key>>>)> =
+            Vec::with_capacity(merge_branches.len());
         let n_merge_branches = merge_branches.len();
         let mut n_values = 0;
         let mut n_possibly_set_branches = 0;
@@ -4912,10 +4900,14 @@ impl<'a> BindingsBuilder<'a> {
                     continue;
                 }
                 value_idxs.insert(v.idx);
-                // An invariant in Pyrefly is that we only set style when we
-                // set a value, so duplicate value_idxs always have the same style.
+                // Branches can share a value with different styles, such as a `break` that
+                // assigned it and the fall-through of a loop that may not have run, so a
+                // value is deduplicated only together with its style.
                 if !unset_unless_terminated {
-                    if let Some((_, keys)) = styled_values.get_mut(&v.idx) {
+                    if let Some((_, _, keys)) = styled_values
+                        .iter_mut()
+                        .find(|(idx, position, _)| *idx == v.idx && styles[*position] == v.style)
+                    {
                         *keys =
                             keys.take()
                                 .zip(merge_branch.termination_key)
@@ -4924,13 +4916,11 @@ impl<'a> BindingsBuilder<'a> {
                                     keys
                                 });
                     } else {
-                        styled_values.insert(
+                        styled_values.push((
                             v.idx,
-                            (
-                                styles.len(),
-                                merge_branch.termination_key.map(|key| vec![key]),
-                            ),
-                        );
+                            styles.len(),
+                            merge_branch.termination_key.map(|key| vec![key]),
+                        ));
                         styles.push(v.style);
                     }
                 }
@@ -4942,7 +4932,7 @@ impl<'a> BindingsBuilder<'a> {
         // carry its value, so it continues only if one of their termination keys is not `Never`.
         // Those branches share one node for the merge. When every branch carries the value,
         // reaching the merge is enough, so the paths need no new node.
-        for (position, keys) in styled_values.into_values() {
+        for (_, position, keys) in styled_values {
             if let FlowStyle::MaybeInitialized(nodes) = &mut styles[position]
                 && let Some(keys) = keys
                 && keys.len() < n_merge_branches
@@ -5374,11 +5364,7 @@ impl<'a> BindingsBuilder<'a> {
         self.merge_flow(finished_loop.base, other_exits, range, merge_style);
         // When control falls off the end of a loop (either the `while` test fails or the loop
         // finishes), we're at the loopback flow but the test (if there is one) is negated.
-        self.bind_narrow_ops(
-            &narrow_ops.negate(),
-            NarrowUseLocation::Span(other_range),
-            &Usage::NonPinningValue(None),
-        );
+        self.bind_narrow_ops(&narrow_ops.negate(), NarrowUseLocation::Span(other_range));
         self.stmts(orelse, parent);
         // Exiting from a break skips past any `else`, so we merge them after, and the
         // test is not negated in flows coming from breaks.
@@ -5487,7 +5473,6 @@ impl<'a> BindingsBuilder<'a> {
                 negated_prev_ops,
                 // Generate a range that is distinct from other use_ranges of the same narrow.
                 NarrowUseLocation::End(fork.range),
-                &Usage::NonPinningValue(None),
             );
             if let Some(key) = base_termination_key {
                 self.scopes.current_mut().flow.last_stmt_expr = Some(key);
@@ -5554,6 +5539,15 @@ impl<'a> BindingsBuilder<'a> {
     pub fn next_branch(&mut self) {
         self.finish_branch();
         self.start_branch();
+    }
+
+    /// When annotations in this module are evaluated.
+    pub fn annotation_evaluation(&self) -> Evaluation {
+        if self.scopes.has_future_annotations() || self.sys_info.version().at_least(3, 14) {
+            Evaluation::Postponed
+        } else {
+            Evaluation::Eager
+        }
     }
 }
 

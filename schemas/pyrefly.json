@@ -14,6 +14,11 @@
     "configBase": {
       "type": "object",
       "properties": {
+        "preset": {
+          "description": "Named preset that provides default error severities and behavior settings. Settings that any config sets explicitly override the preset. In a sub-config, replaces the top-level preset for matching files.",
+          "type": "string",
+          "enum": ["off", "basic", "legacy", "default", "strict", "all"]
+        },
         "errors": {
           "description": "Configure the severity for each kind of error that Pyrefly emits. Set error code to true to enable (default severity), false to disable, or use a severity string ('ignore', 'info', 'warn', 'error'). Any valid Pyrefly error code can be used, not just the ones listed here.",
           "type": "object",
@@ -117,15 +122,15 @@
           "description": "Path to a pyrefly.toml or pyproject.toml [tool.pyrefly] configuration to inherit. The current file's explicit settings override inherited settings, and paths in each file are resolved relative to that file.",
           "type": "string"
         },
+        "use-shape-comments-and-stubs": {
+          "description": "Use shape comments and {package}-shape-stubs throughout the project. Native shape annotations are unaffected.",
+          "type": "boolean",
+          "default": true
+        },
         "required-version": {
           "description": "A PEP 440 version specifier that the running version of Pyrefly must satisfy.",
           "type": "string",
           "examples": [">=1.2.0", ">=1.2.0,<2.0.0", "==1.2.0"]
-        },
-        "preset": {
-          "description": "Named preset that provides default error severities and behavior settings. User-specified settings override the preset.",
-          "type": "string",
-          "enum": ["off", "basic", "legacy", "default", "strict", "all"]
         },
         "project-includes": {
           "description": "The glob patterns used to describe which files to type check, typically understood as user-space files. This does not specify import resolution priority.",
@@ -240,6 +245,14 @@
           "type": "boolean",
           "default": true
         },
+        "script-command": {
+          "description": "A command that finds the Python environment of a PEP 723 script. Pyrefly appends the script's path to the command, which prints the environment in the JSON format of `uv workspace metadata --script`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
         "skip-lsp-config-indexing": {
           "description": "Should Pyrefly try to index the project's files? Disabling this may speed up LSP operations on large projects.",
           "type": "boolean",
@@ -271,6 +284,14 @@
           "description": "Let the language server rewrite the baseline file when a saved file stops producing entries recorded for it. Only entries belonging to the saved file are eligible for removal.",
           "type": "boolean",
           "default": false
+        },
+        "only": {
+          "description": "An array of error kinds that restricts which diagnostics Pyrefly processes.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
         },
         "build-system": {
           "description": "Pyrefly supports integrating into build systems to discover targets to type check and their dependencies. Currently supports Buck2 and custom queries.",

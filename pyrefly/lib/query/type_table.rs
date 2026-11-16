@@ -16,6 +16,7 @@ use pyrefly_types::callable::PrefixParam;
 use pyrefly_types::heap::TypeHeap;
 use pyrefly_types::quantified::Quantified;
 use pyrefly_types::quantified::QuantifiedKind;
+use pyrefly_types::quantified::TypeVarLike;
 use pyrefly_types::tuple::Tuple;
 use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_types::type_var::Restriction;
@@ -483,25 +484,8 @@ pub(super) fn type_to_indexed_shape(
         Type::Falsy => indexed_named_leaf(table, "Falsy"),
         Type::Truthy => indexed_named_leaf(table, "Truthy"),
         Type::Var(_) => indexed_named_leaf(table, "typing.Any"),
-        Type::ShapedArray(_) => indexed_named_leaf(table, "Tensor"),
         Type::IntTuple(_) => indexed_named_leaf(table, "IntTuple"),
         Type::NamedInts(_) => indexed_named_leaf(table, "NamedInts"),
-        Type::NNModule(module) => {
-            let args = module
-                .class
-                .targs()
-                .as_slice()
-                .iter()
-                .map(|ty| type_to_indexed_shape(context, ty, table))
-                .collect::<Vec<_>>();
-            insert_indexed_named(
-                table,
-                qname_to_string(module.class.qname()),
-                args,
-                None,
-                Vec::new(),
-            )
-        }
         Type::DataFrame(schema) => type_to_indexed_shape(context, &schema.underlying_type(), table),
         Type::Series(schema) => type_to_indexed_shape(context, &schema.underlying_type(), table),
         Type::Int(_) => indexed_named_leaf(table, "Int"),

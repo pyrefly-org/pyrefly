@@ -720,6 +720,9 @@ pub(crate) struct TransactionData<'a> {
     cinderx_reporter: Option<Box<crate::report::cinderx::CinderxReporter>>,
     /// When set, called per solved module while its answers are still live (before eviction).
     solutions_hook: Option<Box<dyn Fn(&Handle, &Transaction) + Send + Sync + 'a>>,
+    /// For `--report-scip` only: evict each module's answers once the solutions hook has seen
+    /// it, whatever its require level. See `set_evict_answers_after_scip_hook`.
+    evict_answers_after_scip_hook: bool,
 }
 
 impl<'a> TransactionData<'a> {
@@ -870,6 +873,15 @@ impl<'a> Transaction<'a> {
         hook: Option<Box<dyn Fn(&Handle, &Transaction) + Send + Sync + 'a>>,
     ) {
         self.data.solutions_hook = hook;
+    }
+
+    /// For `--report-scip` only. Evict each module's answers once the solutions hook has seen
+    /// it, so the SCIP writer, which needs them at `Require::Everything` while it writes the
+    /// module's document and never again, doesn't keep them for the rest of the run. Answers
+    /// evicted this way are gone for every other consumer of the transaction, so nothing else
+    /// may rely on them, which is why `--report-scip` conflicts with the other reports.
+    pub fn set_evict_answers_after_scip_hook(&mut self, evict: bool) {
+        self.data.evict_answers_after_scip_hook = evict;
     }
 
     /// Take the pysa reporter out of the transaction, consuming ownership.
@@ -1038,6 +1050,15 @@ impl<'a> Transaction<'a> {
 
     pub fn config_finder(&self) -> &ConfigFinder {
         &self.data.state.config_finder
+    }
+
+    /// Run `op` on the state's thread pool. See `State::install`.
+    pub fn install<OP, R>(&self, op: OP) -> R
+    where
+        OP: FnOnce() -> R + Send,
+        R: Send,
+    {
+        self.data.state.install(op)
     }
 
     /// Search through the export table of every module we know about.
@@ -1639,6 +1660,7 @@ impl<'a> Transaction<'a> {
                 infer_return_types: config.infer_return_types(module_data.handle.path()),
                 infer_with_first_use: config.infer_with_first_use(module_data.handle.path()),
                 tensor_shapes,
+                use_shape_comments_and_stubs: config.use_shape_comments_and_stubs(),
                 strict_callable_subtyping: config
                     .strict_callable_subtyping(module_data.handle.path()),
                 strict_partial_subtyping: config
@@ -1758,7 +1780,7 @@ impl<'a> Transaction<'a> {
                 if let Some(hook) = &self.data.solutions_hook {
                     hook(&module_data.handle, self);
                 }
-                if !require.keep_answers() {
+                if !require.keep_answers() || self.data.evict_answers_after_scip_hook {
                     // From now on we can use the solutions directly, so evict the answers.
                     post.evict_answers();
                 }
@@ -2562,6 +2584,12 @@ impl<'a> Transaction<'a> {
         for (handle, module_data) in self.data.updated_modules.iter_unordered() {
             let config2 = self.data.state.get_config(handle);
             if config2 != *module_data.config.read() {
+                // Comment parsing must be refreshed even when import paths are unchanged.
+                if config2.use_shape_comments_and_stubs
+                    != module_data.config.read().use_shape_comments_and_stubs
+                {
+                    module_data.state.set_dirty_deps();
+                }
                 *module_data.config.write() = config2;
                 module_data.state.set_dirty_find();
                 dirty_set.insert(module_data.dupe());
@@ -2571,7 +2599,12 @@ impl<'a> Transaction<'a> {
             if self.data.updated_modules.get(handle).is_none() {
                 let config2 = self.data.state.get_config(handle);
                 if module_data.config != config2 {
+                    let compatibility_changed = config2.use_shape_comments_and_stubs
+                        != module_data.config.use_shape_comments_and_stubs;
                     let module_data = self.get_module(handle);
+                    if compatibility_changed {
+                        module_data.state.set_dirty_deps();
+                    }
                     *module_data.config.write() = config2;
                     module_data.state.set_dirty_find();
                     dirty_set.insert(module_data.dupe());
@@ -2725,6 +2758,7 @@ impl<'a> Transaction<'a> {
                 // This is a one-shot timing/diagnostic dump, so we intentionally do not
                 // store the bit on `module_data` (no later dirty.find() re-check applies).
                 tensor_shapes: self.tensor_shapes_available(&config, &m.handle, None),
+                use_shape_comments_and_stubs: config.use_shape_comments_and_stubs(),
                 strict_callable_subtyping: config.strict_callable_subtyping(m.handle.path()),
                 strict_partial_subtyping: config.strict_partial_subtyping(m.handle.path()),
                 spec_compliant_overloads: config.spec_compliant_overloads(m.handle.path()),
@@ -2929,10 +2963,12 @@ pub(crate) struct TransactionHandle<'a> {
     module_data: &'a ArcId<ModuleDataMut>,
     /// Locally accumulated deps, flushed to `module_data.deps` on drop.
     /// This batches N lock acquisitions per handle lifetime into 1.
-    /// Keyed by ModulePath (cheap to hash — discriminant + interned u64) rather
-    /// than Handle. Each entry keeps the handle that the first lookup of its path
-    /// resolved, so that later lookups of the same module can reuse it.
-    deferred_deps: RefCell<FxHashMap<ModulePath, (Handle, ModuleDeps)>>,
+    /// Keyed by module name and path, which identify the target module within a
+    /// TransactionHandle because sys_info is invariant. Both are needed: one file can
+    /// be imported under several module names, and each name is a distinct module.
+    /// Each entry also remembers the target module, so that repeated lookups of
+    /// the same module skip the transaction's shared module map.
+    deferred_deps: RefCell<FxHashMap<(ModuleName, ModulePath), DeferredDeps<'a>>>,
     /// Cache of cross-module `BindingsMetadata` for class field lookups.
     /// Keyed by `ArcId::id()` (pointer-as-usize) to avoid atomic refcount
     /// operations and to get a cheap 8-byte hash key.
@@ -2942,6 +2978,14 @@ pub(crate) struct TransactionHandle<'a> {
     ///   2. The cache is append-only — entries are never removed or replaced,
     ///      so references into existing entries remain valid.
     metadata_cache: UnsafeCell<FxHashMap<usize, Arc<BindingsMetadata>>>,
+}
+
+/// Dependencies of a `TransactionHandle`'s module on one target module, not yet
+/// flushed to `module_data.deps`.
+struct DeferredDeps<'a> {
+    handle: Handle,
+    module_data: &'a ArcId<ModuleDataMut>,
+    deps: ModuleDeps,
 }
 
 /// Result of looking up a target module's `Answers` for a cross-module
@@ -2980,29 +3024,29 @@ impl<'a> TransactionHandle<'a> {
                 path,
             )
         };
+        // `handle` builds the target's handle on the first lookup of this module.
+        let resolve = move |path: &ModulePath, handle: &dyn Fn() -> Handle| {
+            let mut deferred_deps = self.deferred_deps.borrow_mut();
+            let deferred = deferred_deps
+                .entry((module, path.dupe()))
+                .or_insert_with(|| {
+                    let handle = handle();
+                    let module_data = self.transaction.get_imported_module(&handle);
+                    DeferredDeps {
+                        handle,
+                        module_data,
+                        deps: ModuleDeps::default(),
+                    }
+                });
+            deferred.deps.add_dep(dep);
+            deferred.module_data
+        };
         match path {
             // Explicit path — already resolved. Bypass imports entirely. Most lookups take this
-            // path, so it resolves directly rather than through a `FindingOrError`, and reuses the
-            // handle kept in `deferred_deps` rather than deciding it again.
-            Some(path) => {
-                let mut deferred_deps = self.deferred_deps.borrow_mut();
-                let (handle, deps) = deferred_deps.entry(path.dupe()).or_insert_with(|| {
-                    (
-                        imported_handle(&self.module_data.config.read(), path.dupe()),
-                        ModuleDeps::default(),
-                    )
-                });
-                deps.add_dep(dep);
-                // One file found through two search roots is two modules, so reuse the handle only
-                // for the same module name.
-                let handle = if handle.module() == module {
-                    handle.dupe()
-                } else {
-                    imported_handle(&self.module_data.config.read(), path.dupe())
-                };
-                drop(deferred_deps);
-                FindingOrError::new_finding(self.transaction.get_imported_module(&handle))
-            }
+            // path, so it resolves directly rather than through a `FindingOrError`.
+            Some(path) => FindingOrError::new_finding(resolve(path, &|| {
+                imported_handle(&self.module_data.config.read(), path.dupe())
+            })),
             None => {
                 // No path — needs find_import. Check imports cache first.
                 let imports_read = self.module_data.imports.read();
@@ -3035,17 +3079,7 @@ impl<'a> TransactionHandle<'a> {
                         finding
                     }
                 };
-                let resolve = move |handle: Handle| {
-                    let res = self.transaction.get_imported_module(&handle);
-                    self.deferred_deps
-                        .borrow_mut()
-                        .entry(handle.path().dupe())
-                        .or_insert_with(|| (handle, ModuleDeps::default()))
-                        .1
-                        .add_dep(dep);
-                    res
-                };
-                handle.map(resolve)
+                handle.map(|handle| resolve(handle.path(), &|| handle.dupe()))
             }
         }
     }
@@ -3146,14 +3180,21 @@ impl Drop for TransactionHandle<'_> {
         let mut deps_lock = self.module_data.deps.write();
         // Detach from the frozen snapshot on first write, if still shared.
         let deps = Arc::make_mut(&mut deps_lock);
-        for (_path, (target_handle, new_deps)) in deferred {
-            match deps.entry(target_handle.dupe()) {
+        for (
+            _,
+            DeferredDeps {
+                handle: target_handle,
+                module_data: target,
+                deps: new_deps,
+            },
+        ) in deferred
+        {
+            match deps.entry(target_handle) {
                 Entry::Occupied(mut e) => {
                     e.get_mut().merge(new_deps);
                 }
                 Entry::Vacant(e) => {
                     e.insert(new_deps);
-                    let target = self.transaction.get_module(&target_handle);
                     let mut rdeps = target.rdeps.lock();
                     let inserted = Arc::make_mut(&mut rdeps).insert(self.module_data.handle.dupe());
                     assert!(inserted);
@@ -3851,6 +3892,7 @@ impl State {
                 pysa_reporter: None,
                 cinderx_reporter: None,
                 solutions_hook: None,
+                evict_answers_after_scip_hook: false,
             },
         }
     }
@@ -3955,6 +3997,7 @@ impl State {
                             pysa_reporter: _,
                             cinderx_reporter: _,
                             solutions_hook: _,
+                            evict_answers_after_scip_hook: _,
                         },
                 },
             committing_transaction_guard,

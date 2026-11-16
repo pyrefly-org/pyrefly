@@ -55,7 +55,6 @@ use crate::config::finder::ConfigFinder;
 use crate::error::error::Error;
 use crate::error::error::print_errors;
 use crate::lsp::non_wasm::module_helpers::handle_from_module_path;
-use crate::lsp::non_wasm::server::resolve_export_location;
 use crate::lsp::wasm::hover::get_hover;
 use crate::module::bundled::BundledStub;
 use crate::module::bundled::set_readonly;
@@ -71,8 +70,57 @@ use crate::state::require::RequireLevels;
 use crate::state::state::State;
 use crate::state::state::Transaction;
 use crate::test::util::TestEnv;
+use crate::tsp::type_conversion::resolve_export_location;
 use crate::types::class::Class;
 use crate::types::types::Type;
+
+#[test]
+fn test_use_shape_comments_and_stubs_config_reload() {
+    let root = TempDir::new().unwrap();
+    let config_path = root.path().join(ConfigFile::PYREFLY_FILE_NAME);
+    let source_path = root.path().join("main.py");
+    fs::write(&config_path, "skip-interpreter-query = true\n").unwrap();
+    fs::write(
+        &source_path,
+        "# enable-shape-type-comments\nx: int = 0  # shaped: [3\nbad: str = 1\n",
+    )
+    .unwrap();
+    let state = State::new(default_config_finder(None), TEST_THREAD_COUNT);
+    let handle = Handle::new(
+        ModuleName::from_str("main"),
+        ModulePath::filesystem(source_path),
+        SysInfo::default(),
+    );
+
+    for setting in [None, Some(false), Some(true)] {
+        if let Some(enabled) = setting {
+            fs::write(
+                &config_path,
+                format!(
+                    "skip-interpreter-query = true\nuse-shape-comments-and-stubs = {enabled}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let mut transaction = state.new_committable_transaction(Require::Everything, None);
+        if setting.is_some() {
+            transaction.as_mut().invalidate_config();
+        }
+        transaction
+            .as_mut()
+            .run(&[handle.dupe()], Require::Everything, None);
+        let errors = transaction
+            .as_mut()
+            .get_errors([&handle])
+            .collect_display_errors();
+        assert_eq!(
+            errors.len(),
+            if setting == Some(false) { 1 } else { 2 },
+            "only comment diagnostics should follow the compatibility setting: {errors:?}"
+        );
+        state.commit_transaction(transaction, None);
+    }
+}
 
 #[test]
 fn test_fallback_search_path_relative_import_emits_dedicated_diagnostic() {
@@ -592,7 +640,6 @@ fn test_tensor_shapes_availability_uses_origin_sensitive_resolution() {
         r#"
 from typing import Any
 
-shaped_array: Any
 class IntTuple:
     def __class_getitem__(cls, params: Any) -> Any: ...
 "#,
@@ -791,7 +838,6 @@ def f(x: Tensor[[2, 3]]) -> None:
         r#"
 from typing import Any
 
-shaped_array: Any
 class IntTuple:
     def __class_getitem__(cls, params: Any) -> Any: ...
 "#,
@@ -921,7 +967,6 @@ class Float[*Shape]: ...
                 r#"
 from typing import Any
 
-shaped_array: Any
 class IntTuple:
     def __class_getitem__(cls, params: Any) -> Any: ...
 "#
@@ -995,7 +1040,6 @@ fn test_tensor_shapes_find_invalidation_drops_shapes_on_removal() {
         r#"
 from typing import Any
 
-shaped_array: Any
 class IntTuple:
     def __class_getitem__(cls, params: Any) -> Any: ...
 "#,
@@ -2218,6 +2262,62 @@ fn test_environment_outside_any_config() {
     );
     assert_eq!(dep.importer_site_package_path(), None);
     assert_eq!(app_dep.path(), dep.path());
+}
+
+/// A PEP 723 script has its own environment, which `script-command` gives it through a config for
+/// the script file alone, while every other file has the project config. A library found through
+/// the script's site-package path is checked in the script's environment, so it resolves `dep` to
+/// the same module as the script.
+#[test]
+fn test_library_in_script_environment() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    for env in ["project_env", "script_env"] {
+        fs::create_dir_all(root.join(env)).unwrap();
+        fs::write(root.join(env).join("dep.py"), "class C: ...\n").unwrap();
+    }
+    fs::write(
+        root.join("script_env").join("mylib.py"),
+        "import dep\ndef f(x: dep.C) -> None: ...\n",
+    )
+    .unwrap();
+    let script = ModulePath::filesystem(root.join("script.py"));
+    fs::write(
+        script.as_path(),
+        "import dep\nimport mylib\nmylib.f(dep.C())\n",
+    )
+    .unwrap();
+    let config = |env: &str| {
+        let mut config = ConfigFile {
+            source: ConfigSource::File(root.join(ConfigFile::PYREFLY_FILE_NAME)),
+            ..Default::default()
+        };
+        config.python_environment.site_package_path = Some(vec![root.join(env)]);
+        config.python_environment.set_empty_to_default();
+        config.interpreters.skip_interpreter_query = true;
+        config.configure();
+        ArcId::new(config)
+    };
+    let (project_config, script_config) = (config("project_env"), config("script_env"));
+    let script2 = script.dupe();
+    let state = State::new(
+        ConfigFinder::new_lookup(
+            Arc::new(move |_| project_config.dupe()),
+            Box::new(move |config, path| {
+                if *path == script2 {
+                    script_config.dupe()
+                } else {
+                    config
+                }
+            }),
+        ),
+        TEST_THREAD_COUNT,
+    );
+    let handle = handle_from_module_path(&state, script);
+    let mut transaction = state.new_transaction(Require::Exports, None);
+    transaction.run(&[handle.dupe()], Require::Everything, None);
+    let errors = transaction.get_errors([&handle]).collect_display_errors();
+    assert!(errors.is_empty(), "expected no errors, got {errors:?}");
 }
 
 /// With the library file open and edited, find references reads the library file from the editor

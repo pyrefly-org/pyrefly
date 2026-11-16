@@ -539,6 +539,20 @@ def f(x: C.X):
     "#,
 );
 
+testcase!(
+    test_generic_legacy_type_alias_inside_class,
+    r#"
+from typing import TypeAlias, TypeVar, assert_type
+T = TypeVar("T")
+class C:
+    L = list[T]
+    M: TypeAlias = "dict[str, T]"
+def f(l: C.L[int], m: C.M[int]):
+    assert_type(l, list[int])
+    assert_type(m, dict[str, int])
+    "#,
+);
+
 // Note: this test documents how Pyre currently treats type aliases inside classes
 // when the try to "close" over class type parameters. It is not 100% clear what
 // the behavior should be. But we disagree with Pyright, which disallows the use of
@@ -1276,6 +1290,74 @@ def bad_type_aliases(
 );
 
 testcase!(
+    test_bad_implicit_type_alias_in_alias_value,
+    r#"
+from typing import TypeAlias, TypeAliasType
+BadTypeAlias = int if 1 < 3 else str
+A: TypeAlias = BadTypeAlias  # E: `BadTypeAlias` is not a valid type alias: If expression cannot be used in annotations
+type B = list[BadTypeAlias]  # E: `BadTypeAlias` is not a valid type alias: If expression cannot be used in annotations
+C = TypeAliasType("C", BadTypeAlias)  # E: `BadTypeAlias` is not a valid type alias: If expression cannot be used in annotations
+
+class Outer:
+    Inner = int
+BadOuter = Outer if 1 < 3 else Outer
+D: TypeAlias = BadOuter.Inner
+"#,
+);
+
+testcase!(
+    test_bad_implicit_type_alias_in_type_parameters,
+    r#"
+from typing import Callable
+
+Bad = int if True else str
+
+class Bound[T: Bad]: ...  # E: `Bad` is not a valid type alias
+def constrained[T: (Bad, bytes)](x: T) -> T: return x  # E: `Bad` is not a valid type alias
+type Default[T = Bad] = list[T]  # E: `Bad` is not a valid type alias
+type NestedBound[T: list[Bad]] = T  # E: `Bad` is not a valid type alias
+type ForwardBound[T: "Bad"] = T  # E: `Bad` is not a valid type alias
+type ParamSpecDefault[**P = [Bad]] = Callable[P, None]  # E: `Bad` is not a valid type alias
+type TupleDefault[*Ts = *tuple[Bad, ...]] = tuple[*Ts]  # E: `Bad` is not a valid type alias
+"#,
+);
+
+testcase!(
+    test_static_type_and_value_positions,
+    r#"
+from typing import Annotated, Callable, Literal
+from typing_extensions import TypeForm
+
+Bad = int if True else str
+class Base[T]: ...
+DynamicBase = Base if True else Base
+class Derived(DynamicBase[list[Bad]]): ...  # E: `Bad` is not a valid type alias
+
+list[Bad]([])  # E: `Bad` is not a valid type alias
+Annotated[Bad, Bad]  # E: `Bad` is not a valid type alias
+Callable[[Bad], None]  # E: `Bad` is not a valid type alias
+form: TypeForm = "Bad"  # E: `Bad` is not a valid type alias
+
+class Namespace:
+    Inner = int
+DynamicNamespace = Namespace if True else Namespace
+type Alias = DynamicNamespace.Inner
+
+def values(x: Annotated[int, Bad], y: Literal["Bad"]) -> None: ...
+"#,
+);
+
+testcase!(
+    test_static_generic_type_arguments,
+    r#"
+from __future__ import annotations
+Bad = int if True else str
+class Base[T]: ...
+Base[Bad]  # E: `Bad` is not a valid type alias
+"#,
+);
+
+testcase!(
     test_implicit_alias_exempt_class_constructors,
     r#"
 from typing import NamedTuple
@@ -1521,6 +1603,23 @@ testcase!(
 from typing import TypeAlias
 X: TypeAlias = int | str
 X()  # E: Expected a callable
+    "#,
+);
+
+testcase!(
+    test_class_type_alias_is_not_instance_variable,
+    TestEnv::new().enable_instance_var_assign_error(),
+    r#"
+from typing import TypeAlias
+
+class Base:
+    Alias: TypeAlias = int
+
+class Child(Base):
+    pass
+
+Base.Alias = Base.Alias
+Child.Alias = Child.Alias
     "#,
 );
 

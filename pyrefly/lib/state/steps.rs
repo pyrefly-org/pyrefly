@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 use dupe::Dupe;
+use dupe::OptionDupedExt;
 use enum_iterator::Sequence;
 use parse_display::Display;
 use paste::paste;
@@ -65,6 +66,7 @@ pub struct Context<'a, Lookup> {
     pub infer_return_types: InferReturnTypes,
     pub infer_with_first_use: bool,
     pub tensor_shapes: bool,
+    pub use_shape_comments_and_stubs: bool,
     pub strict_callable_subtyping: bool,
     pub strict_partial_subtyping: bool,
     pub spec_compliant_overloads: bool,
@@ -89,7 +91,8 @@ pub struct ParsedModule {
     module: Arc<ModModule>,
     tokens: Option<Arc<Tokens>>,
     errors: ModuleDiagnostics,
-    module_ranges: Arc<ModuleRanges>,
+    /// Present exactly when the module's diagnostics are computed.
+    module_ranges: Option<Arc<ModuleRanges>>,
 }
 
 impl ParsedModule {
@@ -97,7 +100,7 @@ impl ParsedModule {
         module: ModModule,
         tokens: Option<Tokens>,
         errors: ModuleDiagnostics,
-        module_ranges: Arc<ModuleRanges>,
+        module_ranges: Option<Arc<ModuleRanges>>,
     ) -> Self {
         Self {
             module: Arc::new(module),
@@ -119,8 +122,8 @@ impl ParsedModule {
         &self.errors
     }
 
-    pub fn module_ranges(&self) -> &Arc<ModuleRanges> {
-        &self.module_ranges
+    pub fn module_ranges(&self) -> Option<&Arc<ModuleRanges>> {
+        self.module_ranges.as_ref()
     }
 }
 
@@ -520,8 +523,13 @@ impl Step {
             ctx.require.keep_ast(),
         );
         load.module_info.initialize_ignore(ignore);
-        let module_ranges = Arc::new(ModuleRanges::compute(&module, &load.module_info));
-        errors.add_misplaced_ignores(&module_ranges.misplaced_ignore_all);
+        // The ranges serve only to collate the module's diagnostics, so a module whose
+        // diagnostics are not computed, such as a dependency, skips the work.
+        let module_ranges = (load.error_style != ErrorStyle::Never).then(|| {
+            let module_ranges = ModuleRanges::compute(&module, &load.module_info);
+            errors.add_misplaced_ignores(&module_ranges.misplaced_ignore_all);
+            Arc::new(module_ranges)
+        });
         Arc::new(ParsedModule::new(
             module,
             tokens,
@@ -569,7 +577,7 @@ impl Step {
             Arc::unwrap_or_clone(parsed_ast.module()),
             load.module_info.dupe(),
             parsed_ast.errors().dupe(),
-            parsed_ast.module_ranges().dupe(),
+            parsed_ast.module_ranges().duped(),
             &exports,
             &solver,
             ctx.lookup,
@@ -581,6 +589,7 @@ impl Step {
             ctx.infer_return_types,
             ctx.treat_all_caps_as_final,
             ctx.infer_param_types_from_docstring,
+            ctx.use_shape_comments_and_stubs,
         );
         Arc::new(Answers::new(
             bindings,

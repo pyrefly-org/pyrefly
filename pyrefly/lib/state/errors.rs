@@ -28,6 +28,7 @@ use pyrefly_python::module::Module;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_util::arc_id::ArcId;
 use pyrefly_util::lined_buffer::LineNumber;
+use pyrefly_util::thread_pool::in_thread_pool;
 use pyrefly_util::visit::Visit;
 use rayon::prelude::*;
 use ruff_python_ast::Expr;
@@ -385,10 +386,12 @@ impl Errors {
     /// Apply `f` to each module, in `loads` order. Every diagnostic is stored on the
     /// module that contains its primary location, so each module's diagnostics are
     /// collated on their own, and the results never need deduplicating across modules.
-    /// That lets large collections run in parallel, on the ambient rayon thread pool
-    /// rather than on the state's pool, which a concurrent recheck may be occupying.
+    /// That lets large collections run in parallel, on the thread pool of the calling thread,
+    /// such as the state's pool once a CLI check has finished with it. Called from outside a
+    /// pool, as the language server does because a recheck may be occupying the state's pool,
+    /// the work stays on the calling thread.
     fn map_modules<'a, R: Send>(&'a self, f: impl Fn(&'a LoadErrors) -> R + Sync + Send) -> Vec<R> {
-        if self.loads.len() < PARALLEL_COLLATION_MIN_MODULES {
+        if self.loads.len() < PARALLEL_COLLATION_MIN_MODULES || !in_thread_pool() {
             self.loads.iter().map(f).collect()
         } else {
             self.loads.par_iter().map(f).collect()
@@ -418,7 +421,7 @@ impl Errors {
                 let module_unused = Self::collect_unused_ignore_errors_for_module(
                     &load.module_info,
                     module_ranges.as_deref(),
-                    config.enabled_ignores(path).as_ref(),
+                    &config.enabled_ignores(path),
                     config.type_ignore_unknown_tag_behavior(path),
                     module_errors
                         .suppressed
@@ -608,7 +611,17 @@ impl Errors {
             // An unreadable or invalid baseline suppresses nothing; the language server
             // surfaces every diagnostic rather than failing the request.
             if let Some(processor) = processor {
+                let start = baselined.len();
                 processor.process_errors(&mut group, &mut baselined);
+                // `baseline-error-level` caps a match here, where this config is already
+                // in hand. An unset level leaves the severity alone and asks the IDE to
+                // draw the open-file match as a hint.
+                for error in &mut baselined[start..] {
+                    *error = match config.baseline_error_level {
+                        Some(level) => error.with_severity(error.severity().min(level)),
+                        None => error.with_unconfigured_baseline_hint(),
+                    };
+                }
             }
             normal.extend(group);
         }
@@ -741,7 +754,7 @@ impl Errors {
             Self::collect_unused_ignore_errors_for_module(
                 &load.module_info,
                 module_ranges.as_deref(),
-                config.enabled_ignores(path).as_ref(),
+                &config.enabled_ignores(path),
                 config.type_ignore_unknown_tag_behavior(path),
                 affected,
             )
@@ -1176,7 +1189,8 @@ def f() -> int:
         let handles = names.iter().map(|name| handle(name)).collect::<Vec<_>>();
         let transaction = state.transaction();
         let errors = transaction.get_errors(&handles);
-        let collected = errors.collect_errors();
+        // Collation runs in parallel only on a thread pool.
+        let collected = state.install(|| errors.collect_errors());
         let modules = collected
             .ordinary
             .iter()
@@ -1189,7 +1203,7 @@ def f() -> int:
                 .iter()
                 .all(|error| error.error_kind() == ErrorKind::BadAssignment)
         );
-        let unused = errors.collect_unused_ignore_errors(&collected);
+        let unused = state.install(|| errors.collect_unused_ignore_errors(&collected));
         let modules = unused
             .iter()
             .map(|error| error.module().name().to_string())

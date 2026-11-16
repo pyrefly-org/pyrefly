@@ -19,8 +19,12 @@ classifiers = [
 ]
 dependencies = [
   "pyrefly-shape-extensions==0.0.0",
-  "pyrefly-torch-stubs==0.0.0",
 ]
+
+[project.optional-dependencies]
+torch = ["pyrefly-torch-stubs==0.0.0"]
+jax = ["jax-pyrefly-stubs==0.0.0"]
+numpy = ["pyrefly-numpy-stubs==0.0.0"]
 
 [project.urls]
 homepage = "https://pyrefly.org"
@@ -28,6 +32,9 @@ documentation = "https://pyrefly.org/en/docs/"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["einops-stubs"]
+
+[tool.hatch.build.targets.wheel.sources]
+"einops-stubs" = "einops-shape-stubs"
 
 [tool.hatch.build.targets.sdist]
 include = ["einops-stubs/", "README.md", "LICENSE"]

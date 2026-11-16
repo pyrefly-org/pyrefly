@@ -26,6 +26,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use dupe::Dupe;
+use dupe::OptionDupedExt;
 use pyrefly_graph::index::Idx;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
@@ -849,8 +850,9 @@ pub struct Solutions {
     solve_errors: ModuleDiagnostics,
     data: Arc<SolutionsData>,
     metadata: Arc<BindingsMetadata>,
-    /// Multi-line ranges and ignore-all directives.
-    module_ranges: Arc<ModuleRanges>,
+    /// Multi-line ranges and ignore-all directives, present exactly when the module's
+    /// diagnostics are computed.
+    module_ranges: Option<Arc<ModuleRanges>>,
     index: Option<Arc<Mutex<Index>>>,
     /// Per-module pysa data, populated when pysa reporting is enabled.
     pysa_solutions: Option<Arc<PysaSolutions>>,
@@ -958,8 +960,8 @@ impl Solutions {
         &self.solve_errors
     }
 
-    pub fn module_ranges(&self) -> &Arc<ModuleRanges> {
-        &self.module_ranges
+    pub fn module_ranges(&self) -> Option<&Arc<ModuleRanges>> {
+        self.module_ranges.as_ref()
     }
 
     /// Access per-module pysa data, if pysa reporting was enabled.
@@ -1582,7 +1584,7 @@ impl Answers {
             solve_errors: self.errors.take(),
             data: self.solutions.dupe(),
             metadata: bindings.metadata().dupe(),
-            module_ranges: bindings.module_ranges().dupe(),
+            module_ranges: bindings.module_ranges().duped(),
             index: self.index.dupe(),
             pysa_solutions,
             cinderx_solutions,
@@ -1967,7 +1969,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     pub fn record_property_getter(&self, loc: TextRange, getter_ty: &Type) {
-        if self.current().trace.is_some() {
+        if self.current().trace.is_some() && !loc.is_empty() {
             self.trace_state()
                 .record_property_getter_trace(loc, Arc::new(getter_ty.clone()));
         }
@@ -1983,7 +1985,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
@@ -2097,7 +2098,7 @@ mod tests {
         assert!(results.iter().all(|(answer, _)| *answer == winner));
         let kept = destination
             .collect(&ErrorConfig::new(
-                Cow::Owned(ErrorDisplayConfig::default()),
+                Arc::new(ErrorDisplayConfig::default()),
                 false,
                 Tool::default_enabled(),
                 TypeIgnoreUnknownTagBehavior::NoEffect,

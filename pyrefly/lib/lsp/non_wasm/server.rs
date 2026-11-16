@@ -262,7 +262,7 @@ use pyrefly_util::telemetry::TelemetryServerState;
 use pyrefly_util::thread_pool::ThreadCount;
 use pyrefly_util::thread_pool::ThreadPool;
 use pyrefly_util::watch_pattern::WatchPattern;
-use ruff_python_ast::name::Name;
+use ruff_source_file::OneIndexed;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
@@ -289,6 +289,7 @@ use crate::config::config::ConfigScope;
 use crate::error::baseline::BaselineWrite;
 use crate::error::baseline::StaleRowScope;
 use crate::error::baseline::write_baseline_file;
+use crate::error::collector::CollectedDiagnostic;
 use crate::error::error::Error;
 use crate::lsp::module_helpers::to_real_path;
 use crate::lsp::non_wasm::build_system::should_requery_build_system;
@@ -369,6 +370,7 @@ use crate::lsp::wasm::provide_type::ProvideTypeResponse;
 use crate::lsp::wasm::provide_type::provide_type;
 use crate::module::bundled::BundledStub;
 use crate::state::errors::BaselineApplyResult;
+use crate::state::ide::prepare_import_insertion_in_range;
 use crate::state::load::Load;
 use crate::state::load::LspFile;
 use crate::state::lsp::FindDefinitionItemWithDocstring;
@@ -387,8 +389,7 @@ use crate::state::subscriber::CompositeSubscriber;
 use crate::state::subscriber::PublishDiagnosticsSubscriber;
 use crate::state::subscriber::Subscriber;
 use crate::state::transaction_manager::TransactionManager;
-use crate::tsp::type_conversion::StdlibClasses;
-use crate::tsp::type_conversion::convert_type_with_resolvers;
+use crate::tsp::convert_type_in_transaction;
 use crate::tsp::type_facts::TypeFact;
 use crate::tsp::type_facts::TypeFactsQuery;
 use crate::tsp::type_facts::type_fact;
@@ -3314,6 +3315,23 @@ impl Server {
             .collect()
     }
 
+    /// Draw a baseline match in an open file as an LSP hint if its severity is a hint
+    /// or its `baseline-error-level` is unset.
+    ///
+    /// `to_diagnostic_with_severity` shows an untagged hint as information, so the
+    /// hint is assigned here.
+    fn show_baseline_hint(
+        e: CollectedDiagnostic,
+        open_files: &HashMap<PathBuf, OpenFile>,
+        diag: &mut Diagnostic,
+    ) {
+        if (e.unconfigured_baseline_hint() || e.severity() == Severity::Hint)
+            && to_real_path(e.error().path()).is_some_and(|open| open_files.contains_key(&open))
+        {
+            diag.severity = Some(DiagnosticSeverity::Hint);
+        }
+    }
+
     fn get_diag_if_shown(
         &self,
         e: &Error,
@@ -3558,13 +3576,10 @@ impl Server {
             }
         }
         for e in baseline_errors {
-            // Errors in open files that match a baseline file are downgraded to HINT.
             if let Some((path, mut diag)) =
                 self.get_diag_if_shown(e.error(), e.severity(), &open_files, None)
             {
-                if to_real_path(e.error().path()).is_some_and(|p| open_files.contains_key(&p)) {
-                    diag.severity = Some(DiagnosticSeverity::Hint);
-                }
+                Self::show_baseline_hint(e, &open_files, &mut diag);
                 diags.entry(path.to_owned()).or_default().push(diag);
             }
         }
@@ -5305,38 +5320,56 @@ impl Server {
                     // into a single workspace edit
                     // so the whole fix applies in one action.
                     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
-                    for (info, range, insert_text) in edits {
+                    for (info, range, mut insert_text) in edits {
                         let lsp_location = self.to_lsp_location(&TextRangeWithModule {
                             module: info.clone(),
                             range,
                         })?;
                         let mut edit_uri = lsp_location.uri;
                         let mut edit_range = lsp_location.range;
-                        // Import insertions in notebooks go into the active cell.
-                        // Replacements must retain their target cell and range.
+                        // Whole import insertions go into the active notebook cell.
+                        // Merge suffixes and other edits retain their original target.
                         if range.is_empty()
+                            && (insert_text.trim_start().starts_with("from ")
+                                || insert_text.trim_start().starts_with("import "))
                             && let Some(current_cell_idx) = triggered_cell_index
                         {
                             let edit_cell_idx = info.to_cell_for_lsp(range.start());
                             if edit_cell_idx != Some(current_cell_idx) {
-                                // Redirect to the current cell, inserting at line 0.
+                                // Plan the import after the destination cell's own header.
                                 let notebook_path =
                                     self.open_notebook_cells.read().get(uri).cloned();
-                                let cell_url = notebook_path
+                                let target_cell = notebook_path
                                     .and_then(|path| self.open_files.get(&path))
                                     .and_then(|file| match &*file {
                                         LspFile::Notebook(notebook) => {
-                                            notebook.get_code_cell_url(current_cell_idx).cloned()
+                                            let cell_url =
+                                                notebook.get_code_cell_url(current_cell_idx)?;
+                                            let cell_range = notebook.ruff_notebook().cell_range(
+                                                OneIndexed::from_zero_indexed(current_cell_idx),
+                                            )?;
+                                            // Exclude Ruff's synthetic newline after the cell.
+                                            let cell_range = TextRange::new(
+                                                cell_range.start(),
+                                                cell_range.end() - TextSize::new(1),
+                                            );
+                                            Some((cell_url.clone(), cell_range))
                                         }
                                         _ => None,
                                     });
-                                if let Some(cell_url) = cell_url {
-                                    let top_of_cell = lsp_types::Range {
-                                        start: lsp_types::Position::new(0, 0),
-                                        end: lsp_types::Position::new(0, 0),
-                                    };
+                                if let Some((cell_url, cell_range)) = target_cell {
+                                    let ast = transaction
+                                        .get_ast(&handle)
+                                        .expect("quickfix generation requires a parsed AST");
+                                    let (offset, text) = prepare_import_insertion_in_range(
+                                        &ast,
+                                        cell_range,
+                                        insert_text,
+                                    );
+                                    let position = module_info.to_lsp_position(offset);
                                     edit_uri = cell_url;
-                                    edit_range = top_of_cell;
+                                    edit_range = Range::new(position, position);
+                                    insert_text = text;
                                 }
                             }
                         };
@@ -6607,13 +6640,10 @@ impl Server {
             }
         }
         for e in baseline_errors {
-            // Errors in open files that match a baseline file are downgraded to HINT.
             if let Some((_, mut diag)) =
                 self.get_diag_if_shown(e.error(), e.severity(), &open_files, cell_uri)
             {
-                if to_real_path(e.error().path()).is_some_and(|p| open_files.contains_key(&p)) {
-                    diag.severity = Some(DiagnosticSeverity::Hint);
-                }
+                Self::show_baseline_hint(e, &open_files, &mut diag);
                 items.push(diag);
             }
         }
@@ -7482,93 +7512,6 @@ impl Server {
         ide_transaction_manager.save(transaction, telemetry_event);
         result
     }
-
-    /// Convert `ty` to the TSP wire format, resolving every declaration location
-    /// against `transaction` — the same transaction that produced `ty`, reached
-    /// through `source_handle`'s import context.
-    ///
-    /// Reusing that transaction is what keeps conversion both cheap and correct:
-    /// computing `ty` already populated the transaction's `Stdlib`, so the
-    /// export lookups below cannot hit the cold `get_stdlib` path and need no
-    /// warm-up run; and a single transaction serves the whole query instead of
-    /// one per resolved symbol.
-    fn convert_type_in_transaction(
-        &self,
-        transaction: &Transaction,
-        source_handle: &Handle,
-        ty: &pyrefly_types::types::Type,
-    ) -> tsp_types::Type {
-        // A `Def` function's name range, looked up in its module's binding table.
-        // The handle reuses `source_handle`'s `SysInfo` (as `get_class_fields`
-        // does for cross-module lookups) so the function's module is found under
-        // the same `SysInfo` the transaction computed it with; re-deriving a
-        // config-default `SysInfo` would miss the module in a multi-`SysInfo`
-        // transaction and silently collapse the range to zero.
-        let resolve_func_range = |func_id: &pyrefly_types::function::FuncDefId| {
-            let handle = Handle::new(
-                func_id.qname.module_name(),
-                func_id.qname.module_path().dupe(),
-                source_handle.sys_info().dupe(),
-            );
-            transaction
-                .get_answers(&handle)?
-                .bindings()
-                .function_def_range(func_id.def_index)
-        };
-        // An importable module's backing filesystem path.
-        let resolve_module_path = |module: &pyrefly_types::module::ModuleType| {
-            let module_name = ModuleName::from_str(&module.to_string());
-            let finding = transaction
-                .import_handle(source_handle, module_name, None)
-                .finding()?;
-            let path = to_real_path(finding.path())?;
-            Some(path.canonicalize().unwrap_or(path))
-        };
-        // An exported symbol's original definition, following re-exports.
-        let resolve_export = |module_name: ModuleName, name: &Name| {
-            resolve_export_location(transaction, source_handle, module_name, name)
-        };
-        // Sentinel-like types (`None`, `TypeGuard`/`TypeIs`, `Size`/`Dim`) are
-        // encoded as the stdlib's version-aware classes. Computing `ty` already
-        // populated this transaction's `Stdlib`, so `get_stdlib` stays on the
-        // warm path (see the doc comment above).
-        let stdlib = transaction.get_stdlib(source_handle);
-        convert_type_with_resolvers(
-            ty,
-            Some(&resolve_func_range),
-            Some(&resolve_module_path),
-            Some(&resolve_export),
-            StdlibClasses {
-                none_type: stdlib.none_type(),
-                bool_type: stdlib.bool(),
-                int_type: stdlib.int(),
-                tuple_class: stdlib.tuple_object(),
-            },
-        )
-    }
-}
-
-/// Resolve an exported symbol's original definition (following re-exports) to a
-/// `(ModulePath, Range)`, looked up in `transaction` from `source_handle`'s
-/// import context.
-///
-/// The target module is reached via `import_handle`, so it inherits
-/// `source_handle`'s `SysInfo` — the one whose `Stdlib` this transaction already
-/// computed. That keeps the export lookup on the warm `get_stdlib` path:
-/// re-deriving the handle from the module path would pick a config-derived
-/// `SysInfo` that was never computed, panicking in `get_stdlib` whenever the
-/// transaction holds more than one `SysInfo`.
-pub(crate) fn resolve_export_location(
-    transaction: &Transaction,
-    source_handle: &Handle,
-    module_name: ModuleName,
-    name: &Name,
-) -> Option<(ModulePath, lsp_types::Range)> {
-    let target_handle = transaction
-        .import_handle(source_handle, module_name, None)
-        .finding()?;
-    let (module, range) = transaction.lookup_export_location(&target_handle, name)?;
-    Some((module.path().dupe(), module.to_lsp_range(range)))
 }
 
 impl TspInterface for Server {
@@ -7712,7 +7655,7 @@ impl TspInterface for Server {
                 let position = module_info
                     .from_lsp_position(lsp_types::Position { line, character }, notebook_cell);
                 let ty = transaction.get_type_at_preserving_declaration(handle, position)?;
-                Some(self.convert_type_in_transaction(transaction, handle, &ty))
+                Some(convert_type_in_transaction(transaction, handle, &ty))
             },
         )
     }
@@ -7754,7 +7697,7 @@ impl TspInterface for Server {
                 // so export location resolution stays warm and cannot hit a cold
                 // `get_stdlib`.
                 let ty = transaction.get_computed_type_at_range(handle, range)?;
-                Some(self.convert_type_in_transaction(transaction, handle, &ty))
+                Some(convert_type_in_transaction(transaction, handle, &ty))
             },
         )
     }
@@ -7781,7 +7724,7 @@ impl TspInterface for Server {
                 let ty = transaction
                     .get_expected_type_at(handle, position)
                     .or_else(|| transaction.get_type_at_preserving_declaration(handle, position))?;
-                Some(self.convert_type_in_transaction(transaction, handle, &ty))
+                Some(convert_type_in_transaction(transaction, handle, &ty))
             },
         )
     }

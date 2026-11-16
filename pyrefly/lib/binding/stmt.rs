@@ -71,6 +71,9 @@ use crate::binding::binding::TypeAliasParams;
 use crate::binding::bindings::BindingsBuilder;
 use crate::binding::bindings::CurrentIdx;
 use crate::binding::bindings::LegacyTParamCollector;
+use crate::binding::expr::Evaluation;
+use crate::binding::expr::StaticUsage;
+use crate::binding::expr::TypeExpressionContext;
 use crate::binding::expr::Usage;
 use crate::binding::narrow::AtomicNarrowOp;
 use crate::binding::narrow::ExcludedNonePair;
@@ -289,7 +292,7 @@ impl<'a> BindingsBuilder<'a> {
     /// condition, and solving it solves the check. Pass it to `insert_bool_condition`.
     pub(crate) fn bind_bool_condition(&mut self, test: &mut Expr) -> CurrentIdx {
         let link = self.declare_current_idx(Key::UsageLink(test.range()));
-        self.ensure_expr(test, &mut Usage::NonPinningValue(Some(link.idx())));
+        self.ensure_expr(test, &mut Usage::Condition(link.idx()));
         link
     }
 
@@ -311,7 +314,6 @@ impl<'a> BindingsBuilder<'a> {
             self.bind_narrow_ops(
                 &negated_narrow_ops,
                 NarrowUseLocation::Span(msg_expr.range()),
-                &Usage::NonPinningValue(None),
             );
             let mut msg = self.declare_current_idx(Key::UsageLink(msg_expr.range()));
             self.ensure_expr(&mut msg_expr, msg.usage());
@@ -322,11 +324,7 @@ impl<'a> BindingsBuilder<'a> {
             self.insert_binding_current(msg, Binding::UsageLink(LinkedKey::Expect(idx)));
             self.scopes.swap_current_flow_with(&mut base);
         };
-        self.bind_narrow_ops(
-            &narrow_ops,
-            NarrowUseLocation::Span(assert_range),
-            &Usage::NonPinningValue(None),
-        );
+        self.bind_narrow_ops(&narrow_ops, NarrowUseLocation::Span(assert_range));
         if let Some(false) = static_test {
             self.scopes
                 .mark_flow_termination(TerminationKind::StaticTest);
@@ -496,9 +494,7 @@ impl<'a> BindingsBuilder<'a> {
 
     fn assign_type_var(&mut self, name: &ExprName, call: &mut ExprCall, kind: QuantifiedKind) {
         // Type var declarations are static types only; skip them for first-usage type inference.
-        let static_type_usage = &mut Usage::StaticTypeInformation {
-            is_annotation: false,
-        };
+        let static_type_usage = &mut Usage::Static(StaticUsage::Value, Evaluation::Eager);
         self.ensure_expr(&mut call.func, static_type_usage);
         let mut iargs = call.arguments.args.iter_mut();
         if let Some(expr) = iargs.next() {
@@ -516,7 +512,7 @@ impl<'a> BindingsBuilder<'a> {
                 self.ensure_expr(arg, static_type_usage);
                 continue;
             }
-            self.ensure_type(arg, None);
+            self.ensure_type(arg, None, Evaluation::Eager);
         }
         for kw in call.arguments.keywords.iter_mut() {
             if let Some(id) = &kw.arg
@@ -532,7 +528,7 @@ impl<'a> BindingsBuilder<'a> {
                     self.ensure_expr(&mut kw.value, static_type_usage);
                     continue;
                 }
-                self.ensure_type(&mut kw.value, None);
+                self.ensure_type(&mut kw.value, None, Evaluation::Eager);
             } else {
                 self.ensure_expr(&mut kw.value, static_type_usage);
             }
@@ -549,9 +545,7 @@ impl<'a> BindingsBuilder<'a> {
 
     fn ensure_type_var_tuple_and_param_spec_args(&mut self, call: &mut ExprCall) {
         // Type var declarations are static types only; skip them for first-usage type inference.
-        let static_type_usage = &mut Usage::StaticTypeInformation {
-            is_annotation: false,
-        };
+        let static_type_usage = &mut Usage::Static(StaticUsage::Value, Evaluation::Eager);
         self.ensure_expr(&mut call.func, static_type_usage);
         for arg in call.arguments.args.iter_mut() {
             self.ensure_expr(arg, static_type_usage);
@@ -560,7 +554,7 @@ impl<'a> BindingsBuilder<'a> {
             if let Some(id) = &kw.arg
                 && id.id == "default"
             {
-                self.ensure_type(&mut kw.value, None);
+                self.ensure_type(&mut kw.value, None, Evaluation::Eager);
             } else {
                 self.ensure_expr(&mut kw.value, static_type_usage);
             }
@@ -591,9 +585,7 @@ impl<'a> BindingsBuilder<'a> {
 
     fn assign_sentinel(&mut self, name: &ExprName, call: &mut ExprCall) {
         // Sentinels are static types only; skip them for first-usage type inference.
-        let static_type_usage = &mut Usage::StaticTypeInformation {
-            is_annotation: false,
-        };
+        let static_type_usage = &mut Usage::Static(StaticUsage::Value, Evaluation::Eager);
         self.ensure_expr(&mut call.func, static_type_usage);
         for expr in call.arguments.args.iter_mut() {
             self.ensure_expr(expr, static_type_usage);
@@ -621,9 +613,7 @@ impl<'a> BindingsBuilder<'a> {
         tparams_builder: &mut LegacyTParamCollector,
     ) {
         // Type var declarations are static types only; skip them for first-usage type inference.
-        let static_type_usage = &mut Usage::StaticTypeInformation {
-            is_annotation: false,
-        };
+        let static_type_usage = &mut Usage::Static(StaticUsage::Value, Evaluation::Eager);
         self.ensure_expr(&mut call.func, static_type_usage);
         let mut iargs = call.arguments.args.iter_mut();
         // The first argument is the name
@@ -632,7 +622,14 @@ impl<'a> BindingsBuilder<'a> {
         }
         // The second argument is the type
         if let Some(expr) = iargs.next() {
-            self.ensure_type_with_usage(expr, Some(tparams_builder), &mut Usage::TypeAliasRhs);
+            self.ensure_type_with_usage(
+                expr,
+                Some(tparams_builder),
+                &mut Usage::Static(
+                    StaticUsage::TypeExpression(TypeExpressionContext::TypeAliasValue),
+                    Evaluation::Eager,
+                ),
+            );
         }
         // There shouldn't be any other positional arguments
         for arg in iargs {
@@ -644,7 +641,7 @@ impl<'a> BindingsBuilder<'a> {
                 && let Expr::Tuple(type_params) = &mut kw.value
             {
                 for type_param in type_params.elts.iter_mut() {
-                    self.ensure_type(type_param, None);
+                    self.ensure_type(type_param, None, Evaluation::Eager);
                 }
             } else if let Some(id) = &kw.arg
                 && id.id == "value"
@@ -652,7 +649,10 @@ impl<'a> BindingsBuilder<'a> {
                 self.ensure_type_with_usage(
                     &mut kw.value,
                     Some(tparams_builder),
-                    &mut Usage::TypeAliasRhs,
+                    &mut Usage::Static(
+                        StaticUsage::TypeExpression(TypeExpressionContext::TypeAliasValue),
+                        Evaluation::Eager,
+                    ),
                 );
             } else {
                 self.ensure_expr(&mut kw.value, static_type_usage);
@@ -806,11 +806,7 @@ impl<'a> BindingsBuilder<'a> {
         is_initialized: AnnAssignHasValue,
     ) -> Idx<KeyAnnotation> {
         let ann_key = KeyAnnotation::Annotation(ShortIdentifier::new(name));
-        if self.scopes.in_class_body() {
-            self.ensure_class_member_type(annotation, None);
-        } else {
-            self.ensure_type(annotation, None);
-        }
+        self.ensure_type(annotation, None, self.annotation_evaluation());
         let ann_val = if let Some(special) = SpecialForm::new(&name.id, annotation) {
             // Special case `_: SpecialForm` declarations (this mainly affects some names declared in `typing.pyi`)
             BindingAnnotation::SpecialForm(
@@ -1172,7 +1168,7 @@ impl<'a> BindingsBuilder<'a> {
             Stmt::AnnAssign(mut x) => match *x.target {
                 Expr::Name(name) => {
                     if Ast::is_synthesized_empty_name(&name) {
-                        self.ensure_type(&mut x.annotation, None);
+                        self.ensure_type(&mut x.annotation, None, self.annotation_evaluation());
                         if let Some(value) = x.value {
                             self.bind_single_name_assign(
                                 &Ast::expr_name_identifier(name),
@@ -1212,6 +1208,23 @@ impl<'a> BindingsBuilder<'a> {
                                         _ => unreachable!("filtered by outer match"),
                                     }
                                 }
+                                return;
+                            }
+                            // Only bare qualifiers (`Final`, `ClassVar`) leave the type to the
+                            // sentinel itself, so that it can be used in type expressions.
+                            SpecialExport::Sentinel | SpecialExport::BuiltinsSentinel
+                                if matches!(
+                                    self.as_special_export(&x.annotation),
+                                    Some(SpecialExport::Final | SpecialExport::ClassVar)
+                                ) =>
+                            {
+                                let ident = Ast::expr_name_identifier(name.clone());
+                                self.bind_annotation(
+                                    &ident,
+                                    &mut x.annotation,
+                                    AnnAssignHasValue::Yes,
+                                );
+                                self.assign_sentinel(&name, call);
                                 return;
                             }
                             _ => {}
@@ -1285,7 +1298,7 @@ impl<'a> BindingsBuilder<'a> {
                 Expr::Attribute(attr) => {
                     let mut attr = attr;
                     let attr_name = attr.attr.id.clone();
-                    self.ensure_type(&mut x.annotation, None);
+                    self.ensure_type(&mut x.annotation, None, self.annotation_evaluation());
                     let ann_key = self.insert_binding(
                         KeyAnnotation::AttrAnnotation(x.annotation.range()),
                         BindingAnnotation::AnnotateExpr(
@@ -1303,12 +1316,7 @@ impl<'a> BindingsBuilder<'a> {
                             })
                         }
                         _ => {
-                            self.ensure_expr(
-                                &mut attr.value,
-                                &mut Usage::StaticTypeInformation {
-                                    is_annotation: false,
-                                },
-                            );
+                            self.ensure_expr(&mut attr.value, &mut Usage::Unchecked);
                             ExprOrBinding::Binding(Binding::Any(AnyStyle::Implicit))
                         }
                     };
@@ -1401,20 +1409,10 @@ impl<'a> BindingsBuilder<'a> {
                         //
                         // We don't track first-usage in this context, since we won't analyze the usage anyway.
                         let mut e = illegal_target.clone();
-                        self.ensure_expr(
-                            &mut e,
-                            &mut Usage::StaticTypeInformation {
-                                is_annotation: false,
-                            },
-                        );
+                        self.ensure_expr(&mut e, &mut Usage::Unchecked);
                         // Even though the assignment target is invalid, we still need to analyze the RHS so errors
                         // (like invalid walrus targets) are reported.
-                        self.ensure_expr(
-                            &mut x.value,
-                            &mut Usage::StaticTypeInformation {
-                                is_annotation: false,
-                            },
-                        );
+                        self.ensure_expr(&mut x.value, &mut Usage::Unchecked);
                     }
                 }
             }
@@ -1432,7 +1430,14 @@ impl<'a> BindingsBuilder<'a> {
                     if let Some(params) = &mut x.type_params {
                         self.type_params(params);
                     }
-                    self.ensure_type_with_usage(&mut x.value, None, &mut Usage::TypeAliasRhs);
+                    self.ensure_type_with_usage(
+                        &mut x.value,
+                        None,
+                        &mut Usage::Static(
+                            StaticUsage::TypeExpression(TypeExpressionContext::TypeAliasValue),
+                            Evaluation::Postponed,
+                        ),
+                    );
                     // Pop the type alias scope before binding the definition
                     self.scopes.pop();
                     let range = x.value.range();
@@ -1480,12 +1485,14 @@ impl<'a> BindingsBuilder<'a> {
                 // Check if the iterable is definitely non-empty before binding
                 // (must be done before x.iter is moved)
                 let loop_definitely_runs = self.is_definitely_nonempty_iterable(&x.iter);
+                let is_unpacking = matches!(&*x.target, Expr::Tuple(_) | Expr::List(_));
                 let in_class_body = self.scopes.in_class_body();
                 self.bind_target_with_expr(&mut x.target, &mut x.iter, &|expr, ann| {
                     Binding::IterableValueLoop(
                         ann,
                         Box::new(expr.clone()),
                         IsAsync::new(x.is_async),
+                        is_unpacking,
                         in_class_body,
                     )
                 });
@@ -1539,11 +1546,7 @@ impl<'a> BindingsBuilder<'a> {
                     }
                     self.scopes.restore_termination(termination);
                 } else {
-                    self.bind_narrow_ops(
-                        &narrow_ops,
-                        NarrowUseLocation::Span(x.range),
-                        &Usage::NonPinningValue(None),
-                    );
+                    self.bind_narrow_ops(&narrow_ops, NarrowUseLocation::Span(x.range));
                     self.stmts(x.body, parent);
                 }
                 // For while True: loops, the loop body definitely runs at least once
@@ -1578,7 +1581,7 @@ impl<'a> BindingsBuilder<'a> {
                 let reachability_idx =
                     self.idx_for_promise(KeyExpect::BranchSuiteReachability(if_range));
                 let tests_link = self.declare_current_idx(Key::UsageLink(if_range));
-                let tests_usage = Usage::NonPinningValue(Some(tests_link.idx()));
+                let tests_usage = Usage::Condition(tests_link.idx());
                 self.ensure_expr(&mut x.test, &mut tests_usage.clone());
                 self.start_fork(if_range);
                 // Type narrowing operations that are carried over from one branch to the next. For example, in:
@@ -1604,11 +1607,7 @@ impl<'a> BindingsBuilder<'a> {
                 let mut branches = Ast::if_branches_owned(x);
                 while let Some((range, mut test, body)) = branches.next() {
                     self.start_branch();
-                    self.bind_narrow_ops(
-                        &negated_prev_ops,
-                        NarrowUseLocation::Start(range),
-                        &Usage::NonPinningValue(None),
-                    );
+                    self.bind_narrow_ops(&negated_prev_ops, NarrowUseLocation::Start(range));
                     // If there is no test, it's an `else` clause and `this_branch_chosen` will be true.
                     let this_branch_chosen = match &test {
                         None => {
@@ -1694,11 +1693,7 @@ impl<'a> BindingsBuilder<'a> {
                         .map(|test| (test, true))
                         .or(previous_test.map(|test| (test, false)));
                     previous_test = this_test.or(previous_test);
-                    self.bind_narrow_ops(
-                        &new_narrow_ops,
-                        NarrowUseLocation::Span(range),
-                        &Usage::NonPinningValue(None),
-                    );
+                    self.bind_narrow_ops(&new_narrow_ops, NarrowUseLocation::Span(range));
                     negated_prev_ops.and_all(new_narrow_ops.negate());
                     let outer_environment_suite = self.environment_suite;
                     if after_environment_test {
@@ -2008,7 +2003,7 @@ impl<'a> BindingsBuilder<'a> {
                         )
                         .definitions
                         .into_iter()
-                        .filter_map(|(name, d)| d.has_value_definition.then_some(name))
+                        .filter_map(|(name, d)| d.sites.binds_value().then_some(name))
                         .collect::<SmallSet<_>>()
                     })
                     .reduce(|all, next| {
@@ -2417,11 +2412,7 @@ impl<'a> BindingsBuilder<'a> {
                             range,
                         ),
                     );
-                    self.bind_narrow_ops(
-                        &narrow_ops,
-                        NarrowUseLocation::Span(range),
-                        &Usage::NonPinningValue(None),
-                    );
+                    self.bind_narrow_ops(&narrow_ops, NarrowUseLocation::Span(range));
                 }
             }
             Stmt::Pass(_) => { /* no-op */ }

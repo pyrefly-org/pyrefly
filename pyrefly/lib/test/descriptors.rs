@@ -1355,7 +1355,7 @@ testcase!(
     test_self_referential_descriptor_get_no_crash,
     r#"
 class C:
-    def d() -> C: ...
+    def d() -> C: ...  # E: Instance method `d` must accept the instance as its first positional parameter
     @d  # E: Expected 0 positional arguments, got 1 in function `C.d`
     def __get__():
         pass
@@ -1514,7 +1514,7 @@ testcase!(
     test_self_referential_descriptor_set_no_crash,
     r#"
 class C:
-    def d() -> C: ...
+    def d() -> C: ...  # E: Instance method `d` must accept the instance as its first positional parameter
     @d  # E: Expected 0 positional arguments, got 1 in function `C.d`
     def __get__():
         pass
@@ -1591,5 +1591,50 @@ class D:
 class K:
     x: D = D()  # E: Cannot set field `x` to data descriptor `D` with inconsistent types
 reveal_type(K.__init__)  # E: revealed type: (self: K, x: bool = ...) -> None
+"#,
+);
+
+testcase!(
+    test_decorator_override,
+    r#"
+from typing import Any
+
+class Descriptor:
+    def __init__(self, *_: object) -> None:
+        pass
+    def __get__(self, *_: object) -> int:
+        return 1
+    def __set__(self, *_: Any) -> None:
+        pass
+
+class Base:
+    x: Any
+
+class Decorated(Base):
+    @Descriptor
+    def x(cls) -> int:
+        return 1
+    "#,
+);
+
+// The error for a descriptor whose `__get__` cannot be called is reported where the attribute is
+// read, not where the descriptor is defined.
+testcase!(
+    test_descriptor_getter_error_at_access,
+    TestEnv::one(
+        "foo",
+        r#"
+class D:
+    @property
+    def __get__(self, extra: int) -> int: ...  # E: Property getter cannot take extra required parameter `extra`
+
+class C:
+    d = D()
+"#,
+    ),
+    r#"
+from foo import C
+
+v = C().d  # E: Missing argument `extra` in function `foo.D.__get__`  # E: Expected a callable, got `int`
 "#,
 );
