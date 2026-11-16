@@ -121,12 +121,13 @@ impl Package {
 }
 
 /// Writes a SCIP index as a stream of `Index` messages, which a reader merges into one: the
-/// metadata, then each document as soon as it is built, in no particular order, then the
-/// external symbols. Documents can be written while the files are being checked, from a
-/// solutions hook.
+/// metadata, then each document in path order, then the external symbols. Documents can be
+/// built while the files are being checked, from a solutions hook, and are kept serialized
+/// until they are written.
 pub struct ScipWriter<W> {
     writer: Mutex<W>,
     handles: SmallSet<Handle>,
+    documents: Mutex<Vec<(String, Vec<u8>)>>,
     project_root: PathBuf,
     project: Package,
     definitions: Mutex<HashMap<Handle, Arc<SmallMap<TextRange, ScipSymbol>>>>,
@@ -170,6 +171,7 @@ impl<W: Write + Send> ScipWriter<W> {
         Ok(Self {
             writer: Mutex::new(writer),
             handles: handles.iter().cloned().collect(),
+            documents: Mutex::new(Vec::new()),
             project_root,
             project,
             definitions: Mutex::new(HashMap::new()),
@@ -210,7 +212,7 @@ impl<W: Write + Send> ScipWriter<W> {
         }
     }
 
-    /// Writes the document of `handle`, if it is one of the indexed files.
+    /// Builds the document of `handle`, if it is one of the indexed files.
     pub fn write_document(&self, transaction: &Transaction, handle: &Handle) -> anyhow::Result<()> {
         if !self.handles.contains(handle) {
             return Ok(());
@@ -218,22 +220,24 @@ impl<W: Write + Send> ScipWriter<W> {
         let Some(document) = self.indexer(transaction).document(handle) else {
             return Ok(());
         };
+        let path = document.relative_path.clone();
         let bytes = Index {
             documents: vec![document],
             ..Default::default()
         }
         .write_to_bytes()?;
-        self.writer.lock().write_all(&bytes)?;
+        self.documents.lock().push((path, bytes));
         Ok(())
     }
 
-    /// Detaches the solutions hook and writes external symbols after every document is written.
+    /// Detaches the solutions hook, then writes the documents and the external symbols.
     pub fn finish(self: Arc<Self>, transaction: &mut Transaction) -> anyhow::Result<W> {
         transaction.set_solutions_hook(None);
         transaction.set_evict_answers_after_scip_hook(false);
         let scip = Arc::into_inner(self).expect("the solutions hook holds the only other copy");
         let Self {
             writer,
+            documents,
             external_symbols,
             definitions,
             asts,
@@ -242,6 +246,11 @@ impl<W: Write + Send> ScipWriter<W> {
         } = scip;
         drop((definitions, asts, distributions));
         let mut writer = writer.into_inner();
+        let mut documents = documents.into_inner();
+        documents.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (_, bytes) in documents {
+            writer.write_all(&bytes)?;
+        }
         let mut first_uses: Vec<(String, ExternalUse)> =
             external_symbols.into_inner().into_iter().collect();
         // Most external symbols are documented at their first use. When that hover has no

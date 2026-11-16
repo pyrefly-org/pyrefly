@@ -192,7 +192,7 @@ let docsSidebar = [
             {
                 type: 'doc' as const,
                 id: 'scip',
-                label: 'SCIP Indexing',
+                label: 'Indexing',
             },
         ],
     },
