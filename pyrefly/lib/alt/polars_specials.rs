@@ -47,6 +47,7 @@ use crate::binding::polars::polars_column_mutation;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 use crate::types::class::Class;
+use crate::types::env::TypeEnv;
 use crate::types::function::FuncDefId;
 use crate::types::function::FunctionKind;
 use crate::types::literal::Lit;
@@ -286,7 +287,7 @@ fn is_polars_selector_name(name: &Name) -> bool {
 /// Map a resolved type to the Polars dtype it names, e.g. the `pl.Float64` class to `Float64`.
 /// Only the modeled scalar dtypes are recognized, and only from a package whose dtype classes
 /// carry Polars' names and meanings; anything else is `None`.
-fn polars_dtype_from_type(ty: &Type) -> Option<PolarsDType> {
+fn polars_dtype_from_type<E: TypeEnv + ?Sized>(env: &E, ty: &Type) -> Option<PolarsDType> {
     let cls = match ty {
         Type::ClassDef(cls) => cls,
         Type::ClassType(cls) => cls.class_object(),
@@ -300,7 +301,7 @@ fn polars_dtype_from_type(ty: &Type) -> Option<PolarsDType> {
     {
         return None;
     }
-    PolarsDType::from_polars_name(cls.name().as_str())
+    PolarsDType::from_polars_name(cls.name(env).as_str())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -417,13 +418,13 @@ impl PolarsFunction {
         }
     }
 
-    fn from_callee(callee: &Type) -> Option<Self> {
+    fn from_callee(env: &dyn TypeEnv, callee: &Type) -> Option<Self> {
         if let Type::ClassType(cls) = callee
             && is_polars_col(cls.class_object())
         {
             return Some(Self::Col);
         }
-        match callee.callee_kind() {
+        match callee.callee_kind(env) {
             Some(CalleeKind::Function(FunctionKind::Def(id))) => Some(Self::from_id(&id)),
             _ => None,
         }
@@ -431,8 +432,11 @@ impl PolarsFunction {
 }
 
 /// For a resolved `polars.col` or `polars.lit`, whether strings name columns rather than values.
-pub(crate) fn polars_function_treats_strings_as_columns(callee: &Type) -> Option<bool> {
-    match PolarsFunction::from_callee(callee)? {
+pub(crate) fn polars_function_treats_strings_as_columns(
+    env: &dyn TypeEnv,
+    callee: &Type,
+) -> Option<bool> {
+    match PolarsFunction::from_callee(env, callee)? {
         PolarsFunction::Col => Some(true),
         PolarsFunction::Lit => Some(false),
         _ => None,
@@ -1218,7 +1222,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 },
             );
         }
-        match PolarsFunction::from_callee(callee) {
+        match PolarsFunction::from_callee(self, callee) {
             Some(PolarsFunction::Csv(function)) => {
                 return self
                     .infer_polars_csv_schema(arguments, function)
@@ -1286,7 +1290,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return Some(dtype);
         }
         let ty = self.expr_infer(e, &self.error_swallower());
-        polars_dtype_from_type(&ty)
+        polars_dtype_from_type(self, &ty)
     }
 
     fn polars_nested_dtype_from_call(&self, call: &ExprCall) -> Option<PolarsDType> {
@@ -1298,7 +1302,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if module.as_str() != POLARS_MODULE && !module.as_str().starts_with(POLARS_MODULE_PREFIX) {
             return None;
         }
-        match cls.name().as_str() {
+        match cls.name(self).as_str() {
             "Array" => {
                 if !arguments_are_valid(&call.arguments, 2, Some(&["inner", "shape"])) {
                     return None;
@@ -1833,7 +1837,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         let mut columns = Vec::with_capacity(fields.len());
         for (name, field) in &fields {
-            columns.push((name.clone(), polars_dtype_from_type(&field.ty())?));
+            columns.push((name.clone(), polars_dtype_from_type(self, &field.ty())?));
         }
         Some(columns)
     }
@@ -1844,10 +1848,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         expr: &Expr,
     ) -> Option<(Vec<(Name, PolarsDType)>, SchemaCompleteness)> {
         let ty = self.expr_infer(expr, &self.error_swallower());
-        let Type::TypedDict(typed_dict) = &ty else {
-            return None;
+        let fields = match &ty {
+            Type::ClassType(ct) if self.is_typed_dict_class(ct.class_object()) => {
+                self.typed_dict_fields(ct)
+            }
+            Type::AnonymousTypedDict(typed_dict) => typed_dict.fields.iter().cloned().collect(),
+            _ => return None,
         };
-        let fields = self.typed_dict_fields(typed_dict);
         if fields.is_empty() {
             return None;
         }
@@ -2775,7 +2782,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     fn polars_function(&self, func: &Expr) -> Option<PolarsFunction> {
-        PolarsFunction::from_callee(&self.expr_infer(func, &self.error_swallower()))
+        PolarsFunction::from_callee(self, &self.expr_infer(func, &self.error_swallower()))
     }
 
     fn polars_col_attribute_name(&self, expr: &Expr) -> Option<Name> {

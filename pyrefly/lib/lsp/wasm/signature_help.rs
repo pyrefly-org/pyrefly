@@ -39,6 +39,7 @@ use crate::state::lsp::FindPreference;
 use crate::state::state::Transaction;
 use crate::types::callable::Param;
 use crate::types::callable::Params;
+use crate::types::env::TypeEnv;
 use crate::types::types::Type;
 
 /// Information about a call site at the cursor position, returned by
@@ -347,26 +348,25 @@ impl Transaction<'_> {
             })
     }
 
-    fn parameter_documentation_for_callee(
+    /// Parameter documentation for the callee at `callee_range`, read from its docstring.
+    pub(crate) fn parameter_documentation_for_callee(
         &self,
         handle: &Handle,
         callee_range: TextRange,
     ) -> Option<HashMap<String, String>> {
         let position = callee_range.end();
+        let source_preference = FindPreference {
+            prefer_pyi: false,
+            include_interpreter_stdlib: true,
+            ..Default::default()
+        };
 
-        let (range, module) = self
-            .find_range_and_module(
-                handle,
-                position,
-                FindPreference {
-                    prefer_pyi: false,
-                    include_interpreter_stdlib: true,
-                    ..Default::default()
-                },
-            )
-            .or_else(|| self.find_range_and_module(handle, position, FindPreference::default()))?;
+        let docs = self
+            .find_range_and_module(handle, position, source_preference)
+            .or_else(|| self.find_range_and_module(handle, position, FindPreference::default()))
+            .map(|(range, module)| parse_parameter_documentation(module.code_at(range)))
+            .unwrap_or_default();
 
-        let docs = parse_parameter_documentation(module.code_at(range));
         if docs.is_empty() { None } else { Some(docs) }
     }
 
@@ -426,6 +426,7 @@ impl Transaction<'_> {
     }
 
     fn create_signature_information(
+        env: &dyn TypeEnv,
         type_: Type,
         active_argument: &ActiveArgument,
         parameter_docs: Option<&HashMap<String, String>>,
@@ -441,13 +442,13 @@ impl Transaction<'_> {
             type_
         };
 
-        let label = display_type.as_lsp_string(LspDisplayMode::SignatureHelp);
+        let label = display_type.as_lsp_string(env, LspDisplayMode::SignatureHelp);
         let (parameters, active_parameter) = if let Some(params) =
             Self::normalize_singleton_function_type_into_params(display_type)
         {
             // Create a type display context for consistent parameter formatting
             let param_types: Vec<&Type> = params.iter().map(|p| p.as_type()).collect();
-            let mut type_ctx = TypeDisplayContext::new(&param_types);
+            let mut type_ctx = TypeDisplayContext::new(env, &param_types);
             type_ctx.set_lsp_display_mode(LspDisplayMode::SignatureHelp);
 
             let active_parameter =
@@ -500,6 +501,7 @@ impl Transaction<'_> {
              }| {
                 let parameter_docs = self.parameter_documentation_for_callee(handle, callee_range);
                 let function_docstring = self.function_docstring_for_callee(handle, callee_range);
+                let type_env = self.type_env(handle);
 
                 let is_constructor_call = self
                     .get_answers(handle)
@@ -510,6 +512,7 @@ impl Transaction<'_> {
                     .into_iter()
                     .map(|t| {
                         Self::create_signature_information(
+                            &type_env,
                             t,
                             &active_argument,
                             parameter_docs.as_ref(),

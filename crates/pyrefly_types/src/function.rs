@@ -14,6 +14,7 @@ use std::sync::Arc;
 use dupe::Dupe;
 use parse_display::Display;
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
 use pyrefly_python::dunder;
@@ -29,31 +30,44 @@ use ruff_python_ast::name::Name;
 use crate::callable::Callable;
 use crate::class::Class;
 use crate::class::ClassType;
+use crate::env::TypeEnv;
 use crate::equality::TypeEq;
 use crate::keywords::DataclassTransformMetadata;
 use crate::type_level_dsl::ResolvedTypeShapeDslFunction;
+use crate::type_ord::TypeOrd;
+use crate::type_ord::TypeOrdCtx;
 use crate::types::TParams;
 use crate::types::Type;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct Function {
     pub signature: Callable,
     pub metadata: FuncMetadata,
 }
 
 impl Function {
-    /// Preserve an existing declared classification when rebuilding a substituted function.
+    /// Preserve a declared classification when rebuilding a substituted function.
     pub fn initialize_unresolved_imports(&mut self, tparams: Option<&TParams>) {
         if self.metadata.flags.unresolved_imports.is_none() {
             self.metadata.flags.unresolved_imports =
-                Some(self.signature.contains_unresolved_imports(tparams));
+                Some(self.signature.classify_unresolved_imports(tparams));
         }
     }
 }
 
+/// Return-only import recovery does not weaken a signature's input contract.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq, TypeOrd
+)]
+pub enum UnresolvedImports {
+    Resolved,
+    ReturnOnly,
+    Inputs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct FuncMetadata {
     pub kind: FunctionKind,
     pub flags: FuncFlags,
@@ -71,14 +85,14 @@ impl FuncMetadata {
         }
     }
 
-    pub fn method(cls: &Class, name: Name) -> Self {
-        Self::synthesized(cls.module(), Some(cls), name)
+    pub fn method(env: &dyn TypeEnv, cls: &Class, name: Name) -> Self {
+        Self::synthesized(cls.module(env), Some(cls), name)
     }
 }
 
 /// Metadata extracted from a `@deprecated` decorator.
 #[derive(
-    Clone, Debug, Visit, VisitMut, TypeEq, PartialEq, Eq, PartialOrd, Ord, Hash
+    Clone, Debug, Visit, VisitMut, TypeEq, TypeOrd, PartialEq, Eq, PartialOrd, Ord, Hash
 )]
 pub struct Deprecation {
     pub message: Option<String>,
@@ -99,7 +113,7 @@ impl Deprecation {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq, TypeOrd
 )]
 pub enum PropertyRole {
     Getter,
@@ -110,7 +124,8 @@ pub enum PropertyRole {
 
 /// Shape of a function body.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq,
+    TypeOrd
 )]
 pub enum BodyKind {
     /// Body is exactly `raise NotImplementedError(...)`. This is the canonical
@@ -169,7 +184,7 @@ impl FuncFacts {
 }
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq, TypeOrd
 )]
 pub struct PropertyMetadata {
     pub role: PropertyRole,
@@ -197,7 +212,7 @@ impl PropertyMetadata {
 
 /// A generated descriptor setter that stores values compatible with its read type.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Visit, VisitMut, TypeEq, TypeOrd
 )]
 pub struct DescriptorSetterMetadata {
     pub read_type: Type,
@@ -206,7 +221,7 @@ pub struct DescriptorSetterMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct FuncFlags {
     /// The storage contract of a generated `__set__` method.
     pub descriptor_setter: Option<Box<DescriptorSetterMetadata>>,
@@ -270,7 +285,7 @@ pub struct FuncFlags {
     pub has_gradual_variadic_params: bool,
     /// Preserve the defined contract across receiver and argument substitution.
     /// Unclassified signatures use a structural fallback at their construction or call boundary.
-    pub unresolved_imports: Option<bool>,
+    pub unresolved_imports: Option<UnresolvedImports>,
 }
 
 impl FuncFlags {
@@ -288,7 +303,7 @@ impl FuncFlags {
 /// The index of a function definition (`def ..():` statement) within the module,
 /// used as a reference to data associated with the function.
 #[derive(Debug, Clone, Dupe, Copy, Eq, PartialEq, Hash, PartialOrd, Ord)]
-#[derive(Display, Visit, VisitMut, TypeEq)]
+#[derive(Display, Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct FuncDefIndex(pub u32);
 
 /// Identity of a source-backed function definition.
@@ -307,6 +322,7 @@ impl PartialEq for FuncDefId {
 
 impl Eq for FuncDefId {}
 impl TypeEq for FuncDefId {}
+impl TypeOrd for FuncDefId {}
 
 impl Ord for FuncDefId {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -378,6 +394,23 @@ impl PartialEq for FuncSymbol {
 impl Eq for FuncSymbol {}
 impl TypeEq for FuncSymbol {}
 
+/// Like `Ord`, but compares the class with `TypeOrd`.
+impl TypeOrd for FuncSymbol {
+    fn type_cmp(&self, other: &Self, ctx: &TypeOrdCtx) -> Ordering {
+        self.module
+            .name()
+            .cmp(&other.module.name())
+            .then_with(|| {
+                self.module
+                    .path()
+                    .to_key_eq()
+                    .cmp(&other.module.path().to_key_eq())
+            })
+            .then_with(|| self.cls.type_cmp(&other.cls, ctx))
+            .then_with(|| self.name.cmp(&other.name))
+    }
+}
+
 impl Ord for FuncSymbol {
     fn cmp(&self, other: &Self) -> Ordering {
         self.key().cmp(&other.key())
@@ -425,7 +458,7 @@ impl FuncSymbol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum FunctionKind {
     IsInstance,
     IsSubclass,
@@ -592,7 +625,7 @@ impl FunctionKind {
             Self::FunctoolsWraps => ModuleName::functools(),
             Self::FunctoolsUpdateWrapper => ModuleName::functools(),
             Self::RuntimeCheckable => ModuleName::typing(),
-            Self::CallbackProtocol(cls) => cls.qname().module_name(),
+            Self::CallbackProtocol(cls) => cls.class_object().module_name(),
             Self::SingleDispatchRegister(_) => ModuleName::functools(),
             Self::AbstractMethod => ModuleName::abc(),
             Self::NoTypeCheck => ModuleName::typing(),
@@ -701,7 +734,7 @@ impl FunctionKind {
         id.qname.parent().ancestor_function_path(id.qname.module())
     }
 
-    pub fn format(&self, current_module: ModuleName) -> String {
+    pub fn format(&self, env: &dyn TypeEnv, current_module: ModuleName) -> String {
         let func_module = self.module_name();
         let module_prefix = if func_module.as_str().is_empty()
             || func_module == current_module
@@ -713,7 +746,7 @@ impl FunctionKind {
         };
         let class_prefix = match &self.class() {
             Some(cls) => {
-                format!("{}.", cls.name())
+                format!("{}.", cls.name(env))
             }
             None => "".to_owned(),
         };
@@ -752,6 +785,7 @@ mod tests {
     use super::FuncDefId;
     use super::FuncDefIndex;
     use super::FunctionKind;
+    use crate::test_type_env::TestTypeEnv;
 
     fn identifier(source: &str, name: &str) -> Identifier {
         let start = source
@@ -795,7 +829,7 @@ mod tests {
             "Outer.factory.Inner.target"
         );
         assert_eq!(
-            FunctionKind::Def(Arc::new(id)).format(module.name()),
+            FunctionKind::Def(Arc::new(id)).format(&TestTypeEnv::new(), module.name()),
             "target"
         );
     }

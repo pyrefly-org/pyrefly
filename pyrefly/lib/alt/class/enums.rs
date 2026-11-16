@@ -108,7 +108,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             };
             let value_ty = self.enum_literal_to_value_type((*lit_enum).clone(), is_django);
             if self.is_equivalent(got, &value_ty) {
-                let candidate = format!("{}.{}", lit_enum.class.name(), lit_enum.member);
+                let candidate = format!("{}.{}", lit_enum.class.name(self), lit_enum.member);
                 match &suggestion {
                     Some(existing) if existing != &candidate => return None,
                     _ => suggestion = Some(candidate),
@@ -428,11 +428,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         match got {
             Type::Quantified(q) if q.is_type_var() => {
-                let bound = q.upper_bound(self.stdlib, self.heap);
+                let bound = q.upper_bound(self, self.heap);
                 self.is_enum_lookup_compatible(&bound, want)
             }
             Type::TypeVar(tv) => {
-                let bound = tv.upper_bound(self.stdlib, self.heap);
+                let bound = tv.upper_bound(self, self.heap);
                 self.is_enum_lookup_compatible(&bound, want)
             }
             Type::Union(u) => u
@@ -581,7 +581,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if field.defining_class.is(KnownClass::Enum) {
                     Some(self.heap.mk_class_type(self.stdlib.int().clone()))
                 } else {
-                    field.value.ty().callable_return_type(self.heap)
+                    field.value.ty().callable_return_type(self.heap, self)
                 }
             })
             .unwrap_or_else(|| self.heap.mk_any_implicit()) // Fall back to `Any` if `_generate_next_value_` is missing or not callable
@@ -692,7 +692,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 Lit::Enum(Box::new(LitEnum {
                     class: enum_.cls.clone(),
                     member: name.clone(),
-                    ty: self.solver().force(value_ty.clone()),
+                    ty: self.solver().force(value_ty.clone(), self),
                 }))
                 .to_implicit_type(),
             )
@@ -749,8 +749,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors, range, ErrorKind::BadAssignment,
                 format!(
                     "Enum member `{member}` has type `{}`, must match the `_value_` attribute annotation of `{}`",
-                    self.for_display(value.clone()),
-                    self.for_display(annotation.clone()),
+                    self.display(value.clone()),
+                    self.display(annotation.clone()),
                 ),
             );
         }

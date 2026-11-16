@@ -17,16 +17,14 @@ use pyrefly_types::dimension::ShapeError;
 use pyrefly_types::function::BodyKind;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::quantified::Quantified;
-use pyrefly_types::simplify::unions;
 use pyrefly_types::special_form::SpecialForm;
-use pyrefly_types::typed_dict::TypedDictInner;
 use pyrefly_types::types::CalleeKind;
 use pyrefly_types::types::TArgs;
 use pyrefly_types::types::TParams;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::prelude::SliceExt;
 use pyrefly_util::prelude::VecExt;
 use pyrefly_util::visit::Visit;
-use pyrefly_util::visit::VisitMut;
 use ruff_python_ast::Arguments;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprCall;
@@ -50,7 +48,6 @@ use crate::alt::callable::CallValue;
 use crate::alt::callable::CallWithTypes;
 use crate::alt::callable::ConstructorArguments;
 use crate::alt::callable::ReturnTypeResolutionError;
-use crate::alt::callable::contains_argument_bindings;
 use crate::alt::class::class_field::ClassAttribute;
 use crate::alt::class::class_field::DescriptorBase;
 use crate::alt::class::dataclass::ReplaceKind;
@@ -82,7 +79,6 @@ use crate::types::keywords::TypeMap;
 use crate::types::literal::Lit;
 use crate::types::module::ModuleType;
 use crate::types::type_var::Restriction;
-use crate::types::typed_dict::TypedDict;
 use crate::types::types::AnyStyle;
 use crate::types::types::BoundMethod;
 use crate::types::types::BoundMethodType;
@@ -148,7 +144,7 @@ pub enum CallTarget {
     /// the upper bound.
     Class(ClassType, ConstructorKind, Option<Quantified>),
     /// A TypedDict.
-    TypedDict(TypedDictInner),
+    TypedDict(ClassType),
     /// An overloaded function.
     FunctionOverload(Vec1<TargetWithTParams<Function>>, FuncMetadata),
     /// An overloaded method.
@@ -173,6 +169,7 @@ pub struct IntersectionCallTarget {
 pub struct CallOutcome {
     pub ty: Type,
     pub overload_table: OverloadTable,
+    pub argmap: ArgMap,
 }
 
 impl CallOutcome {
@@ -180,6 +177,7 @@ impl CallOutcome {
         Self {
             ty,
             overload_table: OverloadTable::default(),
+            argmap: ArgMap::new(),
         }
     }
 }
@@ -352,7 +350,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 range,
                 format!(
                     "`__new__` on `{}` resolves back to the same class, creating infinite recursion at runtime",
-                    cls.name()
+                    cls.name(self)
                 ),
                 ErrorKind::NotCallable,
                 context,
@@ -461,15 +459,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
             }
             Type::ClassDef(cls) => match self.instantiate(&cls) {
-                // `instantiate` can only return `ClassType` or `TypedDict`
+                // `instantiate` can only return `ClassType`
+                Type::ClassType(cls) if self.is_typed_dict_class(cls.class_object()) => {
+                    CallTargetLookup::Ok(Box::new(CallTarget::TypedDict(cls)))
+                }
                 Type::ClassType(cls) => CallTargetLookup::Ok(Box::new(CallTarget::Class(
                     cls,
                     ConstructorKind::BareClassName,
                     None,
                 ))),
-                Type::TypedDict(TypedDict::TypedDict(typed_dict)) => {
-                    CallTargetLookup::Ok(Box::new(CallTarget::TypedDict(typed_dict)))
-                }
                 _ => unreachable!(),
             },
             Type::SpecializedClassDef(cls) => CallTargetLookup::Ok(Box::new(CallTarget::Class(
@@ -580,7 +578,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     Type::ClassType(cls) => cls,
                                     Type::Tuple(tuple) => self.erase_tuple_type(tuple),
                                     ty => unreachable!(
-                                        "shape-extension upper-bound members materialize to builtin types, got `{ty}`"
+                                        "shape-extension upper-bound members materialize to builtin types, got `{}`",
+                                        ty.display_with(self)
                                     ),
                                 };
                                 CallTarget::Class(
@@ -640,7 +639,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
             }
             Type::Var(v) if let Some(_guard) = self.recurse(v) => self
-                .as_call_target_impl(self.solver().force_var(v), quantified)
+                .as_call_target_impl(self.solver().force_var(v, self), quantified)
                 .with_error_type(|_| Type::Var(v)),
             Type::Union(f) => {
                 let original = Type::Union(f.clone());
@@ -716,7 +715,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     };
                     callables.push(callable);
                 }
-                let combined = Type::combine_overload_results(callables, self.heap)
+                let combined = Type::combine_overload_results(callables, self.heap, self)
                     .expect("an overloaded type is never empty");
                 self.as_call_target_impl(combined, None)
                     .with_error_type(|_| original)
@@ -842,14 +841,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     None => CallTargetLookup::Error(Type::SelfType(cls), vec![]),
                 }
             }
-            Type::Type(f) if matches!(&*f, Type::TypedDict(TypedDict::TypedDict(_))) => {
-                let Type::TypedDict(TypedDict::TypedDict(typed_dict)) = *f else {
-                    unreachable!("guarded by matches! above")
-                };
-                CallTargetLookup::Ok(Box::new(CallTarget::TypedDict(typed_dict)))
-            }
-            Type::Type(ref f) if let Type::TypedDict(td @ TypedDict::Anonymous(_)) = &**f => {
-                let value_ty = self.get_typed_dict_value_type(td);
+            Type::Type(ref f) if let Type::AnonymousTypedDict(td) = &**f => {
+                let value_ty = td.compute_value_type(self.heap, self);
                 let cls = self
                     .stdlib
                     .dict(self.heap.mk_class_type(self.stdlib.str().clone()), value_ty);
@@ -896,10 +889,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     CallTargetLookup::Ok(Box::new(CallTarget::Union(targets)))
                 }
                 Restriction::ShapeExtension(extension) => self
-                    .as_call_target_impl(
-                        extension.upper_bound(self.stdlib, self.heap),
-                        Some((*q).clone()),
-                    )
+                    .as_call_target_impl(extension.upper_bound(self, self.heap), Some((*q).clone()))
                     .with_error_type(|_| Type::Quantified(q)),
             },
             Type::KwCall(call) => {
@@ -958,11 +948,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         {
             let header = format!(
                 "`{}` is deprecated",
-                metadata.kind.format(self.module().name())
+                metadata.kind.format(self, self.module().name())
             );
             let mut builder = if let Some(ctx) = context {
                 errors
-                    .error_builder(range, ErrorKind::Deprecated, ctx().format())
+                    .error_builder(range, ErrorKind::Deprecated, ctx().format(self))
                     .with_detail(header)
                     .without_deprecated_tag()
             } else {
@@ -1006,7 +996,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         range,
                         ErrorKind::NoAccess,
-                        error.to_error_msg(&dunder::CALL),
+                        error.to_error_msg(self, &dunder::CALL),
                     );
                     return CallTarget::Any(AnyStyle::Error);
                 }
@@ -1019,7 +1009,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 self.error_call_target(
                     errors,
                     range,
-                    format!("{}, got `{}`", expect_message, self.for_display(ty)),
+                    format!("{}, got `{}`", expect_message, self.display(ty)),
                     ErrorKind::NotCallable,
                     context,
                 )
@@ -1029,7 +1019,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 range,
                 format!(
                     "`__call__` on `{}` resolves back to the same type, creating infinite recursion at runtime",
-                    self.for_display(ty),
+                    self.display(ty),
                 ),
                 ErrorKind::NotCallable,
                 context,
@@ -1151,34 +1141,32 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         return_errors: &ErrorCollector,
         context: Option<&dyn Fn() -> ErrorContext>,
         hint: Option<HintRef>,
-    ) -> Option<Type> {
+    ) -> Option<CallOutcome> {
         let dunder_call = self.get_metaclass_dunder_call(cls)?;
         // Clone targs because we don't want instantiations from metaclass __call__
         let mut ctor_targs = cls.targs().clone();
-        let mut ret = self
-            .call_infer_with_callee_range(
-                self.as_call_target_or_error(
-                    dunder_call,
-                    CallStyle::Method(&dunder::CALL),
-                    arguments_range,
-                    errors,
-                    context,
-                ),
-                args,
-                keywords,
+        let mut ret = self.call_infer_with_callee_range(
+            self.as_call_target_or_error(
+                dunder_call,
+                CallStyle::Method(&dunder::CALL),
                 arguments_range,
-                None,
-                arg_errors,
                 errors,
-                return_errors,
                 context,
-                hint,
-                Some(&mut ctor_targs),
-            )
-            .ty;
+            ),
+            args,
+            keywords,
+            arguments_range,
+            None,
+            arg_errors,
+            errors,
+            return_errors,
+            context,
+            hint,
+            Some(&mut ctor_targs),
+        );
         self.solver()
             .finish_class_targs(&mut ctor_targs, self.uniques);
-        ret.subst_mut(&ctor_targs.substitution_map());
+        ret.ty.subst_mut(&ctor_targs.substitution_map());
         Some(ret)
     }
 
@@ -1204,14 +1192,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) {
         for error in errors_to_add.into_iter().unique() {
             match error {
-                ReturnTypeResolutionError::TypeLevelDsl(ShapeError::BadIndex { message }) => {
-                    self.error_with_context(errors, range, ErrorKind::BadIndex, message, context)
-                }
+                ReturnTypeResolutionError::TypeLevelDsl(ShapeError::BadIndex { message }) => self
+                    .error_with_context(
+                        errors,
+                        range,
+                        ErrorKind::BadIndex,
+                        message.display_with(self).to_string(),
+                        context,
+                    ),
                 ReturnTypeResolutionError::TypeLevelDsl(error) => self.error_with_context(
                     errors,
                     range,
                     ErrorKind::UnsupportedOperation,
-                    format!("Cannot evaluate type-level shape DSL call: {error}"),
+                    format!(
+                        "Cannot evaluate type-level shape DSL call: {}",
+                        error.display_with(self)
+                    ),
                     context,
                 ),
             };
@@ -1398,8 +1394,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 .collect::<Vec<_>>();
             let snapshot = self.solver().snapshot_exact_vars(&call_vars);
             let matched_hint = self.is_subset_eq(&self.heap.mk_class_type(cls.clone()), hint);
-            self.solver()
-                .generalize_class_targs_for_constructor_hint(cls.targs_mut(), &SmallSet::new());
+            self.solver().generalize_class_targs_for_constructor_hint(
+                cls.targs_mut(),
+                &SmallSet::new(),
+                self,
+            );
             self.solver().restore_vars(snapshot);
             (vs, matched_hint)
         } else {
@@ -1416,7 +1415,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let return_errors = self.error_collector();
         // The solutions the constructor call settled on.
         let mut ctor_table = None;
-        if let Some(ret) = self.call_metaclass(
+        let mut constructor_argmap = None;
+        if let Some(CallOutcome {
+            ty: ret, argmap, ..
+        }) = self.call_metaclass(
             &cls,
             arguments_range,
             args,
@@ -1427,6 +1429,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             context,
             hint,
         ) {
+            constructor_argmap = Some(argmap);
             if let Some(metaclass_dunder_call) = self.get_metaclass_dunder_call(&cls) {
                 if let Some(callee_range) = callee_range
                     && let Some(metaclass) = class_metadata.custom_metaclass()
@@ -1493,6 +1496,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let CallOutcome {
                     ty: ret,
                     overload_table,
+                    argmap,
                 } = self.call_infer_with_callee_range(
                     self.dunder_new_call_target(
                         new_method.clone(),
@@ -1513,6 +1517,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     hint,
                     Some(cls.targs_mut()),
                 );
+                // __new__ was checked against [cls, *args]. Constructor-specific checks
+                // consume args, so exclude the synthetic cls from their source input view.
+                constructor_argmap = Some(argmap.without_first_positional_argument());
                 if !overload_table.is_empty() {
                     ctor_table = Some(overload_table);
                 }
@@ -1571,6 +1578,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let dunder_init_errors = self.error_collector();
             let CallOutcome {
                 overload_table: init_table,
+                argmap,
                 ..
             } = self.call_infer_with_callee_range(
                 self.as_call_target_or_error(
@@ -1591,6 +1599,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 hint,
                 Some(cls.targs_mut()),
             );
+            constructor_argmap = Some(argmap);
             if !init_table.is_empty() {
                 ctor_table = Some(init_table);
             }
@@ -1613,11 +1622,29 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if class_metadata.is_pydantic_model()
             && let Some(dataclass) = class_metadata.dataclass_metadata()
         {
+            // Without a checked constructor call, an erased initializer needs one gradual pass.
+            let argmap = constructor_argmap.get_or_insert_with(|| {
+                self.call_infer(
+                    CallTarget::Callable(TargetWithTParams(
+                        None,
+                        Callable::list(ParamList::everything(), self.heap.mk_none()),
+                    )),
+                    args,
+                    keywords,
+                    arguments_range,
+                    &self.error_swallower(),
+                    None,
+                    None,
+                    None,
+                )
+                .argmap
+            });
             self.check_pydantic_argument_constraints(
                 cls.class_object(),
                 dataclass,
                 args,
                 keywords,
+                argmap,
                 &errors,
             );
         }
@@ -1638,7 +1665,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let result = if let Some(ctor_table) = ctor_table {
             self.finish_return(&ctor_table, result).0
         } else {
-            self.solver().expand(result)
+            self.solver().expand(result, self)
         };
         // Normalize builtins.tuple instances to structural Type::Tuple so downstream
         // match arms (concat, unpacking, except, etc.) handle them directly.
@@ -1672,7 +1699,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     fn construct_typed_dict(
         &self,
-        typed_dict: TypedDictInner,
+        typed_dict: ClassType,
         args: &[CallArg],
         keywords: &[CallKeyword],
         arguments_range: TextRange,
@@ -1707,7 +1734,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     fn construct_typed_dict_inner(
         &self,
-        mut typed_dict: TypedDictInner,
+        mut typed_dict: ClassType,
         args: &[CallArg],
         keywords: &[CallKeyword],
         arguments_range: TextRange,
@@ -1718,10 +1745,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let vs = self
                 .solver()
                 .freshen_class_targs(typed_dict.targs_mut(), self.uniques);
-            let matched_hint = self.is_subset_eq(&typed_dict.clone().to_type(self.heap), hint);
+            let matched_hint =
+                self.is_subset_eq(&self.heap.mk_class_type(typed_dict.clone()), hint);
             self.solver().generalize_class_targs_for_constructor_hint(
                 typed_dict.targs_mut(),
                 &SmallSet::new(),
+                self,
             );
             (vs, matched_hint)
         } else {
@@ -1757,7 +1786,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .finish_quantified(vs, self.solver().config.infer_with_first_use)
             .err();
         ConstructedInstance {
-            ty: Type::TypedDict(TypedDict::TypedDict(typed_dict)),
+            ty: Type::ClassType(typed_dict),
             matched_hint,
             arg_errors,
             return_errors,
@@ -1828,8 +1857,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::UnnecessaryTypeConversion,
                     format!(
                         "Unnecessary `{}()` call; argument is already of type `{}`",
-                        cls.name(),
-                        arg_ty.deterministic_printing(),
+                        cls.name(self),
+                        arg_ty.deterministic_printing().display_with(self),
                     ),
                 );
             }
@@ -1872,7 +1901,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::UnsupportedDynamicBase,
                 format!(
                     "Base class `{}` in `type()` call is not a statically known class",
-                    self.for_display(base_ty)
+                    self.display(base_ty)
                 ),
             );
         }
@@ -1902,7 +1931,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             && meta.flags.module_style == ModuleStyle::Executable
             && self.should_error_for_abstract_call(&call_target)
         {
-            let method_name = meta.kind.format(self.module().name());
+            let method_name = meta.kind.format(self, self.module().name());
             self.error_with_context(
                 errors,
                 arguments_range,
@@ -1933,7 +1962,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         call_errors,
                         arguments_range,
                         ErrorKind::BadInstantiation,
-                        format!("`{}` cannot be instantiated", cls.name()),
+                        format!("`{}` cannot be instantiated", cls.name(self)),
                         context,
                     ));
                 }
@@ -1949,7 +1978,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ErrorKind::BadInstantiation,
                         format!(
                             "Cannot instantiate `{}` because it is a protocol",
-                            cls.name()
+                            cls.name(self)
                         ),
                         context,
                     );
@@ -1964,7 +1993,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::BadInstantiation,
                             format!(
                                 "Cannot instantiate `{}` because the following members are abstract: {}",
-                                cls.name(),
+                                cls.name(self),
                                 unimplemented_abstract_methods
                                     .iter()
                                     .map(|x| format!("`{x}`"))
@@ -1980,7 +2009,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::DirectAbstractBaseInstantiation,
                             format!(
                                 "Cannot instantiate `{}` because it directly extends `ABC` or uses `ABCMeta`",
-                                cls.name()
+                                cls.name(self)
                             ),
                             context,
                         );
@@ -2046,7 +2075,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 signature,
                 Some(&metadata.kind),
                 tparams.as_deref(),
-                metadata.flags.unresolved_imports,
                 Some(obj),
                 args,
                 keywords,
@@ -2062,7 +2090,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 callable,
                 None,
                 tparams.as_deref(),
-                None,
                 None,
                 args,
                 keywords,
@@ -2084,7 +2111,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 callable,
                 Some(&metadata.kind),
                 tparams.as_deref(),
-                metadata.flags.unresolved_imports,
                 None,
                 args,
                 keywords,
@@ -2097,7 +2123,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ctor_targs,
             ),
             CallTarget::FunctionOverload(overloads, metadata) => {
-                let (ty, _callable, overload_table) = self.call_overloads(
+                let (ty, _callable, overload_table, argmap) = self.call_overloads(
                     overloads,
                     &metadata,
                     None,
@@ -2111,10 +2137,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     hint,
                     ctor_targs,
                 );
-                CallOutcome { ty, overload_table }
+                CallOutcome {
+                    ty,
+                    overload_table,
+                    argmap,
+                }
             }
             CallTarget::BoundMethodOverload(obj, overloads, meta) => {
-                let (ty, _callable, overload_table) = self.call_overloads(
+                let (ty, _callable, overload_table, argmap) = self.call_overloads(
                     overloads,
                     &meta,
                     Some(obj),
@@ -2128,15 +2158,20 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     hint,
                     ctor_targs,
                 );
-                CallOutcome { ty, overload_table }
+                CallOutcome {
+                    ty,
+                    overload_table,
+                    argmap,
+                }
             }
             CallTarget::Union(targets) => {
                 let call = CallWithTypes::new();
                 let args = call.vec_call_arg(args, self, errors);
                 let keywords = call.vec_call_keyword(keywords, self, errors);
+                let mut argmap = ArgMap::new();
                 let ty = self.unions(targets.into_map(|t| {
                     let ctor_targs = None; // hack
-                    self.call_infer_with_callee_range(
+                    let outcome = self.call_infer_with_callee_range(
                         t,
                         &args,
                         &keywords,
@@ -2148,10 +2183,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         context,
                         hint,
                         ctor_targs,
-                    )
-                    .ty
+                    );
+                    // Inputs were flattened before dispatch, so their types are shared.
+                    if argmap.arg_to_param.is_empty() {
+                        argmap = outcome.argmap;
+                    }
+                    outcome.ty
                 }));
-                CallOutcome::of_ty(ty)
+                CallOutcome {
+                    ty,
+                    overload_table: OverloadTable::default(),
+                    argmap,
+                }
             }
             CallTarget::Intersect(targets) => self.call_intersection(
                 targets,
@@ -2184,6 +2227,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let CallOutcome {
             ty: res,
             overload_table,
+            argmap,
         } = outcome;
         let res = if let Some((func_metadata, wrapped)) = wrapped_arg.as_ref()
             && func_metadata.kind == FunctionKind::FunctoolsWraps
@@ -2212,7 +2256,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if let Some(cls) = transformed {
                     let metadata = self.get_metadata_for_class(cls);
                     self.report_forbidden_dataclass_target(
-                        cls.name(),
+                        cls.name(self),
                         metadata.is_protocol(),
                         metadata.is_enum(),
                         metadata.is_typed_dict(),
@@ -2251,6 +2295,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         CallOutcome {
             ty: res,
             overload_table,
+            argmap,
         }
     }
 
@@ -2375,14 +2420,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             } else {
                 // Materialize each correlated world before its variable state is rolled back.
                 let results = self.solver().per_row(&outcome.overload_table, || {
-                    add_constructor_witnesses(self.solver().expand(outcome.ty.clone()), index)
+                    add_constructor_witnesses(self.solver().expand(outcome.ty.clone(), self), index)
                 });
-                let ty = Type::combine_overload_results(results.into_vec(), self.heap)
+                let ty = Type::combine_overload_results(results.into_vec(), self.heap, self)
                     .expect("an applicable call has at least one result");
                 let lambda_types = self
                     .snapshot_lambda_param_types()
                     .into_iter()
-                    .map(|(id, ty)| (id, ty.map(|ty| self.solver().expand(ty))))
+                    .map(|(id, ty)| (id, ty.map(|ty| self.solver().expand(ty, self))))
                     .collect::<Vec<_>>();
                 accepted.push(AcceptedIntersectionCall {
                     index,
@@ -2407,10 +2452,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::NoMatchingOverload,
                     "No intersection member accepts this call".to_owned(),
                 )
-                .with_context(context);
+                .with_context(self, context);
             for (index, arg_errors, attempt_errors, attempt_return_errors) in failures {
                 builder = builder
-                    .with_detail(format!("  {}", self.for_display(targets[index].ty.clone())))
+                    .with_detail(format!("  {}", self.display(targets[index].ty.clone())))
                     .with_errors_as_details(attempt_errors);
                 errors.extend(arg_errors);
                 return_errors.extend(attempt_return_errors);
@@ -2442,9 +2487,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             );
             if !targets[first_index].constructor_witnesses.is_empty() {
                 let results = self.solver().per_row(&outcome.overload_table, || {
-                    add_constructor_witnesses(self.solver().expand(outcome.ty.clone()), first_index)
+                    add_constructor_witnesses(
+                        self.solver().expand(outcome.ty.clone(), self),
+                        first_index,
+                    )
                 });
-                outcome.ty = Type::combine_overload_results(results.into_vec(), self.heap)
+                outcome.ty = Type::combine_overload_results(results.into_vec(), self.heap, self)
                     .expect("an applicable constructor has at least one result");
             }
             return outcome;
@@ -2465,10 +2513,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ctor_targs,
         );
         let first_results = self.solver().per_row(&first.overload_table, || {
-            add_constructor_witnesses(self.solver().expand(first.ty.clone()), first_index)
+            add_constructor_witnesses(self.solver().expand(first.ty.clone(), self), first_index)
         });
         accepted[representative].ty =
-            Type::combine_overload_results(first_results.into_vec(), self.heap)
+            Type::combine_overload_results(first_results.into_vec(), self.heap, self)
                 .expect("an applicable call has at least one result");
         let mut results = Vec::new();
         let mut lambda_types = SmallMap::new();
@@ -2551,121 +2599,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         })
     }
 
-    /// Probe input compatibility without committing its generic or contextual solutions.
-    pub(crate) fn unresolved_import_input_errors(
-        &self,
-        callable: &Callable,
-        tparams: Option<&TParams>,
-        self_obj: Option<&Type>,
-        args: &[CallArg],
-        keywords: &[CallKeyword],
-        range: TextRange,
-        original_args: &ArgMap,
-    ) -> Option<ErrorCollector> {
-        let mut probe = callable.clone();
-        let mut changed = false;
-        probe.params.visit_mut(&mut |ty| {
-            if ty.contains_missing_import() {
-                ty.transform_mut(&mut |ty| match ty {
-                    Type::Any(AnyStyle::MissingImport) => {
-                        *ty = self.heap.mk_never();
-                        changed = true;
-                    }
-                    Type::Union(union) => *ty = unions(union.members.clone(), self.heap),
-                    _ => {}
-                });
-            }
-        });
-        if !changed {
-            return None;
-        }
-        let mut vars = self.collect_placeholder_vars(self_obj, args, keywords);
-        // Captured signature variables need not occur in the receiver or argument types.
-        callable.visit(&mut |ty: &Type| vars.extend(ty.collect_all_vars()));
-        for param in original_args.arg_to_param.values() {
-            vars.extend(param.ty.collect_all_vars());
-        }
-        let roots: Vec<_> = vars.into_iter().map(|var| var.to_type(self.heap)).collect();
-        let snapshot = self
-            .solver()
-            .snapshot_reachable_vars(&roots.iter().collect::<Vec<_>>());
-        let lambda_snapshot = self.snapshot_lambda_param_types();
-        let errors = self.error_collector();
-        let (_, specialization_errors, _, probe_args, _, _) = self.callable_infer(
-            probe,
-            None,
-            tparams,
-            self_obj.cloned(),
-            args,
-            keywords,
-            range,
-            &self.error_swallower(),
-            &errors,
-            None,
-            None,
-            None,
-            None,
-        );
-        if let Ok(specialization_errors) = Vec1::try_from_vec(specialization_errors) {
-            self.add_specialization_errors(specialization_errors, range, &errors, None);
-        }
-        self.solver().restore_vars(snapshot);
-        self.restore_lambda_param_types(&lambda_snapshot);
-        // Gradual Any can match Never; a wholly unavailable input still supplies no match.
-        for (position, param) in &probe_args.arg_to_param {
-            if param.ty.is_never()
-                && original_args
-                    .arg_to_param
-                    .get(position)
-                    .is_some_and(|original| original.ty.contains_missing_import())
-            {
-                let parameter = param.name.as_ref().map_or_else(
-                    || "The positional parameter".to_owned(),
-                    |name| format!("Parameter `{name}`"),
-                );
-                // This private argument failure becomes a detail of the signature diagnostic.
-                self.error(
-                    &errors,
-                    range,
-                    ErrorKind::BadArgumentType,
-                    format!("{parameter} has no available input type"),
-                );
-            }
-        }
-        errors.has_hard().then_some(errors)
-    }
-
-    pub(crate) fn warn_unresolved_import_signature(
-        &self,
-        errors: &ErrorCollector,
-        range: TextRange,
-        input_errors: ErrorCollector,
-    ) {
-        // HashMap iteration is unordered. Canonical details let same-range diagnostics deduplicate.
-        let details = input_errors
-            .finish()
-            .iter()
-            .map(|error| error.msg_header().to_owned())
-            .sorted()
-            .dedup()
-            .collect();
-        errors
-            .error_builder(
-                range,
-                ErrorKind::UnresolvedImportSignature,
-                "Call uses a signature that depends on unresolved imports".to_owned(),
-            )
-            .with_details(details)
-            .emit();
-    }
-
     /// Wrapper for `callable_infer` that handles trying a call with and without a contextual hint.
     fn call_infer_inner(
         &self,
         callable: Callable,
         callable_name: Option<&FunctionKind>,
         tparams: Option<&TParams>,
-        declared_unresolved_imports: Option<bool>,
         self_obj: Option<Type>,
         args: &[CallArg],
         keywords: &[CallKeyword],
@@ -2677,20 +2616,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         hint: Option<HintRef>,
         ctor_targs: Option<&mut TArgs>,
     ) -> CallOutcome {
-        let signature_has_unresolved_imports = declared_unresolved_imports
-            .unwrap_or_else(|| callable.contains_unresolved_imports(tparams));
-        // Replaying nested calls can recursively double inference; bindings need their real context.
-        // Ordinary probes exclude both. Overload callers already prepare closed call arguments.
-        let reusable = |value: CallValue<'_>| match value.as_type_or_expr() {
-            TypeOrExpr::Type(..) => true,
-            TypeOrExpr::Expr(expr) => !nests_calls(expr, 1) && !contains_argument_bindings(expr),
-        };
-        let probe_inputs = signature_has_unresolved_imports
-            && args.iter().all(|arg| match arg {
-                CallArg::Arg(value) | CallArg::Star(value, _) => reusable(*value),
-            })
-            && keywords.iter().all(|keyword| reusable(keyword.value));
-        let unresolved_input = probe_inputs.then(|| (callable.clone(), self_obj.clone()));
         let hint = HintRef::filter_for_call(hint, tparams);
         let retry_input = hint.map(|_| (callable.clone(), self_obj.clone()));
         // First try the call without the hint to see if it succeeds.
@@ -2760,22 +2685,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     res_no_hint,
                 )
             };
-        let unresolved_import_errors = if !chosen_call_errors.has_hard() && chosen_res.1.is_empty()
-        {
-            unresolved_input.and_then(|(callable, self_obj)| {
-                self.unresolved_import_input_errors(
-                    &callable,
-                    tparams,
-                    self_obj.as_ref(),
-                    args,
-                    keywords,
-                    arguments_range,
-                    &chosen_res.3,
-                )
-            })
-        } else {
-            None
-        };
         call_errors.extend(chosen_call_errors);
         arg_errors.extend(chosen_arg_errors);
         if let Some(targs) = ctor_targs
@@ -2783,8 +2692,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         {
             *targs = chosen_targs;
         }
-        let (ty, specialization_errors, return_type_errors, _expected_types, _, overload_table) =
-            chosen_res;
+        let (ty, specialization_errors, return_type_errors, argmap, _, overload_table) = chosen_res;
         if let Ok(errors) = Vec1::try_from_vec(specialization_errors) {
             self.add_specialization_errors(errors, arguments_range, call_errors, context);
         }
@@ -2794,11 +2702,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return_errors,
             context,
         );
-        if let Some(input_errors) = unresolved_import_errors {
-            // Keep probe failures out of the real call's contextual typing and operator dispatch.
-            self.warn_unresolved_import_signature(return_errors, arguments_range, input_errors);
+        CallOutcome {
+            ty,
+            overload_table,
+            argmap,
         }
-        CallOutcome { ty, overload_table }
     }
 
     pub fn call_infer(
@@ -3028,7 +2936,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // 1. Its return type is not a subclass of the current class, or
             // 2. The class is an enum (enum construction is handled by EnumMeta.__call__).
             if metaclass_call_attr_ty
-                .callable_return_type(self.heap)
+                .callable_return_type(self.heap, self)
                 .is_some_and(|ret| !self.is_compatible_constructor_return(&ret, cls.class_object()))
             {
                 return metaclass_call_attr_ty;
@@ -3050,7 +2958,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .get_dunder_new(cls, false)
             .and_then(|t| self.bind_dunder_new(&t, cls.clone()));
         let (new_attr_ty, overrides_new) = if let Some(t) = bound_new {
-            if t.callable_return_type(self.heap)
+            if t.callable_return_type(self.heap, self)
                 .is_some_and(|ret| !self.is_compatible_constructor_return(&ret, cls.class_object()))
             {
                 // If the return type of __new__ is not a subclass of the current class, use that and ignore __init__
@@ -3258,7 +3166,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     &callee.expr.arguments.keywords,
                     errors,
                 );
-                match ty.callee_kind() {
+                match ty.callee_kind(self) {
                 Some(CalleeKind::Function(FunctionKind::AssertType)) => self
                     .call_assert_type(
                         &callee.expr.arguments.args,
@@ -3773,7 +3681,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // `builtins.enumerate` function form is accepted defensively for alternate stubs.
         let is_enumerate = matches!(ty, Type::ClassDef(cls) if cls.is(KnownClass::Enumerate))
             || matches!(
-                ty.callee_kind(),
+                ty.callee_kind(self),
                 Some(CalleeKind::Function(FunctionKind::Def(func)))
                     if func.has_toplevel_qname("builtins", "enumerate")
             );

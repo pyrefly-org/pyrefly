@@ -10,11 +10,13 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::BufWriter;
 use std::io::Write;
+use std::iter;
 use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
@@ -31,9 +33,13 @@ use std::time::Duration;
 use dupe::Dupe;
 use enum_iterator::Sequence;
 use fxhash::FxHashMap;
+use itertools::Either;
 use itertools::Itertools;
 use pyrefly_build::handle::Handle;
+use pyrefly_build::handle::SitePackagePath;
 use pyrefly_python::module::Module;
+use pyrefly_python::module_key::ExactModuleKey;
+use pyrefly_python::module_key::ModuleKey;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_python::module_path::ModulePathDetails;
@@ -76,6 +82,7 @@ use crate::alt::answers::AnswerTable;
 use crate::alt::answers::Answers;
 use crate::alt::answers::AnyAnswer;
 use crate::alt::answers::LookupAnswer;
+use crate::alt::answers::LookupModule;
 use crate::alt::answers::Solutions;
 use crate::alt::answers::SolutionsEntry;
 use crate::alt::answers::SolutionsTable;
@@ -148,7 +155,6 @@ use crate::state::subscriber::Subscriber;
 use crate::types::class::Class;
 use crate::types::class::ClassDefIndex;
 use crate::types::class::ClassFields;
-use crate::types::class::PrecomputedTParams;
 use crate::types::env::TypeEnv;
 use crate::types::function::Deprecation;
 use crate::types::stdlib::Stdlib;
@@ -180,12 +186,166 @@ pub struct ModuleDeps {
     pub names: SmallMap<Name, NameDep>,
     /// Do we depend on the wildcard export set?
     pub wildcard: bool,
-    /// Which classes do we depend on?
-    pub classes: SmallSet<ClassDefIndex>,
+    /// Which exported keys of classes, and which classes' declared fields (their rows in
+    /// `BindingsMetadata`), do we depend on?
+    pub classes: ClassReads,
     /// Which type aliases do we depend on?
     pub type_aliases: SmallSet<TypeAliasIndex>,
     /// Do we depend on module-level Django reverse relation metadata?
     pub django_relations: bool,
+}
+
+/// The exported keys of classes that a module read from another module, or that changed in a
+/// module, and the classes whose declared fields it read or that changed. Entries are packed into a
+/// `u64` each and kept sorted, with the class index in the high 32 bits:
+/// - for each class, one entry with a bit per kind of key below the top bit (`ClassReads::MRO`
+///   and the others), where `ClassReads::ROW` stands for the declared fields;
+/// - for each field key, one entry with the top bit set and a 31-bit hash of the field name.
+///
+/// Two sets share a read when they have entries for the same class whose kind bits intersect, or
+/// the same field entry. Two field names of a class with the same hash look like the same field;
+/// that can only rebuild a module that did not need to be rebuilt.
+///
+/// Inserting into the sorted `Vec` moves the entries after it, so it costs O(n) per insert. Sets
+/// hold about 3 entries on average; a module that reads hundreds of fields of one class is where
+/// this would show.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ClassReads(Vec<u64>);
+
+impl ClassReads {
+    const TPARAMS: u32 = 1 << 0;
+    const BASE_TYPE: u32 = 1 << 1;
+    const SYNTHESIZED_FIELDS: u32 = 1 << 2;
+    const VARIANCE: u32 = 1 << 3;
+    const METADATA: u32 = 1 << 4;
+    const MRO: u32 = 1 << 5;
+    const DISJOINT_BASE: u32 = 1 << 6;
+    const ABSTRACT_CLASS_CHECK: u32 = 1 << 7;
+    const SUBSCRIPT_SYMMETRY: u32 = 1 << 8;
+    /// The fields that the class declares.
+    const ROW: u32 = 1 << 9;
+    /// Set in the entry of a field key.
+    const FIELD: u64 = 1 << 31;
+
+    fn prefix(class: ClassDefIndex) -> u64 {
+        (class.0 as u64) << 32
+    }
+
+    fn class_of(entry: u64) -> u32 {
+        (entry >> 32) as u32
+    }
+
+    fn is_field(entry: u64) -> bool {
+        entry & Self::FIELD != 0
+    }
+
+    /// The position of the kinds entry of `class`, or where it would be.
+    fn kinds_position(&self, class: u32) -> (usize, bool) {
+        let i = self.0.partition_point(|&e| Self::class_of(e) < class);
+        let found = self
+            .0
+            .get(i)
+            .is_some_and(|&e| Self::class_of(e) == class && !Self::is_field(e));
+        (i, found)
+    }
+
+    fn insert_kinds(&mut self, class: ClassDefIndex, kinds: u32) {
+        match self.kinds_position(class.0) {
+            (i, true) => self.0[i] |= kinds as u64,
+            (i, false) => self.0.insert(i, Self::prefix(class) | kinds as u64),
+        }
+    }
+
+    fn insert_field(&mut self, class: ClassDefIndex, name: &Name) {
+        let hash = Hashed::new(name).hash().get() as u64;
+        let entry = Self::prefix(class) | Self::FIELD | (hash & (Self::FIELD - 1));
+        if let Err(i) = self.0.binary_search(&entry) {
+            self.0.insert(i, entry);
+        }
+    }
+
+    fn merge(&mut self, other: &ClassReads) {
+        if other.0.is_empty() {
+            return;
+        }
+        let mut merged = Vec::with_capacity(self.0.len() + other.0.len());
+        let (mut x, mut y) = (self.0.iter().peekable(), other.0.iter().peekable());
+        loop {
+            let next = match (x.peek(), y.peek()) {
+                (Some(&&a), Some(&&b))
+                    if Self::class_of(a) == Self::class_of(b)
+                        && !Self::is_field(a)
+                        && !Self::is_field(b) =>
+                {
+                    x.next();
+                    y.next();
+                    a | b
+                }
+                (Some(&&a), Some(&&b)) if a == b => {
+                    x.next();
+                    y.next();
+                    a
+                }
+                (Some(&&a), Some(&&b)) if a < b => {
+                    x.next();
+                    a
+                }
+                (_, Some(&&b)) => {
+                    y.next();
+                    b
+                }
+                (Some(&&a), None) => {
+                    x.next();
+                    a
+                }
+                (None, None) => break,
+            };
+            merged.push(next);
+        }
+        merged.shrink_to_fit();
+        self.0 = merged;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `self` and `other` share a read (see `ClassReads`).
+    fn intersects(&self, other: &ClassReads) -> bool {
+        let (small, large) = if self.0.len() <= other.0.len() {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        small.0.iter().any(|&e| {
+            if Self::is_field(e) {
+                large.0.binary_search(&e).is_ok()
+            } else {
+                match large.kinds_position(Self::class_of(e)) {
+                    (i, true) => large.0[i] & e & (Self::FIELD - 1) != 0,
+                    (_, false) => false,
+                }
+            }
+        })
+    }
+}
+
+impl Debug for ClassReads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|&e| {
+                if Self::is_field(e) {
+                    format!(
+                        "class {} field #{:x}",
+                        Self::class_of(e),
+                        e & (Self::FIELD - 1)
+                    )
+                } else {
+                    format!("class {} kinds {:#b}", Self::class_of(e), e as u32)
+                }
+            }))
+            .finish()
+    }
 }
 
 /// Per-module change tracking. Represents what changed in a module's exports.
@@ -238,7 +398,7 @@ pub enum ModuleDep {
     /// existence-level only; used by call sites that want every export
     /// without establishing per-name dependencies.
     EveryExportUntracked,
-    /// Depend on a class definition (fields, metadata, etc.).
+    /// Depend on the fields that a class declares, its row in `BindingsMetadata`.
     Class(ClassDefIndex),
 }
 
@@ -257,9 +417,15 @@ impl ModuleChanges {
             AnyExportedKey::KeyExport(k) => {
                 self.0.names.entry(k.0).or_default();
             }
-            // Classes, type aliases, and django relations don't distinguish between existence and change.
+            // Class keys, type aliases, and django relations don't distinguish between existence
+            // and change: a module that read the key is affected either way.
             _ => self.add_key(key),
         }
+    }
+
+    /// Record that the fields a class declares changed, or that the class was added or removed.
+    pub fn add_class_row(&mut self, class: ClassDefIndex) {
+        self.0.classes.insert_kinds(class, ClassReads::ROW);
     }
 
     /// Merge another `ModuleChanges` into this one, mutating in place.
@@ -301,7 +467,7 @@ impl ModuleChanges {
                 }
             }
         }
-        if self.0.classes.iter().any(|c| other.0.classes.contains(c)) {
+        if self.0.classes.intersects(&other.0.classes) {
             return true;
         }
         self.0
@@ -325,17 +491,36 @@ impl ModuleDeps {
             AnyExportedKey::KeyDjangoRelations(_) => {
                 self.django_relations = true;
             }
-            AnyExportedKey::KeyTParams(KeyTParams(c))
-            | AnyExportedKey::KeyClassBaseType(KeyClassBaseType(c))
-            | AnyExportedKey::KeyClassField(KeyClassField(c, _))
-            | AnyExportedKey::KeyClassSynthesizedFields(KeyClassSynthesizedFields(c))
-            | AnyExportedKey::KeyVariance(KeyVariance(c))
-            | AnyExportedKey::KeyClassMetadata(KeyClassMetadata(c))
-            | AnyExportedKey::KeyClassMro(KeyClassMro(c))
-            | AnyExportedKey::KeyClassDisjointBase(KeyClassDisjointBase(c))
-            | AnyExportedKey::KeyAbstractClassCheck(KeyAbstractClassCheck(c))
-            | AnyExportedKey::KeyClassSubscriptSymmetry(KeyClassSubscriptSymmetry(c)) => {
-                self.classes.insert(c);
+            AnyExportedKey::KeyClassField(KeyClassField(c, name)) => {
+                self.classes.insert_field(c, &name);
+            }
+            AnyExportedKey::KeyTParams(KeyTParams(c)) => {
+                self.classes.insert_kinds(c, ClassReads::TPARAMS);
+            }
+            AnyExportedKey::KeyClassBaseType(KeyClassBaseType(c)) => {
+                self.classes.insert_kinds(c, ClassReads::BASE_TYPE);
+            }
+            AnyExportedKey::KeyClassSynthesizedFields(KeyClassSynthesizedFields(c)) => {
+                self.classes.insert_kinds(c, ClassReads::SYNTHESIZED_FIELDS);
+            }
+            AnyExportedKey::KeyVariance(KeyVariance(c)) => {
+                self.classes.insert_kinds(c, ClassReads::VARIANCE);
+            }
+            AnyExportedKey::KeyClassMetadata(KeyClassMetadata(c)) => {
+                self.classes.insert_kinds(c, ClassReads::METADATA);
+            }
+            AnyExportedKey::KeyClassMro(KeyClassMro(c)) => {
+                self.classes.insert_kinds(c, ClassReads::MRO);
+            }
+            AnyExportedKey::KeyClassDisjointBase(KeyClassDisjointBase(c)) => {
+                self.classes.insert_kinds(c, ClassReads::DISJOINT_BASE);
+            }
+            AnyExportedKey::KeyAbstractClassCheck(KeyAbstractClassCheck(c)) => {
+                self.classes
+                    .insert_kinds(c, ClassReads::ABSTRACT_CLASS_CHECK);
+            }
+            AnyExportedKey::KeyClassSubscriptSymmetry(KeyClassSubscriptSymmetry(c)) => {
+                self.classes.insert_kinds(c, ClassReads::SUBSCRIPT_SYMMETRY);
             }
         }
     }
@@ -361,7 +546,7 @@ impl ModuleDeps {
                 self.wildcard = true;
             }
             ModuleDep::Class(idx) => {
-                self.classes.insert(idx);
+                self.classes.insert_kinds(idx, ClassReads::ROW);
             }
         }
     }
@@ -384,7 +569,7 @@ impl ModuleDeps {
                 }
             }
         }
-        self.classes.extend(other.classes);
+        self.classes.merge(&other.classes);
         self.type_aliases.extend(other.type_aliases);
         self.wildcard |= other.wildcard;
         self.django_relations |= other.django_relations;
@@ -430,7 +615,7 @@ impl ModuleDeps {
         if self.django_relations && changed.0.django_relations {
             return true;
         }
-        if self.classes.iter().any(|c| changed.0.classes.contains(c)) {
+        if self.classes.intersects(&changed.0.classes) {
             return true;
         }
         self.type_aliases
@@ -485,7 +670,7 @@ struct ModuleData {
     // Copy-on-write: shared with in-flight transactions until first write.
     // `clone_for_mutation` bumps the refcount instead of cloning the maps, so
     // modules that are loaded but never rebuilt pay no clone.
-    imports: Arc<HashMap<ModuleName, FindingOrError<ModulePath>, BuildNoHash>>,
+    imports: Arc<HashMap<ModuleName, FindingOrError<Handle>, BuildNoHash>>,
     deps: Arc<HashMap<Handle, ModuleDeps>>,
     rdeps: Arc<HashSet<Handle>>,
     /// Last-computed value of `tensor_shapes_available` for this module.
@@ -505,9 +690,9 @@ struct ModuleDataMut {
     /// Pre-rebuild data saved for diffing at the Solutions step.
     /// Populated during `clean()`, consumed during `demand()` at Solutions.
     old: Mutex<OldData>,
-    /// Import resolution cache: module names from import statements → resolved paths.
+    /// Import resolution cache: module names from import statements → resolved handles.
     /// Only contains deps that were resolved via `find_import`.
-    imports: RwLock<Arc<HashMap<ModuleName, FindingOrError<ModulePath>, BuildNoHash>>>,
+    imports: RwLock<Arc<HashMap<ModuleName, FindingOrError<Handle>, BuildNoHash>>>,
     /// All forward dependencies keyed by Handle.
     /// Invariant: If deps contains h2, then h2.rdeps.contains(self.handle).
     /// To ensure atomicity, rdeps is modified while holding the deps write lock.
@@ -595,7 +780,9 @@ impl ModuleDataMut {
 struct StateData {
     stdlib: SmallMap<SysInfo, Arc<Stdlib>>,
     modules: HashMap<Handle, ModuleData>,
-    loaders: SmallMap<ArcId<ConfigFile>, Arc<LoaderFindCache>>,
+    /// Keyed by config and by the Python environment that the loader resolves imports in, if it
+    /// is not the config's own.
+    loaders: SmallMap<(ArcId<ConfigFile>, Option<SitePackagePath>), Arc<LoaderFindCache>>,
     /// The contents for ModulePath::memory values
     memory: MemoryFiles,
     /// The current epoch, gets incremented every time we recompute
@@ -693,7 +880,7 @@ pub(crate) struct TransactionData<'a> {
     state: &'a State,
     stdlib: SmallMap<SysInfo, Arc<Stdlib>>,
     updated_modules: LockedMap<Handle, ArcId<ModuleDataMut>>,
-    updated_loaders: LockedMap<ArcId<ConfigFile>, Arc<LoaderFindCache>>,
+    updated_loaders: LockedMap<(ArcId<ConfigFile>, Option<SitePackagePath>), Arc<LoaderFindCache>>,
     memory_overlay: MemoryFilesOverlay,
     default_require: Require,
     /// The epoch when this transaction was created
@@ -959,7 +1146,11 @@ impl<'a> Transaction<'a> {
 
     /// Look up the `ClassFields` for a class, which may be defined in another module.
     pub fn get_class_fields(&self, source_handle: &Handle, class: &Class) -> Option<ClassFields> {
-        let handle = source_handle.for_module(class.module_name(), class.module_path().dupe());
+        let handle = self.imported_handle(
+            source_handle,
+            class.module_name(),
+            class.module_path().dupe(),
+        );
         Some(
             self.get_bindings_metadata(&handle)?
                 .get_class_checked(class.index())?
@@ -1026,70 +1217,32 @@ impl<'a> Transaction<'a> {
         )
     }
 
-    pub fn get_all_errors(&self) -> Errors {
-        if self.data.updated_modules.is_empty() {
-            // Optimized path
-            return Errors::new(
-                self.readable
-                    .modules
-                    .values()
-                    .filter_map(|x| {
-                        let load = x.state.get_load()?;
-                        let parse_errors = x.state.parse_errors();
-                        let binding_errors = x.state.binding_errors();
-                        let solve_diagnostics = x.state.solve_errors();
-                        let module_ranges = x.state.module_ranges();
-                        Some((
-                            load,
-                            parse_errors,
-                            binding_errors,
-                            solve_diagnostics,
-                            module_ranges,
-                            x.config.dupe(),
-                        ))
-                    })
-                    .collect(),
-            );
-        }
-        let mut res = self
-            .data
-            .updated_modules
-            .iter_unordered()
-            .filter_map(|x| {
-                let load = x.1.state.get_load()?;
-                let parse_errors = x.1.state.parse_errors();
-                let binding_errors = x.1.state.binding_errors();
-                let solve_diagnostics = x.1.state.solve_errors();
-                let module_ranges = x.1.state.module_ranges();
-                Some((
-                    load,
-                    parse_errors,
-                    binding_errors,
-                    solve_diagnostics,
-                    module_ranges,
-                    x.1.config.read().dupe(),
-                ))
+    /// The loaded handles, one per file. A file checked in several Python environments has a
+    /// handle for each, which differ only in the importer's site-package path. Keep the handle of
+    /// the file's own environment if it was checked there, or one importer's copy otherwise.
+    pub fn loaded_handles_one_per_file(&self) -> Vec<Handle> {
+        let file = |handle: &Handle| {
+            (
+                handle.module(),
+                handle.path().dupe(),
+                handle.sys_info().dupe(),
+            )
+        };
+        self.handles()
+            .into_iter()
+            .filter(|handle| self.get_load(handle).is_some())
+            // Put each file's handles together, with the handle of its own environment first.
+            .sorted_by(|a, b| {
+                (file(a), a.importer_site_package_path().is_some())
+                    .cmp(&(file(b), b.importer_site_package_path().is_some()))
             })
-            .collect::<Vec<_>>();
-        for (k, v) in self.readable.modules.iter() {
-            if self.data.updated_modules.get(k).is_none()
-                && let Some(load) = v.state.get_load()
-            {
-                let parse_errors = v.state.parse_errors();
-                let binding_errors = v.state.binding_errors();
-                let solve_diagnostics = v.state.solve_errors();
-                let module_ranges = v.state.module_ranges();
-                res.push((
-                    load,
-                    parse_errors,
-                    binding_errors,
-                    solve_diagnostics,
-                    module_ranges,
-                    v.config.dupe(),
-                ));
-            }
-        }
-        Errors::new(res)
+            .dedup_by(|a, b| file(a) == file(b))
+            .collect()
+    }
+
+    /// The errors of every loaded module, reporting each file once.
+    pub fn get_all_errors(&self) -> Errors {
+        self.get_errors(&self.loaded_handles_one_per_file())
     }
 
     pub fn config_finder(&self) -> &ConfigFinder {
@@ -1186,7 +1339,8 @@ impl<'a> Transaction<'a> {
         self.get_load(handle).map(|x| x.module_info.dupe())
     }
 
-    /// Return the modules that directly depend on this one.
+    /// Return the modules that directly depend on this one, or on any copy of it checked in
+    /// another Python environment.
     ///
     /// A dependency edge means the depending module's result was computed from
     /// this file's contents, which is exactly the question safe deletion asks,
@@ -1203,22 +1357,57 @@ impl<'a> Transaction<'a> {
     /// has open look unused.
     pub fn get_rdeps(&self, handle: &Handle) -> HashSet<Handle> {
         let path = handle.path().as_path();
-        self.get_module(handle)
-            .rdeps
-            .lock()
-            .iter()
-            .filter(|rdep| rdep.path().as_path() != path)
-            .cloned()
+        let mut rdeps = HashSet::new();
+        for copy in self.copies(handle) {
+            rdeps.extend(
+                self.get_module(&copy)
+                    .rdeps
+                    .lock()
+                    .iter()
+                    .filter(|rdep| rdep.path().as_path() != path)
+                    .cloned(),
+            );
+        }
+        rdeps
+    }
+
+    /// `handle` and the handles this transaction holds for the same module checked in other
+    /// Python environments. This is one lookup per interned site-package path, rather than a scan
+    /// of every module. The interner is global, so it can hold paths that no module here uses.
+    fn copies(&self, handle: &Handle) -> Vec<Handle> {
+        iter::once(None)
+            .chain(SitePackagePath::all().map(Some))
+            .map(|path| handle.dupe().with_importer_site_package_path(path))
+            .filter(|copy| copy == handle || self.get_require(copy).is_some())
             .collect()
     }
 
+    /// The handle of the module `module` at `path`, looked up from `importer`. Every lookup from
+    /// `importer` into another module uses it, whether or not `importer` imports that module, so
+    /// that all of them reach the same module.
+    pub fn imported_handle(
+        &self,
+        importer: &Handle,
+        module: ModuleName,
+        path: ModulePath,
+    ) -> Handle {
+        let config = self
+            .get_config(importer)
+            .unwrap_or_else(|| self.data.state.get_config(importer));
+        self.data
+            .state
+            .imported_handle_with_config(importer, &config, module, path)
+    }
+
     /// Compute transitive dependency closure for the given handle.
+    /// The closure starts from every copy of the module checked in another Python environment,
+    /// since each copy has its own dependents.
     /// Note that for IDE services, if the given handle is an in-memory one, then you are probably
     /// not getting what you want, because the set of rdeps of in-memory file for IDE service will
     /// only contain itself.
     pub fn get_transitive_rdeps(&self, handle: Handle) -> HashSet<Handle> {
         let mut transitive_rdeps = HashSet::new();
-        let mut work_list = vec![handle];
+        let mut work_list = self.copies(&handle);
         while let Some(handle) = work_list.pop() {
             if !transitive_rdeps.insert(handle.dupe()) {
                 continue;
@@ -1329,13 +1518,18 @@ impl<'a> Transaction<'a> {
         module: ModuleName,
         path: Option<&ModulePath>,
     ) -> FindingOrError<Handle> {
+        let config = self.get_module(handle).config.read().dupe();
         let path = match path {
             Some(path) => FindingOrError::new_finding(path.dupe()),
             None => self
-                .get_cached_loader(&self.get_module(handle).config.read())
+                .get_cached_loader(&config, handle.importer_site_package_path())
                 .find_import(module, Some(handle.path()), Some(&self.timing)),
         };
-        path.map(|path| Handle::new(module, path, handle.sys_info().dupe()))
+        path.map(|path| {
+            self.data
+                .state
+                .imported_handle_with_config(handle, &config, module, path)
+        })
     }
 
     /// Create a handle for source lookup, including modules replaced with `Any`.
@@ -1347,7 +1541,8 @@ impl<'a> Transaction<'a> {
         fallback_style: Option<ModuleStyle>,
         include_interpreter_stdlib: bool,
     ) -> FindingOrError<Handle> {
-        self.get_cached_loader(&self.get_module(handle).config.read())
+        let config = self.get_module(handle).config.read().dupe();
+        self.get_cached_loader(&config, handle.importer_site_package_path())
             .find_import_including_replaced(
                 module,
                 Some(handle.path()),
@@ -1356,7 +1551,11 @@ impl<'a> Transaction<'a> {
                 include_interpreter_stdlib,
                 Some(&self.timing),
             )
-            .map(|path| Handle::new(module, path, handle.sys_info().dupe()))
+            .map(|path| {
+                self.data
+                    .state
+                    .imported_handle_with_config(handle, &config, module, path)
+            })
     }
 
     /// Create a handle for import `module` within the handle `handle`, preferring `.py` over `.pyi`
@@ -1367,10 +1566,11 @@ impl<'a> Transaction<'a> {
         path: Option<&ModulePath>,
         include_interpreter_stdlib: bool,
     ) -> FindingOrError<Handle> {
+        let config = self.get_module(handle).config.read().dupe();
         let path = match path {
             Some(path) => FindingOrError::new_finding(path.dupe()),
             None => self
-                .get_cached_loader(&self.get_module(handle).config.read())
+                .get_cached_loader(&config, handle.importer_site_package_path())
                 .find_import_prefer_executable(
                     module,
                     Some(handle.path()),
@@ -1378,7 +1578,11 @@ impl<'a> Transaction<'a> {
                     Some(&self.timing),
                 ),
         };
-        path.map(|path| Handle::new(module, path, handle.sys_info().dupe()))
+        path.map(|path| {
+            self.data
+                .state
+                .imported_handle_with_config(handle, &config, module, path)
+        })
     }
 
     /// Create a handle for import `module` within the handle `handle`
@@ -1479,18 +1683,29 @@ impl<'a> Transaction<'a> {
 
         // Validate the find flag.
         if dirty.find() {
-            let loader = self.get_cached_loader(&module_data.config.read());
+            let config = module_data.config.read().dupe();
+            let loader =
+                self.get_cached_loader(&config, module_data.handle.importer_site_package_path());
             let mut is_dirty = false;
 
             // Only check imports (not all deps), since only import-statement deps
-            // need `find_import` re-validation. The cached value is the same type
-            // returned by `find_import`, so we just compare for equality.
+            // need `find_import` re-validation. The cache holds the handle built from
+            // the result of `find_import`, so we rebuild it and compare.
             for (module_name, cached) in module_data.imports.read().iter() {
-                let fresh = loader.find_import(
-                    *module_name,
-                    Some(module_data.handle.path()),
-                    Some(&self.timing),
-                );
+                let fresh = loader
+                    .find_import(
+                        *module_name,
+                        Some(module_data.handle.path()),
+                        Some(&self.timing),
+                    )
+                    .map(|path| {
+                        self.data.state.imported_handle_with_config(
+                            &module_data.handle,
+                            &config,
+                            *module_name,
+                            path,
+                        )
+                    });
                 if *cached != fresh {
                     is_dirty = true;
                     break;
@@ -1716,6 +1931,19 @@ impl<'a> Transaction<'a> {
                     .state
                     .get_solutions()
                     .expect("solutions must exist after computing Solutions");
+                // Class rows: the fields each class declares, which other modules read through
+                // `get_class_fields` rather than through an exported key. Without old answers or
+                // solutions, no module could have read them.
+                let old_metadata = match (&old_solutions, &old_answers) {
+                    (Some(solutions), _) => Some(solutions.metadata().dupe()),
+                    (None, Some(answers)) => Some(answers.bindings().metadata().dupe()),
+                    (None, None) => None,
+                };
+                if let Some(old_metadata) = old_metadata {
+                    for class in old_metadata.changed_class_rows(new_solutions.metadata()) {
+                        changed.add_class_row(class);
+                    }
+                }
                 if let Some(old_sol) = old_solutions {
                     old_sol.changed_exports(&new_solutions, &mut changed);
                 } else if let Some(old_ans) = old_answers {
@@ -1950,17 +2178,17 @@ impl<'a> Transaction<'a> {
             return None;
         };
         let class = class.dupe();
-        let tparams = match class.precomputed_tparams() {
-            PrecomputedTParams::NotGeneric => None,
-            PrecomputedTParams::FromBinding => self
-                .lookup_answer(
-                    module_data,
-                    &KeyTParams(class.index()),
-                    thread_state,
-                    &answer_scope,
-                )
-                .map(Dupe::dupe),
-            PrecomputedTParams::Precomputed(tparams) => Some(tparams.dupe()),
+        let tparams = if class.has_tparams() {
+            self.lookup_answer(
+                module_data,
+                &KeyTParams(class.index()),
+                thread_state,
+                &answer_scope,
+            )
+            .filter(|tparams| !tparams.is_empty())
+            .map(Dupe::dupe)
+        } else {
+            None
         };
         Some((class, tparams))
     }
@@ -1989,11 +2217,17 @@ impl<'a> Transaction<'a> {
             }
             ExportLocation::OtherModule(other_module, alias) => {
                 let actual_name = alias.as_ref().unwrap_or(name);
-                let loader = self.get_cached_loader(&module_data.config.read());
-                let other_path = loader
+                let config = module_data.config.read().dupe();
+                let other_path = self
+                    .get_cached_loader(&config, handle.importer_site_package_path())
                     .find_import(*other_module, Some(handle.path()), Some(&self.timing))
                     .finding()?;
-                let other_handle = Handle::new(*other_module, other_path, handle.sys_info().dupe());
+                let other_handle = self.data.state.imported_handle_with_config(
+                    handle,
+                    &config,
+                    *other_module,
+                    other_path,
+                );
                 self.lookup_export_location(&other_handle, actual_name)
             }
         }
@@ -2059,12 +2293,22 @@ impl<'a> Transaction<'a> {
         MemoryFilesLookup::new(&self.readable.memory, &self.data.memory_overlay)
     }
 
-    fn get_cached_loader(&self, loader: &ArcId<ConfigFile>) -> Arc<LoaderFindCache> {
+    /// The loader for `config`, resolving imports in the Python environment with site-package path
+    /// `site_package_path` if one is given, or in `config`'s own otherwise.
+    fn get_cached_loader(
+        &self,
+        config: &ArcId<ConfigFile>,
+        site_package_path: Option<SitePackagePath>,
+    ) -> Arc<LoaderFindCache> {
+        let key = (config.dupe(), site_package_path);
         self.data
             .updated_loaders
-            .ensure(loader, || match self.readable.loaders.get(loader) {
+            .ensure(&key, || match self.readable.loaders.get(&key) {
                 Some(v) => v.dupe(),
-                None => Arc::new(LoaderFindCache::new(loader.dupe())),
+                None => Arc::new(LoaderFindCache::new_in_environment(
+                    config,
+                    site_package_path,
+                )),
             })
             .0
             .dupe()
@@ -2076,7 +2320,7 @@ impl<'a> Transaction<'a> {
         handle: &Handle,
         timing: Option<&TransactionTimingCounters>,
     ) -> bool {
-        self.get_cached_loader(config)
+        self.get_cached_loader(config, handle.importer_site_package_path())
             .find_import_for_tensor_shapes(Some(handle.path()), timing)
             .finding()
             // This is Pyrefly resolvability, not runtime importability: a
@@ -2145,7 +2389,7 @@ impl<'a> Transaction<'a> {
             stdlib_config.python_environment.python_version = Some(k.version());
             stdlib_config.configure();
             let stdlib_config = ArcId::new(stdlib_config);
-            let loader = self.get_cached_loader(&stdlib_config);
+            let loader = self.get_cached_loader(&stdlib_config, None);
             self.data
                 .stdlib
                 .insert_hashed(k.to_owned(), Arc::new(Stdlib::for_bootstrapping()));
@@ -2530,11 +2774,19 @@ impl<'a> Transaction<'a> {
     /// E.g. you have include paths, and a new file appeared earlier on the path.
     fn invalidate_find(&mut self) {
         let new_loaders = LockedMap::new();
-        for loader in self.data.updated_loaders.keys() {
-            new_loaders.insert(loader.dupe(), Arc::new(LoaderFindCache::new(loader.dupe())));
-        }
-        for loader in self.readable.loaders.keys() {
-            new_loaders.insert(loader.dupe(), Arc::new(LoaderFindCache::new(loader.dupe())));
+        for (config, site_package_path) in self
+            .data
+            .updated_loaders
+            .keys()
+            .chain(self.readable.loaders.keys())
+        {
+            new_loaders.insert(
+                (config.dupe(), *site_package_path),
+                Arc::new(LoaderFindCache::new_in_environment(
+                    config,
+                    *site_package_path,
+                )),
+            );
         }
         self.data.updated_loaders = new_loaders;
 
@@ -2602,13 +2854,17 @@ impl<'a> Transaction<'a> {
             .updated_loaders
             .iter_unordered()
             .chain(self.readable.loaders.iter())
-            .filter(|(c, _)| !configs.contains(*c))
-            .for_each(|(c, l)| {
-                new_loaders.insert(c.dupe(), l.dupe());
+            .for_each(|((config, site_package_path), loader)| {
+                let loader = if configs.contains(config) {
+                    Arc::new(LoaderFindCache::new_in_environment(
+                        config,
+                        *site_package_path,
+                    ))
+                } else {
+                    loader.dupe()
+                };
+                new_loaders.insert((config.dupe(), *site_package_path), loader);
             });
-        configs.iter().for_each(|config| {
-            new_loaders.insert(config.dupe(), Arc::new(LoaderFindCache::new(config.dupe())));
-        });
         self.data.updated_loaders = new_loaders;
 
         // Then mark all handles under that config as dirty.
@@ -2866,7 +3122,10 @@ impl<'a> Transaction<'a> {
         let answers = self
             .get_answers(handle)
             .expect("answers must be available to build cinderx_solutions");
-        crate::report::cinderx::CinderxSolutions::build_from_answers(&answers)
+        crate::report::cinderx::CinderxSolutions::build_from_answers(
+            &answers,
+            &self.type_env(handle),
+        )
     }
 }
 
@@ -2880,7 +3139,8 @@ impl<'a> Transaction<'a> {
 /// env is not `Sync`.
 pub struct TransactionTypeEnv<'a> {
     transaction: &'a Transaction<'a>,
-    /// The module this env was created for. Other modules are looked up with its `SysInfo`.
+    /// The module this env was created for. Other modules are looked up with the handles it gets
+    /// for them.
     handle: Handle,
     stdlib: Arc<Stdlib>,
     thread_state: ThreadState,
@@ -2893,22 +3153,20 @@ impl TypeEnv for TransactionTypeEnv<'_> {
     }
 
     fn class_tparams<'b>(&'b self, cls: &'b Class) -> &'b TParams {
-        let key = match cls.precomputed_tparams() {
-            PrecomputedTParams::NotGeneric => return TParams::empty_ref(),
-            PrecomputedTParams::Precomputed(tparams) => return tparams,
-            PrecomputedTParams::FromBinding => KeyTParams(cls.index()),
-        };
-        let handle = Handle::new(
+        if !cls.has_tparams() {
+            return TParams::empty_ref();
+        }
+        let handle = self.transaction.imported_handle(
+            &self.handle,
             cls.module_name(),
             cls.module_path().dupe(),
-            self.handle.sys_info().dupe(),
         );
         // There is no answer only if the class's module was rebuilt without this class, in which
         // case the solver also treats the class as having no type parameters.
         self.transaction
             .lookup_answer(
                 self.transaction.get_module(&handle),
-                &key,
+                &KeyTParams(cls.index()),
                 &self.thread_state,
                 &self.answer_scope,
             )
@@ -2921,12 +3179,15 @@ pub(crate) struct TransactionHandle<'a> {
     module_data: &'a ArcId<ModuleDataMut>,
     /// Locally accumulated deps, flushed to `module_data.deps` on drop.
     /// This batches N lock acquisitions per handle lifetime into 1.
-    /// Keyed by module name and path, which identify the target module within a
-    /// TransactionHandle because sys_info is invariant. Both are needed: one file can
-    /// be imported under several module names, and each name is a distinct module.
+    /// Keyed by the exact module name and path, which identify the target module within a
+    /// TransactionHandle because sys_info and the importer's Python environment are
+    /// invariant. Both are needed: one file can be imported under several module names,
+    /// and each name is a distinct module. The key is exact, so the in-memory and on-disk
+    /// versions of one file are separate entries.
     /// Each entry also remembers the target module, so that repeated lookups of
-    /// the same module skip the transaction's shared module map.
-    deferred_deps: RefCell<FxHashMap<(ModuleName, ModulePath), DeferredDeps<'a>>>,
+    /// the same module skip the transaction's shared module map and do not build the
+    /// target's handle again.
+    deferred_deps: RefCell<FxHashMap<ExactModuleKey, DeferredDeps<'a>>>,
     /// Cache of cross-module `BindingsMetadata` for class field lookups.
     /// Keyed by `ArcId::id()` (pointer-as-usize) to avoid atomic refcount
     /// operations and to get a cheap 8-byte hash key.
@@ -2970,50 +3231,63 @@ enum TargetAnswers<'a> {
 impl<'a> TransactionHandle<'a> {
     fn get_module(
         &self,
-        module: ModuleName,
-        path: Option<&ModulePath>,
+        module: LookupModule,
         dep: ModuleDep,
     ) -> FindingOrError<&'a ArcId<ModuleDataMut>> {
-        let resolve = move |path: &ModulePath| {
+        // `handle` builds the target's handle. It runs only when the target has no entry yet.
+        let resolve = move |key: ModuleKey, handle: &dyn Fn() -> Handle| {
             let mut deferred_deps = self.deferred_deps.borrow_mut();
-            let deferred = deferred_deps
-                .entry((module, path.dupe()))
-                .or_insert_with(|| {
-                    let handle = Handle::new(
-                        module,
-                        path.dupe(),
-                        self.module_data.handle.sys_info().dupe(),
-                    );
-                    let module_data = self.transaction.get_imported_module(&handle);
-                    DeferredDeps {
-                        handle,
-                        module_data,
-                        deps: ModuleDeps::default(),
-                    }
-                });
+            let deferred = deferred_deps.entry(key.exact()).or_insert_with(|| {
+                let handle = handle();
+                let module_data = self.transaction.get_imported_module(&handle);
+                DeferredDeps {
+                    handle,
+                    module_data,
+                    deps: ModuleDeps::default(),
+                }
+            });
             deferred.deps.add_dep(dep);
             deferred.module_data
         };
-        match path {
-            // Explicit path — already resolved. Bypass imports entirely. Most lookups take this
+        let imported_handle = |config: &ConfigFile, module: ModuleName, path: ModulePath| {
+            self.transaction.data.state.imported_handle_with_config(
+                &self.module_data.handle,
+                config,
+                module,
+                path,
+            )
+        };
+        match module {
+            // Explicit module — already resolved. Bypass imports entirely. Most lookups take this
             // path, so it resolves directly rather than through a `FindingOrError`.
-            Some(path) => FindingOrError::new_finding(resolve(path)),
-            None => {
-                // No path — needs find_import. Check imports cache first.
+            LookupModule::Exact(key) => FindingOrError::new_finding(resolve(key, &|| {
+                imported_handle(
+                    &self.module_data.config.read(),
+                    key.name(),
+                    key.path().dupe(),
+                )
+            })),
+            LookupModule::Import(module) => {
+                // Resolve the import with find_import, checking the imports cache first.
                 let imports_read = self.module_data.imports.read();
-                let path = match imports_read.get(&module) {
-                    Some(path) => path.dupe(),
+                let handle = match imports_read.get(&module) {
+                    Some(handle) => handle.dupe(),
                     None => {
                         drop(imports_read);
                         let fi_start = Timer::start();
+                        let config = self.module_data.config.read().dupe();
                         let finding = self
                             .transaction
-                            .get_cached_loader(&self.module_data.config.read())
+                            .get_cached_loader(
+                                &config,
+                                self.module_data.handle.importer_site_package_path(),
+                            )
                             .find_import(
                                 module,
                                 Some(self.module_data.handle.path()),
                                 Some(self.transaction.timing()),
-                            );
+                            )
+                            .map(|path| imported_handle(&config, module, path));
                         let fi_ns = fi_start.elapsed().as_nanos() as u64;
                         self.transaction
                             .timing()
@@ -3028,7 +3302,8 @@ impl<'a> TransactionHandle<'a> {
                         finding
                     }
                 };
-                path.map(|path| resolve(&path))
+                handle
+                    .map(|handle| resolve(ModuleKey::new(module, handle.path()), &|| handle.dupe()))
             }
         }
     }
@@ -3041,7 +3316,9 @@ impl<'a> TransactionHandle<'a> {
         dep: ModuleDep,
     ) -> Option<T> {
         let label = dep.demand_label();
-        let module_data = self.get_module(module, None, dep).finding()?;
+        let module_data = self
+            .get_module(LookupModule::Import(module), dep)
+            .finding()?;
         self.transaction.record_demand_exports_event(
             self.module_data.handle.module(),
             module,
@@ -3069,13 +3346,14 @@ impl<'a> TransactionHandle<'a> {
     /// enum so callers only need to handle the "answers available" case.
     fn lookup_target_answers(&self, calc_id: &CalcId) -> TargetAnswers<'a> {
         let bindings = calc_id.bindings();
-        let module = bindings.module().name();
-        let path = bindings.module().path();
 
         // Look up the target module. Use default ModuleDep since cross-module
         // operations don't establish new dependencies.
         let module_data = match self
-            .get_module(module, Some(path), ModuleDep::Exists)
+            .get_module(
+                LookupModule::Exact(bindings.module().key()),
+                ModuleDep::Exists,
+            )
             .finding()
         {
             Some(data) => data,
@@ -3193,7 +3471,7 @@ impl<'a> LookupExport for TransactionHandle<'a> {
         // the incremental change-detection path only kicks in for
         // modules that have a stored Load result, so we demand Load
         // here to keep file edits to the target observable.
-        self.get_module(module, None, ModuleDep::Exists)
+        self.get_module(LookupModule::Import(module), ModuleDep::Exists)
             .map(|module_data| {
                 self.transaction.record_demand_load_event(
                     self.module_data.handle.module(),
@@ -3402,8 +3680,7 @@ impl<'a> LookupExport for TransactionHandle<'a> {
 impl<'a> LookupAnswer for TransactionHandle<'a> {
     fn get<'answer, K: Solve<Self> + Exported>(
         &self,
-        module: ModuleName,
-        path: Option<&ModulePath>,
+        module: LookupModule,
         k: &K,
         thread_state: &'answer ThreadState,
         answer_scope: &'answer AnswerScope,
@@ -3416,21 +3693,24 @@ impl<'a> LookupAnswer for TransactionHandle<'a> {
         // The unwrap is safe because we must have said there were no exports,
         // so no one can be trying to get at them
         let module_data = self
-            .get_module(module, path, ModuleDep::Key(k.to_anykey()))
+            .get_module(module, ModuleDep::Key(k.to_anykey()))
             .finding()
             .unwrap();
         // Hold the span guard for the duration of the lookup so that a panic
         // inside `lookup_answer` still closes the span (keeping the per-thread
         // demand stack balanced on this worker for subsequent demands).
-        let _demand_span =
-            self.transaction
-                .enter_demand_answer_span(self.module_data.handle.module(), module, k);
+        let _demand_span = self.transaction.enter_demand_answer_span(
+            self.module_data.handle.module(),
+            module.name(),
+            k,
+        );
         let res = self
             .transaction
             .lookup_answer(module_data, k, thread_state, answer_scope);
         if res.is_none() {
             let msg = format!(
-                "LookupAnswer::get failed to find key, {module} {k:?} (concurrent changes?)"
+                "LookupAnswer::get failed to find key, {} {k:?} (concurrent changes?)",
+                module.name()
             );
             if self.transaction.data.state.run_count.load(Ordering::SeqCst) <= 1 {
                 // We failed to find the key, but we are the only one running, and have never had any invalidation.
@@ -3512,8 +3792,7 @@ impl<'a> LookupAnswer for TransactionHandle<'a> {
         // both module resolution and dep tracking through deferred_deps.
         let module_data = self
             .get_module(
-                cls.module_name(),
-                Some(cls.module_path()),
+                LookupModule::Exact(cls.module_key()),
                 ModuleDep::Class(cls.index()),
             )
             .finding()
@@ -3725,6 +4004,46 @@ impl State {
         } else {
             self.config_finder
                 .python_file(handle.module_kind(), handle.path())
+        }
+    }
+
+    /// `Transaction::imported_handle`, for a caller that has already read the importer's config.
+    ///
+    /// A module under the importer's site-package path whose own config has a different
+    /// site-package path is checked in the importer's Python environment: it keeps its own config,
+    /// and resolves its imports with the importer's site-package path in place of its own. A module outside a config, such as one in a virtual
+    /// environment elsewhere, has the default config, so it is checked this way too. Every other
+    /// module keeps a plain handle, so a module whose own config already uses the importer's
+    /// site-package path is checked only once.
+    fn imported_handle_with_config(
+        &self,
+        importer: &Handle,
+        importer_config: &ConfigFile,
+        module: ModuleName,
+        path: ModulePath,
+    ) -> Handle {
+        let handle = Handle::new(module, path, importer.sys_info().dupe());
+        // The importer's site-package path: the one on its handle if it is itself checked in an
+        // importer's environment, or its config's otherwise.
+        let importer_env = importer.importer_site_package_path();
+        let importer_site_package_path = || match &importer_env {
+            Some(site_package_path) => Either::Left(site_package_path.paths().iter()),
+            None => Either::Right(importer_config.site_package_path()),
+        };
+        let in_importer_site_packages =
+            importer_site_package_path().any(|dir| handle.path().as_path().starts_with(dir));
+        if in_importer_site_packages
+            && !self
+                .get_config(&handle)
+                .site_package_path()
+                .eq(importer_site_package_path())
+        {
+            let site_package_path = importer_env.unwrap_or_else(|| {
+                SitePackagePath::new(importer_config.site_package_path().cloned().collect())
+            });
+            handle.with_importer_site_package_path(Some(site_package_path))
+        } else {
+            handle
         }
     }
 
@@ -3963,11 +4282,11 @@ impl State {
         let active_configs: HashSet<usize> =
             state.modules.values().map(|m| m.config.id()).collect();
         let old_loaders = mem::take(&mut state.loaders);
-        for (config, loader) in old_loaders {
-            if active_configs.contains(&config.id()) {
-                state.loaders.insert(config, loader);
+        for (key, loader) in old_loaders {
+            if active_configs.contains(&key.0.id()) {
+                state.loaders.insert(key, loader);
             } else {
-                stale_loaders.push((config, loader));
+                stale_loaders.push((key, loader));
             }
         }
 
@@ -4017,5 +4336,53 @@ impl State {
             .transaction
             .run(handles, require, custom_thread_pool);
         self.commit_transaction(transaction, telemetry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyrefly_types::class::ClassDefIndex;
+    use ruff_python_ast::name::Name;
+
+    use super::ClassReads;
+
+    #[test]
+    fn test_class_reads() {
+        let c0 = ClassDefIndex(0);
+        let c1 = ClassDefIndex(1);
+        let mut reads = ClassReads::default();
+        reads.insert_kinds(c1, ClassReads::MRO);
+        reads.insert_field(c0, &Name::new_static("x"));
+        reads.insert_kinds(c0, ClassReads::ROW);
+        reads.insert_kinds(c1, ClassReads::METADATA);
+        reads.insert_field(c0, &Name::new_static("x"));
+
+        let with = |f: &dyn Fn(&mut ClassReads)| {
+            let mut changes = ClassReads::default();
+            f(&mut changes);
+            changes
+        };
+        assert!(reads.intersects(&with(&|c| c.insert_kinds(c1, ClassReads::METADATA))));
+        assert!(reads.intersects(&with(&|c| {
+            c.insert_kinds(c0, ClassReads::ROW | ClassReads::MRO)
+        })));
+        assert!(reads.intersects(&with(&|c| c.insert_field(c0, &Name::new_static("x")))));
+        assert!(!reads.intersects(&with(&|c| c.insert_kinds(c0, ClassReads::MRO))));
+        assert!(!reads.intersects(&with(&|c| c.insert_field(c0, &Name::new_static("y")))));
+        assert!(!reads.intersects(&with(&|c| c.insert_field(c1, &Name::new_static("x")))));
+        assert!(!reads.intersects(&with(&|c| c.insert_kinds(c1, ClassReads::ROW))));
+
+        // Merging keeps one kinds entry per class and drops repeated fields.
+        let mut merged = with(&|c| {
+            c.insert_kinds(c0, ClassReads::TPARAMS);
+            c.insert_field(c0, &Name::new_static("x"));
+            c.insert_field(c1, &Name::new_static("z"));
+        });
+        merged.merge(&reads);
+        let mut expected = reads.clone();
+        expected.insert_kinds(c0, ClassReads::TPARAMS);
+        expected.insert_field(c1, &Name::new_static("z"));
+        assert_eq!(merged, expected);
+        assert_eq!(merged.0.len(), 4);
     }
 }

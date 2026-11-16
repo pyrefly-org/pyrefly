@@ -63,7 +63,7 @@ lsp-server = "0.10.0"
 lsp_types = { package = "gen-lsp-types", version = "0.11.0", features = ["url"] }
 num-traits = { version = "0.2.19", default-features = false }
 parking_lot = { version = "0.13.0", features = ["arc_lock", "send_guard", "serde"] }
-parse-display = "0.8.2"
+parse-display = "0.11.0"
 paste = "1.0.14"
 percent-encoding = "2.1"
 protobuf = "3.7.2"
@@ -105,7 +105,7 @@ xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
 yansi = { version = "1.0.0-rc.1", features = ["hyperlink"] }
 
 [dev-dependencies]
-criterion = { package = "codspeed-criterion-compat", version = "5.0.3", features = ["html_reports"] }
+criterion = { package = "codspeed-criterion-compat", version = "6.0.0", features = ["html_reports"] }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 pyrefly_bench_harness = { path = "../crates/pyrefly_bench_harness" }
 pyrefly_lsp_test = { path = "../crates/pyrefly_lsp_test" }

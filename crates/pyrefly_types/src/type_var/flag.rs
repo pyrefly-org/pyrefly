@@ -25,9 +25,11 @@ use std::fmt::Display;
 use std::slice;
 
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_util::visit::Visit;
 use pyrefly_util::visit::VisitMut;
 
+use crate::env::TypeEnv;
 use crate::heap::TypeHeap;
 use crate::known_class::KnownClass;
 use crate::literal::Lit;
@@ -183,7 +185,9 @@ impl FlagMember {
 }
 
 /// The integer-tuple portion of a `Flag` domain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash
+)]
 enum FlagTuple {
     Absent,
     Fixed(usize),
@@ -279,7 +283,9 @@ impl Display for FlagMember {
 ///
 /// Invariant: a domain is never empty. `of` and `join` are the only constructors and both
 /// yield at least one member, so materialization may assume a member exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash
+)]
 pub struct FlagDomain {
     integer: bool,
     boolean: bool,
@@ -479,13 +485,13 @@ impl FlagDomain {
 
     /// The single type covering the whole domain: the member itself when there is only one,
     /// otherwise their union.
-    pub fn as_type(self, stdlib: &Stdlib, heap: &TypeHeap) -> Type {
-        let types = self.types(stdlib);
+    pub fn as_type(self, env: &dyn TypeEnv, heap: &TypeHeap) -> Type {
+        let types = self.types(env.stdlib());
         assert!(
             !types.is_empty(),
             "a `Flag` domain always has at least one member"
         );
-        unions(types, heap)
+        unions(types, env, heap)
     }
 }
 

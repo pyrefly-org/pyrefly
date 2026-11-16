@@ -23,7 +23,6 @@ use pyrefly_types::callable::Params;
 use pyrefly_types::class::Class;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::type_var::Restriction;
-use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::types::BoundMethod;
 use pyrefly_types::types::BoundMethodType;
 use pyrefly_types::types::OverloadType;
@@ -1465,7 +1464,7 @@ impl DirectCall {
                         "For callee `{}`, unknown object type in bound method `{}`",
                         callee.display_with(context),
                         callee_type
-                            .map(string_for_type)
+                            .map(|t| string_for_type(context.resolver.type_env(), t))
                             .unwrap_or("None".to_owned()),
                     );
                     // `true` would skip overrides, which may lead to false negatives. But we prefer false positives since
@@ -1629,16 +1628,9 @@ impl<'a> CallGraphVisitor<'a> {
                     is_class_def: false,
                 }
             }
-            Type::TypedDict(TypedDict::Anonymous(_)) => ReceiverClassResult {
+            Type::AnonymousTypedDict(_) => ReceiverClassResult {
                 class: Some(ClassRef::from_class(
                     self.module_answers_context.stdlib.dict_object(),
-                    self.module_context,
-                )),
-                is_class_def: false,
-            },
-            Type::TypedDict(TypedDict::TypedDict(typed_dict)) => ReceiverClassResult {
-                class: Some(ClassRef::from_class(
-                    typed_dict.class_object(),
                     self.module_context,
                 )),
                 is_class_def: false,
@@ -1650,7 +1642,7 @@ impl<'a> CallGraphVisitor<'a> {
                 }
                 Restriction::ShapeExtension(extension) => self.receiver_class_from_type(
                     &extension.upper_bound(
-                        &self.module_answers_context.stdlib,
+                        self.module_context.resolver.type_env(),
                         self.module_answers_context.answers.heap(),
                     ),
                     is_class_method,
@@ -1695,7 +1687,7 @@ impl<'a> CallGraphVisitor<'a> {
         if let Some(function_ref) = self
             .module_context
             .resolver
-            .resolve_pysa_solutions(class.module())
+            .resolve_pysa_solutions(class.module(self.module_context.resolver.type_env()))
             .module_index
             .get_function_ref_for_class_field(class_id, field_name)
         {
@@ -1717,7 +1709,9 @@ impl<'a> CallGraphVisitor<'a> {
             if let Some(function_ref) = self
                 .module_context
                 .resolver
-                .resolve_pysa_solutions(parent_class.module())
+                .resolve_pysa_solutions(
+                    parent_class.module(self.module_context.resolver.type_env()),
+                )
                 .module_index
                 .get_function_ref_for_class_field(parent_class_id, field_name)
             {
@@ -2002,16 +1996,12 @@ impl<'a> CallGraphVisitor<'a> {
                 let str_class = self.module_answers_context.stdlib.str().class_object();
                 call_targets_from_method_name_with_class(str_class)
             }
-            Some(Type::TypedDict(typed_dict)) | Some(Type::PartialTypedDict(typed_dict)) => {
-                match typed_dict {
-                    TypedDict::TypedDict(inner) => {
-                        call_targets_from_method_name_with_class(inner.class_object())
-                    }
-                    TypedDict::Anonymous(..) => call_targets_from_method_name_with_class(
-                        self.module_answers_context.stdlib.dict_object(),
-                    ),
-                }
+            Some(Type::PartialTypedDict(class_type)) => {
+                call_targets_from_method_name_with_class(class_type.class_object())
             }
+            Some(Type::AnonymousTypedDict(..)) => call_targets_from_method_name_with_class(
+                self.module_answers_context.stdlib.dict_object(),
+            ),
             _ => MaybeResolved::Unresolved(UnresolvedReason::UnexpectedDefiningClass),
         };
         if call_targets.is_unresolved() {
@@ -2020,7 +2010,7 @@ impl<'a> CallGraphVisitor<'a> {
                 "Cannot find call targets for method `{}` in class `{}`",
                 method,
                 defining_class
-                    .map(string_for_type)
+                    .map(|t| string_for_type(self.module_context.resolver.type_env(), t))
                     .unwrap_or("None".to_owned()),
             );
         }
@@ -2299,12 +2289,12 @@ impl<'a> CallGraphVisitor<'a> {
                         exclude_object_methods,
                     )
                 }
-                CallTarget::TypedDict(typed_dict_inner) => {
+                CallTarget::TypedDict(typed_dict) => {
                     let init_method = self
                         .module_context
                         .resolver
                         .with_solver("call_graph_typed_dict_init", |solver| {
-                            solver.get_typed_dict_dunder_init(&typed_dict_inner)
+                            solver.get_typed_dict_dunder_init(&typed_dict)
                         });
                     self.resolve_constructor_callees(
                         init_method,
@@ -2627,8 +2617,10 @@ impl<'a> CallGraphVisitor<'a> {
                      }| {
                         // TODO(T252263933): Need more precise return types for `__getitem__` in `typed_dict.py`
                         let return_type = if let Some(return_type) = callee_type
-                            .callable_return_type(self.module_answers_context.answers.heap())
-                        {
+                            .callable_return_type(
+                                self.module_answers_context.answers.heap(),
+                                self.module_context.resolver.type_env(),
+                            ) {
                             ScalarTypeProperties::from_type(&return_type, self.module_context)
                         } else {
                             ScalarTypeProperties::none()
@@ -3104,7 +3096,12 @@ impl<'a> CallGraphVisitor<'a> {
     // for a call expression, we could simply query its type (e.g., query the type of `c(1)`).
     fn get_return_type_for_callee(&self, callee_type: Option<&Type>) -> ScalarTypeProperties {
         callee_type
-            .and_then(|ty| ty.callable_return_type(self.module_answers_context.answers.heap()))
+            .and_then(|ty| {
+                ty.callable_return_type(
+                    self.module_answers_context.answers.heap(),
+                    self.module_context.resolver.type_env(),
+                )
+            })
             .map(|return_type| ScalarTypeProperties::from_type(&return_type, self.module_context))
             .unwrap_or(ScalarTypeProperties::none())
     }
@@ -3402,8 +3399,10 @@ impl<'a> CallGraphVisitor<'a> {
             /* base */
             iter_callee_type
                 .and_then(|iter_callee_type| {
-                    iter_callee_type
-                        .callable_return_type(self.module_answers_context.answers.heap())
+                    iter_callee_type.callable_return_type(
+                        self.module_answers_context.answers.heap(),
+                        self.module_context.resolver.type_env(),
+                    )
                 })
                 .as_ref(),
             /* attribute */ Some(&next_callee_name),
@@ -3828,13 +3827,15 @@ impl<'a> CallGraphVisitor<'a> {
                 self.debug,
                 "Found function with graphql decorator `{:#?}` and a return expression with (inner) class `{}`",
                 graphql_decorator,
-                return_inner_class
+                return_inner_class.def(self.module_context.resolver.type_env())
             );
             let return_class_id = ClassId::from_class(&return_inner_class);
             let callees: Vec<PysaCallTarget<FunctionRef>> = self
                 .module_context
                 .resolver
-                .resolve_pysa_solutions(return_inner_class.module())
+                .resolve_pysa_solutions(
+                    return_inner_class.module(self.module_context.resolver.type_env()),
+                )
                 .module_index
                 .get_graphql_decorated_class_fields(return_class_id, |decorator| {
                     decorator == graphql_decorator
@@ -4123,7 +4124,10 @@ impl<'a> CallGraphVisitor<'a> {
                         .answers
                         .get_idx(idx)
                         .unwrap()
-                        .callable_return_type(self.module_answers_context.answers.heap())
+                        .callable_return_type(
+                            self.module_answers_context.answers.heap(),
+                            self.module_context.resolver.type_env(),
+                        )
                         .map_or(ScalarTypeProperties::none(), |type_| {
                             ScalarTypeProperties::from_type(&type_, self.module_context)
                         });
@@ -4318,7 +4322,10 @@ impl<'a> CallGraphVisitor<'a> {
         let qualified_name = match self.get_base_definition(current_function).defining_class {
             Some(class_ref) => format!(
                 "{}.{}",
-                class_ref.class.qname().module_qualified_name(),
+                class_ref
+                    .class
+                    .qname(self.module_context.resolver.type_env())
+                    .module_qualified_name(),
                 current_function.function_name
             ),
             None => format!(

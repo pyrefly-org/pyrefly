@@ -17,11 +17,13 @@ use std::sync::Arc;
 use dupe::Dupe;
 use parse_display::Display;
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::qname::QName;
 use pyrefly_util::assert_words;
+use pyrefly_util::display::DisplayWith;
 use pyrefly_util::display::commas_iter;
 use pyrefly_util::uniques::Unique;
 use pyrefly_util::uniques::UniqueFactory;
@@ -43,6 +45,7 @@ use crate::class::ClassType;
 use crate::data_frame::DataFrameSchema;
 use crate::dimension;
 use crate::dimension::Int;
+use crate::env::TypeEnv;
 use crate::function::Deprecation;
 use crate::function::FuncMetadata;
 use crate::function::Function;
@@ -73,11 +76,11 @@ use crate::type_level_dsl::TypeLevelDslCall;
 use crate::type_var::Restriction;
 use crate::type_var::TypeVar;
 use crate::type_var_tuple::TypeVarTuple;
-use crate::typed_dict::TypedDict;
+use crate::typed_dict::AnonymousTypedDictInner;
 
 /// An introduced synthetic variable to range over as yet unknown types.
 #[derive(Debug, Copy, Clone, Dupe, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct Var(Unique);
 
 impl Display for Var {
@@ -96,6 +99,19 @@ impl Var {
     pub fn to_type(self, heap: &TypeHeap) -> Type {
         heap.mk_var(self)
     }
+}
+
+/// Which of the two uses of `Type::Unpack` this is. They are written the same way in an
+/// annotation but displayed differently, and after a TypedDict instance became an ordinary
+/// `ClassType` the inner type no longer distinguishes them.
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash
+)]
+pub enum UnpackKind {
+    /// Unpacking a TypeVarTuple or tuple in `*args` position, displayed as `*T`.
+    Args,
+    /// Unpacking a TypedDict in `**kwargs` position, displayed as `Unpack[T]`.
+    Kwargs,
 }
 
 #[derive(PartialEq, Eq)]
@@ -117,7 +133,7 @@ impl Display for TParamsSource {
 
 /// Wraps a vector of type parameters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct TParams(Vec<Quantified>);
 
 static EMPTY_TPARAMS: TParams = TParams(Vec::new());
@@ -146,12 +162,12 @@ impl Visit<Type> for Arc<TParams> {
     }
 }
 
-impl Display for TParams {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for TParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         write!(
             f,
             "[{}]",
-            commas_iter(|| self.0.iter().map(|q| q.display_with_bounds()))
+            commas_iter(|| self.0.iter().map(|q| q.display_with_bounds(env)))
         )
     }
 }
@@ -185,61 +201,63 @@ impl TParams {
         self.0.extend(other.iter().cloned());
     }
 
-    /// Truncate recursive TArgs nesting in Quantified restrictions.
+    /// Strip the type arguments through which these type parameters, which belong to `owner`,
+    /// would contain themselves.
     ///
-    /// During iterative fixpoint solving, TParams can grow unboundedly when
-    /// classes reference each other in type parameter bounds (either self-referentially
-    /// like `class C[T: C]`, or mutually like Session ↔ DataFrame ↔ Catalog).
-    /// Each iteration embeds the previous iteration's TParams one level deeper
-    /// through the chain: TParams → Restriction → ClassType → TArgs → TParams → ...
-    ///
-    /// This method enforces a structural invariant: within a Quantified's restriction,
-    /// any ClassType whose TArgs embed TParams with their own non-trivial restrictions
-    /// (Bound or Constraints) has its TArgs stripped to empty. This prevents recursive
-    /// nesting while preserving TArgs for simple cases like `T: List[int]` where the
-    /// inner TParams have only unrestricted type variables.
-    pub fn truncate_recursive_targs(self) -> Self {
+    /// A bound, constraint or default can name `owner`, directly or through other classes whose
+    /// own type parameters name `owner`. Type arguments carry their class's type parameters, so
+    /// while such a cycle is solved, each iteration would embed the previous iteration's type
+    /// parameters one level deeper, and the iterations would never agree. That nesting goes
+    /// through a class type that is `owner` or whose type parameters name `owner`, so stripping
+    /// the type arguments of exactly those class types ends it. Every other type argument is kept.
+    pub fn truncate_recursive_targs(self, owner: &Class) -> Self {
+        let mut strip = |t: &mut Type| {
+            if let Type::ClassType(ct) = t
+                && !ct.targs().is_empty()
+                && (ct.class_object() == owner
+                    || Self::mentions(ct.targs().tparams(), owner, &mut SmallSet::new()))
+            {
+                *t = Type::ClassType(ClassType::new(ct.class_object().dupe(), TArgs::default()));
+            }
+        };
         let quantifieds = self
             .0
             .into_iter()
-            .map(|q| {
-                let new_restriction = match q.restriction() {
-                    Restriction::Bound(ty) => {
-                        Restriction::Bound(Self::strip_recursive_class_targs(ty.clone()))
+            .map(|mut q| {
+                match &mut q.restriction {
+                    Restriction::Bound(ty) => ty.transform_mut(&mut strip),
+                    Restriction::Constraints(tys) => {
+                        tys.iter_mut().for_each(|ty| ty.transform_mut(&mut strip))
                     }
-                    Restriction::Constraints(tys) => Restriction::Constraints(
-                        tys.iter()
-                            .map(|ty| Self::strip_recursive_class_targs(ty.clone()))
-                            .collect(),
-                    ),
-                    Restriction::ShapeExtension(extension) => {
-                        Restriction::ShapeExtension(extension.clone())
-                    }
-                    Restriction::Unrestricted => Restriction::Unrestricted,
-                };
-                q.with_restriction(new_restriction)
+                    Restriction::ShapeExtension(_) | Restriction::Unrestricted => {}
+                }
+                if let Some(default) = &mut q.default {
+                    default.transform_mut(&mut strip);
+                }
+                q
             })
             .collect();
         Self(quantifieds)
     }
 
-    /// Walk a type tree and strip TArgs from any ClassType whose TArgs' TParams
-    /// have non-trivial restrictions (Bound or Constraints). Such TParams can
-    /// participate in recursive nesting across fixpoint iterations.
-    fn strip_recursive_class_targs(ty: Type) -> Type {
-        ty.transform(&mut |t| {
-            if let Type::ClassType(ct) = t
-                && !ct.targs().is_empty()
-                && Self::tparams_have_restrictions(ct.targs().tparams())
-            {
-                *t = Type::ClassType(ClassType::new(ct.class_object().dupe(), TArgs::default()));
-            }
-        })
-    }
-
-    /// Check if any Quantified in the TParams has a non-trivial restriction.
-    fn tparams_have_restrictions(tparams: &TParams) -> bool {
-        tparams.iter().any(|q| q.restriction().is_restricted())
+    /// Whether a bound, constraint or default of `tparams` names `owner`, directly or through the
+    /// type parameters that the class types in it carry. `visited` holds the type parameters
+    /// already searched, by address, since the type arguments of one class can carry type
+    /// parameters from different iterations of a cycle.
+    fn mentions(tparams: &TParams, owner: &Class, visited: &mut SmallSet<*const TParams>) -> bool {
+        if !visited.insert(tparams as *const TParams) {
+            return false;
+        }
+        let mut found = false;
+        tparams.visit(&mut |ty: &Type| {
+            ty.universe(&mut |t| {
+                if !found && let Type::ClassType(ct) | Type::SelfType(ct) = t {
+                    found = ct.class_object() == owner
+                        || Self::mentions(ct.targs().tparams(), owner, visited);
+                }
+            })
+        });
+        found
     }
 }
 
@@ -249,7 +267,7 @@ impl TParams {
 /// types are not generic, so they carry no allocation, and cloning or dropping them
 /// touches no reference count shared with other threads.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[derive(TypeEq)]
+#[derive(TypeEq, TypeOrd)]
 pub struct TArgs(Option<Arc<(Arc<TParams>, Box<[Type]>)>>);
 
 impl Visit<Type> for TArgs {
@@ -351,7 +369,7 @@ impl TArgs {
     ///
     /// Unions in the substituted arguments are simplified, so type arguments that differ only in
     /// the order, nesting or duplication of union members compare equal.
-    pub fn substitute_with(&self, substitution: &Substitution) -> Self {
+    pub fn substitute_with(&self, substitution: &Substitution, env: &dyn TypeEnv) -> Self {
         let Some((tparams, targs)) = self.0.as_deref() else {
             return Self::default();
         };
@@ -365,7 +383,7 @@ impl TArgs {
                 let mut ty = substitution.substitute_into(ty.clone());
                 ty.transform_mut(&mut |x| {
                     if let Type::Union(u) = x {
-                        let mut merged = unions(mem::take(&mut u.members), &heap);
+                        let mut merged = unions(mem::take(&mut u.members), env, &heap);
                         if let Type::Union(merged_u) = &mut merged {
                             merged_u.display_name.0 = u.display_name.0.take();
                         }
@@ -432,7 +450,7 @@ impl<'a> Substitution<'a> {
 
 /// The types of Never. Prefer later ones where we have multiple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum NeverStyle {
     NoReturn,
     Never,
@@ -440,7 +458,7 @@ pub enum NeverStyle {
 
 /// The types of Any. Prefer later ones where we have multiple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum AnyStyle {
     /// The user wrote `Any` literally.
     Explicit,
@@ -487,7 +505,7 @@ impl AnyStyle {
 assert_words!(Type, 4);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum CalleeKind {
     Callable,
     Function(FunctionKind),
@@ -518,7 +536,7 @@ impl FunctionTransform {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct BoundMethod {
     /// Type of the self/cls argument,
     pub obj: Type,
@@ -540,7 +558,7 @@ impl BoundMethod {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum BoundMethodType {
     Function(Function),
     Forall(Forall<Function>),
@@ -678,7 +696,7 @@ impl BoundMethodType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct Overload {
     pub signatures: Vec1<OverloadType>,
     pub metadata: Box<FuncMetadata>,
@@ -695,7 +713,7 @@ impl Overload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum OverloadType {
     Function(Function),
     Forall(Forall<Function>),
@@ -745,7 +763,7 @@ impl OverloadType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct Forall<T> {
     pub tparams: Arc<TParams>,
     pub body: T,
@@ -759,7 +777,7 @@ impl Forall<Forallable> {
 
 /// These are things that can have Forall around them, so often you see `Forall<Forallable>`
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum Forallable {
     TypeAlias(TypeAliasData),
     Function(Function),
@@ -843,14 +861,14 @@ impl Forallable {
 /// Either an instance of a class (inside an instance method) or a
 /// class object (inside a classmethod or staticmethod)
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum SuperObj {
     Instance(ClassType),
     Class(ClassType),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct Union {
     pub members: Vec<Type>,
     pub display_name: IdentityIgnored<Option<(ModuleName, Name)>>,
@@ -858,7 +876,7 @@ pub struct Union {
 
 // Note: The fact that Literal and LiteralString are at the front is important for
 // optimisations in `unions_with_literals`.
-#[derive(Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash)]
 pub enum Type {
     Literal(Box<Literal>),
     LiteralString(LitStyle),
@@ -908,16 +926,18 @@ pub enum Type {
     ///
     /// Instances of classes have this type.
     ClassType(ClassType),
-    /// Instances of TypedDicts have this type, and a term of the form `TD[arg1, arg2]`
-    /// would have the form `Type::Type(box Type::TypedDict(TD, [arg1, arg2]))`. Note
-    /// that TypedDict class definitions are still represented as `ClassDef(TD)`, just
-    /// like regular classes.
-    TypedDict(TypedDict),
+    /// A TypedDict inferred from a dict literal with known string keys. It has no class
+    /// object, so unlike a declared TypedDict it cannot be described by a `Class` and `TArgs`,
+    /// and needs its own variant. A declared TypedDict instance is a plain `ClassType`; ask
+    /// its `ClassMetadata` whether it is a TypedDict.
+    AnonymousTypedDict(Box<AnonymousTypedDictInner>),
     /// Represents a "partial" version of a TypedDict that can be merged into the TypedDict
     /// (e.g., via its `update` method).
     /// For a TypedDict type `C`, `Partial[C]` represents an object with any subset of read-write
     /// keys from `C`, where each present key has the same value type as in `C`.
-    PartialTypedDict(TypedDict),
+    /// Only declared TypedDicts have an `update` method, so this is never anonymous, and the
+    /// class and type arguments it needs are exactly a `ClassType`.
+    PartialTypedDict(ClassType),
     /// First-class tensor shape tuple.
     IntTuple(Box<IntTuple>),
     /// Named integer values captured by the experimental shape extensions.
@@ -953,7 +973,7 @@ pub enum Type {
     /// cannot be assigned to `type[T]`.
     /// The second field carries the metadata items (the `...` in `Annotated[T, ...]`).
     Annotated(Box<Type>, Box<[Type]>),
-    Unpack(Box<Type>),
+    Unpack(Box<Type>, UnpackKind),
     TypeVar(TypeVar),
     ParamSpec(ParamSpec),
     TypeVarTuple(TypeVarTuple),
@@ -1042,7 +1062,7 @@ impl Visit for Type {
             Type::ClassDef(x) => x.visit(f),
             Type::SpecializedClassDef(x) => x.visit(f),
             Type::ClassType(x) => x.visit(f),
-            Type::TypedDict(x) => x.visit(f),
+            Type::AnonymousTypedDict(x) => x.visit(f),
             Type::PartialTypedDict(x) => x.visit(f),
             Type::IntTuple(x) => x.visit(f),
             Type::NamedInts(x) => x.visit(f),
@@ -1059,7 +1079,7 @@ impl Visit for Type {
             Type::TypeGuard(x) => x.visit(f),
             Type::TypeIs(x) => x.visit(f),
             Type::Annotated(x, _metadata) => x.visit(f),
-            Type::Unpack(x) => x.visit(f),
+            Type::Unpack(x, _) => x.visit(f),
             Type::TypeVar(x) => x.visit(f),
             Type::Sentinel(x) => x.visit(f),
             Type::ParamSpec(x) => x.visit(f),
@@ -1105,7 +1125,7 @@ impl VisitMut for Type {
             Type::ClassDef(x) => x.visit_mut(f),
             Type::SpecializedClassDef(x) => x.visit_mut(f),
             Type::ClassType(x) => x.visit_mut(f),
-            Type::TypedDict(x) => x.visit_mut(f),
+            Type::AnonymousTypedDict(x) => x.visit_mut(f),
             Type::PartialTypedDict(x) => x.visit_mut(f),
             Type::IntTuple(x) => x.visit_mut(f),
             Type::NamedInts(x) => x.visit_mut(f),
@@ -1122,7 +1142,7 @@ impl VisitMut for Type {
             Type::TypeGuard(x) => x.visit_mut(f),
             Type::TypeIs(x) => x.visit_mut(f),
             Type::Annotated(x, _metadata) => x.visit_mut(f),
-            Type::Unpack(x) => x.visit_mut(f),
+            Type::Unpack(x, _) => x.visit_mut(f),
             Type::TypeVar(x) => x.visit_mut(f),
             Type::Sentinel(x) => x.visit_mut(f),
             Type::ParamSpec(x) => x.visit_mut(f),
@@ -1307,15 +1327,17 @@ impl Type {
     }
 
     pub fn is_unpack(&self) -> bool {
-        matches!(self, Type::Unpack(_))
+        matches!(self, Type::Unpack(..))
     }
 
-    /// The `TypedDict` of an `Unpack[TypedDict]`, the annotation form a `**kwargs`
-    /// parameter uses to accept each field as a keyword argument. `None` for any
-    /// other type, including `Unpack` of a non-`TypedDict` such as a `TypeVarTuple`.
-    pub fn unpacked_typed_dict(&self) -> Option<&TypedDict> {
+    /// The TypedDict of an `Unpack[TypedDict]`, the annotation form a `**kwargs` parameter
+    /// uses to accept each field as a keyword argument. `None` for any other type, including
+    /// `Unpack` of a non-TypedDict such as a `TypeVarTuple`.
+    pub fn unpacked_typed_dict(&self) -> Option<&ClassType> {
         match self {
-            Type::Unpack(inner) if let Type::TypedDict(typed_dict) = &**inner => Some(typed_dict),
+            Type::Unpack(inner, UnpackKind::Kwargs) if let Type::ClassType(ct) = &**inner => {
+                Some(ct)
+            }
             _ => None,
         }
     }
@@ -1394,10 +1416,6 @@ impl Type {
         matches!(self, Type::ClassType(cls) if cls.is(KnownClass::Object))
     }
 
-    pub fn is_typed_dict(&self) -> bool {
-        matches!(self, Type::TypedDict(_) | Type::PartialTypedDict(_))
-    }
-
     pub fn is_error(&self) -> bool {
         matches!(self, Type::Any(style) if style.is_error())
     }
@@ -1453,7 +1471,6 @@ impl Type {
             // * Not checking the rest of the ClassType is a critical performance optimization
             //   when visiting Vars. See https://github.com/facebook/pyrefly/issues/2016.
             Type::ClassType(cls) => recurse_targs(cls.targs()),
-            Type::TypedDict(TypedDict::TypedDict(td)) => recurse_targs(td.targs()),
             // `Self` is a keyword, not a user-written type variable reference, so we don't
             // recurse into it when looking for type variable references.
             Type::SelfType(_) => {}
@@ -1473,7 +1490,6 @@ impl Type {
         // IMPORTANT: keep this match in sync with `recurse_type_variable_positions`
         match self {
             Type::ClassType(cls) => recurse_targs(cls.targs_mut()),
-            Type::TypedDict(TypedDict::TypedDict(td)) => recurse_targs(td.targs_mut()),
             Type::SelfType(_) | Type::Literal(_) => {}
             _ => self.recurse_mut(f),
         }
@@ -1749,15 +1765,15 @@ impl Type {
         matches!(self, Type::None)
     }
 
-    pub fn callee_kind(&self) -> Option<CalleeKind> {
+    pub fn callee_kind(&self, env: &dyn TypeEnv) -> Option<CalleeKind> {
         match self {
             Type::Callable(_) => Some(CalleeKind::Callable),
             Type::Function(func) => Some(CalleeKind::Function(func.metadata.kind.clone())),
-            Type::ClassDef(c) => Some(CalleeKind::Class(c.kind())),
-            Type::SpecializedClassDef(c) => Some(CalleeKind::Class(c.class_object().kind())),
-            Type::Forall(forall) => forall.body.clone().as_type().callee_kind(),
+            Type::ClassDef(c) => Some(CalleeKind::Class(c.kind(env))),
+            Type::SpecializedClassDef(c) => Some(CalleeKind::Class(c.kind(env))),
+            Type::Forall(forall) => forall.body.clone().as_type().callee_kind(env),
             Type::Overload(overload) => Some(CalleeKind::Function(overload.metadata.kind.clone())),
-            Type::KwCall(call) => call.return_ty.callee_kind(),
+            Type::KwCall(call) => call.return_ty.callee_kind(env),
             _ => None,
         }
     }
@@ -1802,13 +1818,16 @@ impl Type {
         self
     }
 
-    pub fn finalize_type_level_dsl_at_boundary(&mut self) -> Vec<dimension::ShapeError> {
+    pub fn finalize_type_level_dsl_at_boundary(
+        &mut self,
+        env: &dyn TypeEnv,
+    ) -> Vec<dimension::ShapeError> {
         let mut errors = Vec::new();
 
         // Nested applications are dependencies of the public application being forced here:
         // propagate the first invalid dependency upward so fallback is applied only at that
         // public result-schema boundary.
-        fn force_nested(ty: &mut Type) -> Result<(), dimension::ShapeError> {
+        fn force_nested(ty: &mut Type, env: &dyn TypeEnv) -> Result<(), dimension::ShapeError> {
             let Type::TypeLevelDslCall(call) = ty else {
                 match ty {
                     Type::Callable(_)
@@ -1820,7 +1839,7 @@ impl Type {
                         let mut error = None;
                         ty.recurse_mut(&mut |ty| {
                             if error.is_none() {
-                                error = force_nested(ty).err();
+                                error = force_nested(ty, env).err();
                             }
                         });
                         return match error {
@@ -1830,21 +1849,24 @@ impl Type {
                     }
                 }
             };
-            fn force_call(call: &mut TypeLevelDslCall) -> Result<Type, dimension::ShapeError> {
+            fn force_call(
+                call: &mut TypeLevelDslCall,
+                env: &dyn TypeEnv,
+            ) -> Result<Type, dimension::ShapeError> {
                 for arg in &mut call.args {
-                    force_nested(arg)?;
+                    force_nested(arg, env)?;
                 }
                 if let Some(source) = call.map_int_tuples_source_mut() {
-                    force_nested(source)?;
+                    force_nested(source, env)?;
                 }
-                call.normalize_value_arguments();
+                call.normalize_value_arguments(env);
                 // Mapping can instantiate DSL calls from its lambda body, so the produced type
                 // must cross the same boundary as the source arguments.
-                let mut result = call.evaluate()?;
-                force_nested(&mut result)?;
+                let mut result = call.evaluate(env)?;
+                force_nested(&mut result, env)?;
                 Ok(result)
             }
-            match force_call(call) {
+            match force_call(call, env) {
                 Ok(result) => {
                     *ty = result;
                     Ok(())
@@ -1853,16 +1875,20 @@ impl Type {
                     // Report only the original error if reducing a structured fallback also
                     // encounters a failing nested call.
                     let mut fallback = call.fallback();
-                    let _ = force_nested(&mut fallback);
+                    let _ = force_nested(&mut fallback, env);
                     *ty = fallback;
                     Err(error)
                 }
             }
         }
 
-        fn collect_errors(ty: &mut Type, errors: &mut Vec<dimension::ShapeError>) {
+        fn collect_errors(
+            ty: &mut Type,
+            errors: &mut Vec<dimension::ShapeError>,
+            env: &dyn TypeEnv,
+        ) {
             if matches!(ty, Type::TypeLevelDslCall(_)) {
-                if let Err(error) = force_nested(ty) {
+                if let Err(error) = force_nested(ty, env) {
                     errors.push(error);
                 }
                 return;
@@ -1873,10 +1899,10 @@ impl Type {
                 | Type::BoundMethod(_)
                 | Type::Overload(_)
                 | Type::Forall(_) => {}
-                _ => ty.recurse_mut(&mut |ty| collect_errors(ty, errors)),
+                _ => ty.recurse_mut(&mut |ty| collect_errors(ty, errors, env)),
             }
         }
-        collect_errors(self, &mut errors);
+        collect_errors(self, &mut errors, env);
         errors
     }
 
@@ -2117,7 +2143,7 @@ impl Type {
     }
 
     // This doesn't handle generics currently
-    pub fn callable_return_type(&self, heap: &TypeHeap) -> Option<Type> {
+    pub fn callable_return_type(&self, heap: &TypeHeap, env: &dyn TypeEnv) -> Option<Type> {
         let rets = self
             .toplevel_callable_signatures()
             .map(|(callable, _)| callable.ret.clone())
@@ -2125,11 +2151,11 @@ impl Type {
         if rets.is_empty() {
             None
         } else {
-            Some(unions(rets, heap))
+            Some(unions(rets, env, heap))
         }
     }
 
-    pub fn callable_first_param(&self, heap: &TypeHeap) -> Option<Type> {
+    pub fn callable_first_param(&self, heap: &TypeHeap, env: &dyn TypeEnv) -> Option<Type> {
         let params = self
             .toplevel_callable_signatures()
             .filter_map(|(callable, _)| callable.get_first_param().cloned())
@@ -2137,7 +2163,7 @@ impl Type {
         if params.is_empty() {
             None
         } else {
-            Some(unions(params, heap))
+            Some(unions(params, env, heap))
         }
     }
 
@@ -2403,18 +2429,17 @@ impl Type {
     }
 
     /// Does this type have a QName associated with it
-    pub fn qname(&self) -> Option<&QName> {
+    pub fn qname<'a>(&'a self, env: &'a dyn TypeEnv) -> Option<&'a QName> {
         match self {
-            Type::ClassDef(cls) => Some(cls.qname()),
-            Type::SpecializedClassDef(c) => Some(c.qname()),
-            Type::ClassType(c) => Some(c.qname()),
-            Type::TypedDict(TypedDict::TypedDict(c)) => Some(c.qname()),
-            Type::PartialTypedDict(TypedDict::TypedDict(c)) => Some(c.qname()),
+            Type::ClassDef(cls) => Some(cls.qname(env)),
+            Type::SpecializedClassDef(c) => Some(c.qname(env)),
+            Type::ClassType(c) => Some(c.qname(env)),
+            Type::PartialTypedDict(c) => Some(c.qname(env)),
             Type::TypeVar(t) => Some(t.qname()),
             Type::TypeVarTuple(t) => Some(t.qname()),
             Type::ParamSpec(t) => Some(t.qname()),
-            Type::SelfType(cls) => Some(cls.qname()),
-            Type::Literal(lit) if let Lit::Enum(e) = &lit.value => Some(e.class.qname()),
+            Type::SelfType(cls) => Some(cls.qname(env)),
+            Type::Literal(lit) if let Lit::Enum(e) = &lit.value => Some(e.class.qname(env)),
             Type::Sentinel(s) => Some(s.qname()),
             _ => None,
         }
@@ -2505,7 +2530,7 @@ impl Type {
             | Type::ClassDef(_)
             | Type::SpecializedClassDef(_)
             | Type::ClassType(_)
-            | Type::TypedDict(_)
+            | Type::AnonymousTypedDict(_)
             | Type::PartialTypedDict(_)
             | Type::IntTuple(_)
             | Type::NamedInts(_)
@@ -2521,7 +2546,7 @@ impl Type {
             | Type::TypeGuard(_)
             | Type::TypeIs(_)
             | Type::Annotated(_, _)
-            | Type::Unpack(_)
+            | Type::Unpack(..)
             | Type::TypeVar(_)
             | Type::ParamSpec(_)
             | Type::TypeVarTuple(_)
@@ -2686,6 +2711,7 @@ mod tests {
     use crate::quantified::QuantifiedKind;
     use crate::quantified::QuantifiedOrigin;
     use crate::shaped_array::IntTuple;
+    use crate::test_type_env::TestTypeEnv;
     use crate::type_level_dsl::TypeLevelDslCall;
     use crate::type_var::PreInferenceVariance;
     use crate::type_var::Restriction;
@@ -2772,7 +2798,7 @@ mod tests {
         let mut result =
             Type::TypeLevelDslCall(Box::new(TypeLevelDslCall::index_shape(shape, index)));
 
-        let errors = result.finalize_type_level_dsl_at_boundary();
+        let errors = result.finalize_type_level_dsl_at_boundary(&TestTypeEnv::new());
 
         assert!(matches!(errors.as_slice(), [ShapeError::BadIndex { .. }]));
         assert_eq!(
@@ -2790,7 +2816,7 @@ mod tests {
             LitInt::new(0).to_explicit_type(),
         )));
 
-        let errors = result.finalize_type_level_dsl_at_boundary();
+        let errors = result.finalize_type_level_dsl_at_boundary(&TestTypeEnv::new());
 
         assert!(errors.is_empty(), "unexpected DSL errors: {errors:?}");
         assert_eq!(result, IntTuple::shapeless().to_shape_arg_type());
@@ -2805,7 +2831,7 @@ mod tests {
             Type::None,
         )));
 
-        let errors = result.finalize_type_level_dsl_at_boundary();
+        let errors = result.finalize_type_level_dsl_at_boundary(&TestTypeEnv::new());
 
         assert!(errors.is_empty(), "unexpected DSL errors: {errors:?}");
         assert_eq!(

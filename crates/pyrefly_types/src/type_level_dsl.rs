@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use compact_str::CompactString;
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
 use pyrefly_python::sys_info::SysInfo;
@@ -64,6 +65,7 @@ use crate::einsum::evaluate_einops_einsum;
 use crate::einsum::evaluate_einsum;
 use crate::einsum::parse_einops_einsum_equation;
 use crate::einsum::parse_einsum_equation;
+use crate::env::TypeEnv;
 use crate::equality::TypeEq as TypeEqTrait;
 use crate::equality::TypeEqCtx;
 use crate::function::FuncDefId;
@@ -80,11 +82,15 @@ use crate::shaped_array::IntTuple;
 use crate::shaped_array::IntTupleView;
 use crate::shaped_array::reduce_axis_shape;
 use crate::tuple::Tuple;
+use crate::type_ord::TypeOrd;
+use crate::type_ord::TypeOrdCtx;
 use crate::type_var::FlagDomain;
 use crate::type_var::FlagMember;
 use crate::types::Type;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash
+)]
 pub enum TypeShapeDslDomain {
     Int,
     IntTuple,
@@ -101,7 +107,9 @@ impl TypeShapeDslDomain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash
+)]
 /// The type-system domain accepted by one DSL parameter.
 ///
 /// `Value` represents a shape dimension or shape tuple. `Flag` represents literal-preserving
@@ -401,7 +409,9 @@ impl fmt::Display for TypeShapeDslInputDomain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash
+)]
 struct ResolvedTypeShapeDslNodeId(u32);
 
 impl ResolvedTypeShapeDslNodeId {
@@ -412,7 +422,7 @@ impl ResolvedTypeShapeDslNodeId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash)]
 struct ResolvedTypeShapeDslNode {
     id: Arc<FuncDefId>,
     definition: Arc<StructurallyValidatedTypeShapeDslFunction>,
@@ -436,7 +446,7 @@ impl ResolvedTypeShapeDslNode {
 ///
 /// A function with no helper calls has only its root node. Keeping nodes in a flat program lets
 /// helper definitions be shared rather than recursively embedded once helper calls are resolved.
-#[derive(Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash)]
 struct ResolvedTypeShapeDslProgram {
     nodes: Box<[ResolvedTypeShapeDslNode]>,
     edge_count: usize,
@@ -480,7 +490,7 @@ impl ResolvedTypeShapeDslProgram {
 }
 
 /// A validated DSL definition paired with its resolved program.
-#[derive(Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash)]
 pub struct ResolvedTypeShapeDslFunction {
     program: Arc<ResolvedTypeShapeDslProgram>,
 }
@@ -6016,7 +6026,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
 }
 
 /// A deferred type-level DSL invocation retained until the operation's result is consumed.
-#[derive(Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash)]
 #[derive(Visit, VisitMut)]
 pub struct TypeLevelDslCall {
     pub(crate) function: TypeLevelDslFunction,
@@ -6024,7 +6034,7 @@ pub struct TypeLevelDslCall {
 }
 
 /// The identity of a type-level DSL operation.
-#[derive(Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash)]
 pub enum TypeLevelDslFunction {
     IndexShape,
     UserDefined(Arc<ResolvedTypeShapeDslFunction>),
@@ -6278,13 +6288,13 @@ impl TypeLevelDslCall {
         }
     }
 
-    fn normalize_value_argument(ty: &mut Type, domain: TypeShapeDslDomain) {
+    fn normalize_value_argument(ty: &mut Type, domain: TypeShapeDslDomain, ctx: &TypeOrdCtx) {
         if let Type::Union(union) = ty {
             union
                 .members
                 .iter_mut()
-                .for_each(|member| Self::normalize_value_argument(member, domain));
-            union.members.sort();
+                .for_each(|member| Self::normalize_value_argument(member, domain, ctx));
+            union.members.sort_by(|x, y| x.type_cmp(y, ctx));
             union.members.dedup();
             if union.members.len() == 1 {
                 *ty = union.members.pop().expect("union contains one member");
@@ -6299,11 +6309,12 @@ impl TypeLevelDslCall {
     }
 
     /// Normalize values whose DSL parameter domain gives them shape semantics.
-    pub(crate) fn normalize_value_arguments(&mut self) {
+    pub(crate) fn normalize_value_arguments(&mut self, env: &dyn TypeEnv) {
+        let ctx = &TypeOrdCtx::new(env);
         match &self.function {
             TypeLevelDslFunction::IndexShape => {
                 if let Some(shape) = self.args.first_mut() {
-                    Self::normalize_value_argument(shape, TypeShapeDslDomain::IntTuple);
+                    Self::normalize_value_argument(shape, TypeShapeDslDomain::IntTuple, ctx);
                 }
             }
             TypeLevelDslFunction::UserDefined(function) => {
@@ -6313,7 +6324,7 @@ impl TypeLevelDslCall {
                     .zip(function.parameter_domains().iter().copied())
                 {
                     if let TypeShapeDslInputDomain::Value(domain) = domain {
-                        Self::normalize_value_argument(argument, domain);
+                        Self::normalize_value_argument(argument, domain, ctx);
                     }
                 }
             }
@@ -6407,12 +6418,12 @@ impl TypeLevelDslCall {
     /// `tuple[IntTuple[2]]`, while the generic argument remains the unevaluated call so later
     /// specialization can still use its call-site arguments. Invalid calls use their gradual
     /// fallback here; their evaluation error is reported when the public call result is forced.
-    pub fn type_for_generic_bound_check(&self) -> Type {
-        self.evaluate().unwrap_or_else(|_| self.fallback())
+    pub fn type_for_generic_bound_check(&self, env: &dyn TypeEnv) -> Type {
+        self.evaluate(env).unwrap_or_else(|_| self.fallback())
     }
 
     /// Evaluates the call, reporting incompatible concrete shapes.
-    pub fn evaluate(&self) -> Result<Type, ShapeError> {
+    pub fn evaluate(&self, env: &dyn TypeEnv) -> Result<Type, ShapeError> {
         let project = |outcome| match outcome {
             DslOutcome::Value(DslValue::Unknown) => Ok(self.fallback()),
             DslOutcome::Value(value) => Ok(value.into_type()),
@@ -6430,7 +6441,7 @@ impl TypeLevelDslCall {
                 index_shape_from_type(&shape, index).map(|shape| shape.to_shape_arg_type())
             }
             TypeLevelDslFunction::UserDefined(function) => project(function.evaluate(&self.args)),
-            TypeLevelDslFunction::MapIntTuples(map) => map.evaluate(),
+            TypeLevelDslFunction::MapIntTuples(map) => map.evaluate(env),
         }
     }
 }
@@ -6552,7 +6563,7 @@ impl ResolvedTypeShapeDslProgram {
                                 unreachable!("validated Invalid return has a string message")
                             };
                             DslOutcome::Invalid(ShapeError::ShapeComputation {
-                                message: message.value.to_str().to_owned(),
+                                message: message.value.to_str().to_owned().into(),
                             })
                         }
                         TypeShapeDslReturnKind::Gradual(domain) => {
@@ -7158,7 +7169,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
                         }
                         EinsumClassification::Invalid(error) => {
                             return DslOutcome::Invalid(ShapeError::ShapeComputation {
-                                message: error.message(),
+                                message: error.message().into(),
                             });
                         }
                     },
@@ -7169,7 +7180,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
                             }
                             EinopsEinsumClassification::Invalid(error) => {
                                 return DslOutcome::Invalid(ShapeError::ShapeComputation {
-                                    message: error.message(),
+                                    message: error.message().into(),
                                 });
                             }
                         }
@@ -7217,7 +7228,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
                         EinopsPatternClassification::Supported(pattern) => Some(pattern),
                         EinopsPatternClassification::Invalid(error) => {
                             return DslOutcome::Invalid(ShapeError::ShapeComputation {
-                                message: error.message(operation),
+                                message: error.message(operation).into(),
                             });
                         }
                     },
@@ -7342,7 +7353,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
                         GufuncClassification::Unsupported(_unsupported) => None,
                         GufuncClassification::Invalid(error) => {
                             return DslOutcome::Invalid(ShapeError::ShapeComputation {
-                                message: error.message(),
+                                message: error.message().into(),
                             });
                         }
                     },
@@ -7413,7 +7424,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
                         let index = if index < 0 { index + length } else { index };
                         if index < 0 || index >= length {
                             return DslOutcome::Invalid(ShapeError::ShapeComputation {
-                                message: "IntTuple index out of bounds".to_owned(),
+                                message: "IntTuple index out of bounds".to_owned().into(),
                             });
                         }
                         DslOutcome::Value(DslValue::Dimension(shape[index as usize].clone()))
@@ -7482,7 +7493,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
                         let index = if index < 0 { index + length } else { index };
                         if index < 0 || index >= length {
                             return DslOutcome::Invalid(ShapeError::ShapeComputation {
-                                message: "`IntTuples` index out of bounds".to_owned(),
+                                message: "`IntTuples` index out of bounds".to_owned().into(),
                             });
                         }
                         DslOutcome::Value(DslValue::Shape(shapes[index as usize].clone()))
@@ -7738,7 +7749,7 @@ impl StructurallyValidatedTypeShapeDslFunction {
                 };
                 if step == Some(0) {
                     return DslOutcome::Invalid(ShapeError::ShapeComputation {
-                        message: "range() arg 3 must not be zero".to_owned(),
+                        message: "range() arg 3 must not be zero".to_owned().into(),
                     });
                 }
                 let (Some(start), Some(stop), Some(step)) = (start, stop, step) else {
@@ -7826,7 +7837,8 @@ impl StructurallyValidatedTypeShapeDslFunction {
                             DslOutcome::Invalid(ShapeError::ShapeComputation {
                                 message: format!(
                                     "Flag sequence `.index` value `{item}` was not found"
-                                ),
+                                )
+                                .into(),
                             })
                         }
                     },
@@ -8763,7 +8775,7 @@ fn evaluate_dimension_arithmetic(
             "modulo"
         };
         return DslOutcome::Invalid(ShapeError::ShapeComputation {
-            message: format!("dimension integer {operation} by zero"),
+            message: format!("dimension integer {operation} by zero").into(),
         });
     }
     let left = operand(left);
@@ -8776,7 +8788,7 @@ fn evaluate_dimension_arithmetic(
         return evaluate_i64_arithmetic(*left, op, *right).map_or_else(
             |operation| {
                 DslOutcome::Invalid(ShapeError::ShapeComputation {
-                    message: format!("dimension integer {operation} by zero"),
+                    message: format!("dimension integer {operation} by zero").into(),
                 })
             },
             |value| {
@@ -8806,7 +8818,7 @@ fn evaluate_flag_int_arithmetic(left: i64, op: TypeShapeDslArithmeticOp, right: 
     evaluate_i64_arithmetic(left, op, right).map_or_else(
         |operation| {
             DslOutcome::Invalid(ShapeError::ShapeComputation {
-                message: format!("Flag integer {operation} by zero"),
+                message: format!("Flag integer {operation} by zero").into(),
             })
         },
         |value| {
@@ -8951,7 +8963,7 @@ impl DslValue {
             TypeShapeDslDomain::Int => match Int::from_type(ty) {
                 Some(dimension) => match canonicalize(Type::Int(dimension)) {
                     Type::Int(dimension) => Self::Dimension(dimension),
-                    canonical => unreachable!("canonicalizing a dimension yields `{canonical}`"),
+                    canonical => unreachable!("canonicalizing a dimension yields `{canonical:?}`"),
                 },
                 None => Self::Unknown,
             },
@@ -9018,6 +9030,8 @@ fn common_int_tuple_member(shapes: &[IntTuple]) -> IntTuple {
         IntTuple::shapeless()
     }
 }
+
+impl TypeOrd for StructurallyValidatedTypeShapeDslFunction {}
 
 #[cfg(test)]
 mod tests {

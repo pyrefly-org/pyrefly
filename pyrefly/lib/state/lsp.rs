@@ -39,8 +39,6 @@ use pyrefly_types::function::FuncMetadata;
 use pyrefly_types::function::FunctionKind;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::type_alias::TypeAliasData;
-use pyrefly_types::typed_dict::TypedDict;
-use pyrefly_types::typed_dict::TypedDictInner;
 use pyrefly_util::gas::Gas;
 use pyrefly_util::lock::Mutex;
 use pyrefly_util::prelude::SliceExt;
@@ -2019,7 +2017,11 @@ impl<'a> Transaction<'a> {
     /// ranges read from current class metadata: a `Class` keeps the `Module` from when its type
     /// was solved, and a module is not rechecked when a dependency only moves code around.
     fn class_module(&self, handle: &Handle, cls: &Class) -> Option<Module> {
-        self.get_module_info(&handle.for_module(cls.module_name(), cls.module_path().dupe()))
+        self.get_module_info(&self.imported_handle(
+            handle,
+            cls.module_name(),
+            cls.module_path().dupe(),
+        ))
     }
 
     /// The references in `references_by_module` that point at the definition at `definition_range`
@@ -2791,7 +2793,7 @@ impl<'a> Transaction<'a> {
         handle: &Handle,
         position: TextSize,
         covering_nodes: &[AnyNodeRef],
-    ) -> Option<(TypedDictInner, Name)> {
+    ) -> Option<(ClassType, Name)> {
         let subscript = covering_nodes.iter().find_map(|node| match node {
             AnyNodeRef::ExprSubscript(subscript) => Some(subscript),
             _ => None,
@@ -2805,19 +2807,23 @@ impl<'a> Transaction<'a> {
 
         let name = Name::new(key.value.to_str());
         let base_type = self.get_type_trace(handle, subscript.value.range())?;
-        let typed_dict = match base_type {
-            Type::TypedDict(TypedDict::TypedDict(typed_dict))
-            | Type::PartialTypedDict(TypedDict::TypedDict(typed_dict)) => typed_dict,
-            _ => return None,
+        let (Type::ClassType(typed_dict) | Type::PartialTypedDict(typed_dict)) = &base_type else {
+            return None;
         };
-        Some((typed_dict, name))
+        if self.ad_hoc_solve(handle, "typed_dict_key_at", |solver| {
+            solver.is_typed_dict(&base_type)
+        }) != Some(true)
+        {
+            return None;
+        }
+        Some((typed_dict.clone(), name))
     }
 
     /// Resolve a TypedDict key to its field declaration.
     fn find_definition_for_typed_dict_key(
         &self,
         handle: &Handle,
-        typed_dict: &TypedDictInner,
+        typed_dict: &ClassType,
         name: &Name,
     ) -> Option<FindDefinitionItemWithDocstring> {
         self.ad_hoc_solve(handle, "typed_dict_key_definition", |solver| {
@@ -3537,7 +3543,7 @@ impl<'a> Transaction<'a> {
             .get_answers(handle)
             .ok_or(EmptyResponseReason::AnswersNotFound)?;
         let none_type = answers.heap().mk_class_type(stdlib.none_type().clone());
-        let symbol_def_paths = collect_symbol_def_paths(&none_type);
+        let symbol_def_paths = collect_symbol_def_paths(&self.type_env(handle), &none_type);
         let defs = symbol_def_paths.map(|(qname, _)| {
             let module_info = qname.module().clone();
             FindDefinitionItemWithDocstring {
@@ -3660,7 +3666,8 @@ impl<'a> Transaction<'a> {
         };
 
         if let Some(func_id) = metadata.kind.as_func_def_id() {
-            let def_handle = handle.for_module(
+            let def_handle = self.imported_handle(
+                handle,
                 func_id.qname.module_name(),
                 func_id.qname.module_path().dupe(),
             );
@@ -3685,7 +3692,8 @@ impl<'a> Transaction<'a> {
             // A callback protocol borrows the signature of a class's `__call__`, so the
             // class is what defines it.
             FunctionKind::CallbackProtocol(cls) => {
-                let qname = cls.qname();
+                let env = self.type_env(handle);
+                let qname = cls.qname(&env);
                 Some(Ok(TextRangeWithModule::new(
                     qname.module().clone(),
                     qname.range(),
@@ -3733,7 +3741,7 @@ impl<'a> Transaction<'a> {
                 return Ok(vec![def?]);
             }
 
-            let symbol_def_paths = collect_symbol_def_paths(&t);
+            let symbol_def_paths = collect_symbol_def_paths(&self.type_env(handle), &t);
 
             if !symbol_def_paths.is_empty() {
                 return Ok(symbol_def_paths.map(|(qname, _)| {
@@ -3805,6 +3813,7 @@ impl<'a> Transaction<'a> {
         handle: &Handle,
         range: TextRange,
         import_format: ImportFormat,
+        inlay_hint_config: InlayHintConfig,
         custom_thread_pool: Option<&ThreadPool>,
     ) -> Option<Vec<(String, Vec<(Module, TextRange, String)>)>> {
         let module_info = self.get_module_info(handle)?;
@@ -4078,6 +4087,17 @@ impl<'a> Transaction<'a> {
                 }
                 _ => {}
             }
+        }
+        if let Some(actions) =
+            quick_fixes::insert_inferred_annotation::insert_inferred_annotation_code_actions(
+                self,
+                handle,
+                range,
+                import_format,
+                inlay_hint_config,
+            )
+        {
+            multi_actions.extend(actions);
         }
         if let Some(answers) = self.get_answers(handle) {
             let bindings = answers.bindings();

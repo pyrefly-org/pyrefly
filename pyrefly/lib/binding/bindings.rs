@@ -769,8 +769,8 @@ impl Bindings {
     }
 
     /// Look up pre-computed class fields by `ClassDefIndex`. O(1) Vec index.
-    /// Returns `None` if the index is out of bounds (e.g., stale cross-module
-    /// index after incremental rebuild).
+    /// Returns `None` if the index is out of bounds (e.g., a stale index after
+    /// an incremental rebuild).
     pub fn get_class_fields(&self, idx: ClassDefIndex) -> Option<&ClassFields> {
         Some(&self.metadata.get_class_checked(idx)?.fields)
     }
@@ -2126,9 +2126,7 @@ impl<'a> BindingsBuilder<'a> {
             return false;
         };
         match self.idx_to_binding(*class_idx) {
-            Some(BindingClass::ClassDef(class)) => {
-                class.def.type_params.is_some() || class.tparams_require_binding
-            }
+            Some(BindingClass::ClassDef(class)) => class.has_tparams,
             Some(BindingClass::FunctionalClassDef(..)) | None => false,
         }
     }

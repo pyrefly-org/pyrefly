@@ -2443,6 +2443,23 @@ def f(begin: int | None, end: int | None) -> int:
 "#,
 );
 
+// https://github.com/pyrefly-org/pyrefly/issues/5206
+testcase!(
+    test_match_tuple_refutable_cases_are_exhaustive_return,
+    r#"
+def f(x: bool, y: bool) -> int:
+    match x, y:
+        case True, True:
+            return 0
+        case True, False:
+            return 1
+        case False, True:
+            return 2
+        case False, False:
+            return 3
+"#,
+);
+
 testcase!(
     test_match_starred_tuple_subject_is_not_fixed_arity,
     r#"
@@ -2665,5 +2682,38 @@ def duplicate_partial(a: A) -> None:
             pass
         case A(x=1):
             pass
+"#,
+);
+
+testcase!(
+    test_tuple_match_class_pattern_with_capture_exhaustive,
+    r#"
+from typing import assert_never
+
+class A:
+    __match_args__ = ("x",)
+    x: int
+
+def f(a: A, b: bool) -> None:
+    match a, b:
+        case A(x), _:
+            pass
+        case _ as never:
+            assert_never(never)
+"#,
+);
+
+// https://github.com/pyrefly-org/pyrefly/issues/5622
+testcase!(
+    test_sequence_pattern_or_element_exhaustive,
+    r#"
+from typing import Literal, assert_never
+
+def f(value: Literal[1, 2]) -> None:
+    match (value,):
+        case (1 | 2,):
+            pass
+        case remaining:
+            assert_never(remaining)
 "#,
 );

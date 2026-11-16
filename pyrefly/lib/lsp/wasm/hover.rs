@@ -8,7 +8,6 @@
 // @lint-ignore-every SPELL
 
 use std::cell::LazyCell;
-use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use dupe::Dupe;
@@ -40,6 +39,7 @@ use pyrefly_types::display::LspDisplayMode;
 use pyrefly_types::type_var::Variance;
 use pyrefly_types::types::Type;
 use pyrefly_util::absolutize::Absolutize as _;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::lined_buffer::LineNumber;
 use regex::Regex;
 use ruff_python_ast::AnyNodeRef;
@@ -77,6 +77,7 @@ use crate::state::lsp::IdentifierWithContext;
 use crate::state::lsp::attribute_symbol_kind_from_type;
 use crate::state::state::Transaction;
 use crate::state::state::TransactionHandle;
+use crate::types::env::TypeEnv;
 
 /// Matches Sphinx cross-references like `:meth:`target``, `:class:`MyClass``, etc.
 /// The role name is captured but ignored — all roles resolve uniformly.
@@ -118,8 +119,8 @@ fn qualify_hover_names(kind: Option<SymbolKind>, type_: &Type) -> bool {
 
 impl HoverValue {
     #[cfg(not(target_arch = "wasm32"))]
-    fn format_symbol_def_locations(t: &Type) -> Option<String> {
-        let symbol_paths = collect_symbol_def_paths(t);
+    fn format_symbol_def_locations(env: &dyn TypeEnv, t: &Type) -> Option<String> {
+        let symbol_paths = collect_symbol_def_paths(env, t);
         let linked_names = symbol_paths
             .into_iter()
             .filter_map(|(qname, file_path)| {
@@ -142,7 +143,7 @@ impl HoverValue {
     }
 
     #[cfg(target_arch = "wasm32")]
-    fn format_symbol_def_locations(t: &Type) -> Option<String> {
+    fn format_symbol_def_locations(_env: &dyn TypeEnv, t: &Type) -> Option<String> {
         None
     }
 
@@ -250,6 +251,7 @@ impl HoverValue {
     }
 
     pub fn format(&self, transaction: &Transaction, handle: &Handle) -> Hover {
+        let type_env = transaction.type_env(handle);
         let docstring_formatted = match &self.docstring {
             Some(docstring) => {
                 let content = docstring.resolve();
@@ -288,7 +290,7 @@ impl HoverValue {
             .map(|s| format!("{s}: "))
             .unwrap_or_default();
         let symbol_def_formatted = if self.show_go_to_links {
-            HoverValue::format_symbol_def_locations(&self.type_).unwrap_or_default()
+            HoverValue::format_symbol_def_locations(&type_env, &self.type_).unwrap_or_default()
         } else {
             String::new()
         };
@@ -305,6 +307,7 @@ impl HoverValue {
         };
         let type_display = self.display.clone().unwrap_or_else(|| {
             self.type_.as_lsp_string_with_options(
+                &type_env,
                 self.name.as_deref(),
                 LspDisplayMode::Hover,
                 false,
@@ -435,7 +438,7 @@ fn position_is_in_docstring(ast: Option<&ModModule>, position: TextSize) -> bool
 /// If we can't determine a symbol name via go-to-definition, fall back to what the
 /// type metadata knows about the callable. This primarily handles third-party stubs
 /// where we only have typeshed information.
-fn fallback_hover_name_from_type(type_: &Type) -> Option<String> {
+fn fallback_hover_name_from_type(type_: &Type, env: &dyn TypeEnv) -> Option<String> {
     let name = type_
         .toplevel_func_metadata()
         .map(|meta| meta.kind.function_name());
@@ -445,13 +448,13 @@ fn fallback_hover_name_from_type(type_: &Type) -> Option<String> {
     // Recurse through Type wrapper
     if let Type::Type(inner) = type_ {
         return match inner.as_ref() {
-            Type::ClassType(cls) => Some(cls.name().to_string()),
-            _ => fallback_hover_name_from_type(inner),
+            Type::ClassType(cls) => Some(cls.name(env).to_string()),
+            _ => fallback_hover_name_from_type(inner, env),
         };
     }
     match type_ {
-        Type::ClassDef(cls) => Some(cls.name().to_string()),
-        Type::SpecializedClassDef(cls) => Some(cls.name().to_string()),
+        Type::ClassDef(cls) => Some(cls.name(env).to_string()),
+        Type::SpecializedClassDef(cls) => Some(cls.name(env).to_string()),
         _ => None,
     }
 }
@@ -529,20 +532,18 @@ fn docstring_for_class_object_type(
     handle: &Handle,
     type_: &Type,
 ) -> Option<Docstring> {
+    let env = transaction.type_env(handle);
     let qname = match type_ {
-        Type::ClassDef(cls) => cls.qname(),
-        Type::SpecializedClassDef(cls) => cls.qname(),
+        Type::ClassDef(cls) => cls.qname(&env),
+        Type::SpecializedClassDef(cls) => cls.qname(&env),
         Type::Type(inner) => match inner.as_ref() {
-            Type::ClassType(cls) => cls.qname(),
+            Type::ClassType(cls) => cls.qname(&env),
             _ => return None,
         },
         _ => return None,
     };
-    let definition_handle = Handle::new(
-        qname.module_name(),
-        qname.module_path().dupe(),
-        handle.sys_info().dupe(),
-    );
+    let definition_handle =
+        transaction.imported_handle(handle, qname.module_name(), qname.module_path().dupe());
     let module = transaction.get_module_info(&definition_handle)?;
     // Exported classes retain their docstring range after their AST is evicted.
     let range = if let Some(ExportLocation::ThisModule(export)) =
@@ -681,7 +682,7 @@ fn type_parameter_hover_display(
     Some(format!(
         "{}@{} ({})",
         quantified.name(),
-        owner.name(),
+        owner.name(solver),
         display_variance_for_hover(variance.get(quantified.name()))
     ))
 }
@@ -726,45 +727,6 @@ fn class_display_type(solver: &AnswersSolver<TransactionHandle<'_>>, type_: &Typ
     Some(solver.for_display(constructor))
 }
 
-fn parameter_documentation_for_callee(
-    transaction: &Transaction<'_>,
-    handle: &Handle,
-    callee_range: TextRange,
-) -> Option<HashMap<String, String>> {
-    let position = callee_range.start();
-    let docstring = transaction
-        .find_definition(
-            handle,
-            position,
-            FindPreference {
-                prefer_pyi: false,
-                include_interpreter_stdlib: true,
-                ..Default::default()
-            },
-        )
-        .map(Vec1::into_vec)
-        .unwrap_or_default()
-        .into_iter()
-        .find_map(|item| {
-            item.docstring_range
-                .map(|range| (range, item.module.clone()))
-        })
-        .or_else(|| {
-            transaction
-                .find_definition(handle, position, FindPreference::default())
-                .map(Vec1::into_vec)
-                .unwrap_or_default()
-                .into_iter()
-                .find_map(|item| {
-                    item.docstring_range
-                        .map(|range| (range, item.module.clone()))
-                })
-        })?;
-    let (range, module) = docstring;
-    let docs = parse_parameter_documentation(module.code_at(range));
-    if docs.is_empty() { None } else { Some(docs) }
-}
-
 fn keyword_argument_documentation(
     transaction: &Transaction<'_>,
     handle: &Handle,
@@ -775,7 +737,7 @@ fn keyword_argument_documentation(
         return None;
     }
     let CallInfo { callee_range, .. } = transaction.get_callables_from_call(handle, position)?;
-    let docs = parameter_documentation_for_callee(transaction, handle, callee_range)?;
+    let docs = transaction.parameter_documentation_for_callee(handle, callee_range)?;
     let name = identifier.identifier.id.to_string();
     docs.get(name.as_str()).cloned().map(|doc| (name, doc))
 }
@@ -798,10 +760,11 @@ fn parameter_definition_documentation(
         })
         .find(|func| func.range.contains_inclusive(definition_range.start()))?;
 
-    let doc_range = Docstring::range_from_stmts(func.body.as_slice())?;
-    let docs = parse_parameter_documentation(module.code_at(doc_range));
+    let mut docs = Docstring::range_from_stmts(func.body.as_slice())
+        .map(|range| parse_parameter_documentation(module.code_at(range)))
+        .unwrap_or_default();
     let key = name.as_str();
-    docs.get(key).cloned().map(|doc| (key.to_owned(), doc))
+    docs.remove(key).map(|doc| (key.to_owned(), doc))
 }
 
 fn keyword_argument_identifier(
@@ -1346,7 +1309,8 @@ fn in_keyword_hover(
             contents: Contents::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: format!(
-                    "```python\n(keyword) in\n```\n---\nIteration over `{iterable_type}`\n\n{documentation}\n\n[Python language reference]({reference})"
+                    "```python\n(keyword) in\n```\n---\nIteration over `{}`\n\n{documentation}\n\n[Python language reference]({reference})",
+                    iterable_type.display_with(&transaction.type_env(handle)),
                 ),
             }),
             range: Some(module.to_lsp_range(token.range())),
@@ -1631,7 +1595,8 @@ pub fn get_hover_with_verbosity(
                 })
         });
 
-    let fallback_name_from_type = fallback_hover_name_from_type(&type_);
+    let fallback_name_from_type =
+        fallback_hover_name_from_type(&type_, &transaction.type_env(handle));
     let keyword_argument_identifier = keyword_argument_identifier(transaction, handle, position);
     let definition = transaction
         .find_definition(
@@ -1755,6 +1720,7 @@ pub fn get_hover_with_verbosity(
                     qualify_hover_names(kind, &display_type).then(|| handle.module());
                 let render = |expand| {
                     display_type.as_lsp_string_with_options(
+                        &solver,
                         name_for_display.as_deref(),
                         LspDisplayMode::Hover,
                         expand,
@@ -1817,6 +1783,7 @@ mod tests {
     use pyrefly_types::function::FuncMetadata;
     use pyrefly_types::function::Function;
     use pyrefly_types::heap::TypeHeap;
+    use pyrefly_types::test_type_env::TestTypeEnv;
     use ruff_python_ast::name::Name;
 
     use super::*;
@@ -1839,7 +1806,7 @@ mod tests {
     fn fallback_uses_function_metadata() {
         let heap = TypeHeap::new();
         let ty = make_function_type(&heap, "numpy", "arange");
-        let fallback = fallback_hover_name_from_type(&ty);
+        let fallback = fallback_hover_name_from_type(&ty, &TestTypeEnv::new());
         assert_eq!(fallback.as_deref(), Some("arange"));
     }
 
@@ -1849,7 +1816,8 @@ mod tests {
         let report =
             get_batched_lsp_operations_report(&[("main", code)], |state, handle, position| {
                 let ty = state.transaction().get_type_at(handle, position).unwrap();
-                let name = fallback_hover_name_from_type(&ty);
+                let name =
+                    fallback_hover_name_from_type(&ty, &state.transaction().type_env(handle));
                 assert_eq!(name.as_deref(), Some("Box"));
                 name.unwrap()
             });
@@ -1860,7 +1828,7 @@ mod tests {
     fn fallback_recurses_through_type_wrapper() {
         let heap = TypeHeap::new();
         let ty = heap.mk_type_of(make_function_type(&heap, "pkg.subpkg", "run"));
-        let fallback = fallback_hover_name_from_type(&ty);
+        let fallback = fallback_hover_name_from_type(&ty, &TestTypeEnv::new());
         assert_eq!(fallback.as_deref(), Some("run"));
     }
 

@@ -5,9 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::fmt::Display;
-use std::fmt::Formatter;
-use std::fmt::Result as FmtResult;
+use std::fmt;
 
 use dupe::Dupe;
 use pyrefly_derive::TypeEq;
@@ -16,6 +14,7 @@ use pyrefly_derive::VisitMut;
 use pyrefly_python::dunder;
 use pyrefly_types::dimension::Int;
 use pyrefly_types::heap::TypeHeap;
+use pyrefly_util::display::DisplayWith;
 use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use starlark_map::small_map::SmallMap;
@@ -28,6 +27,7 @@ use crate::alt::types::class_bases::ClassBases;
 use crate::types::callable::Callable;
 use crate::types::callable::Params;
 use crate::types::class::Class;
+use crate::types::env::TypeEnv;
 use crate::types::function::FuncMetadata;
 use crate::types::quantified::Quantified;
 use crate::types::tuple::Tuple;
@@ -61,8 +61,8 @@ pub struct VarianceMap(SmallMap<Name, Variance>);
 
 static EMPTY_VARIANCE_MAP: VarianceMap = VarianceMap(SmallMap::new());
 
-impl Display for VarianceMap {
-    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for VarianceMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, _env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         write!(f, "{{")?;
         for (key, value) in self.0.iter() {
             write!(f, "{key}: {value}, ")?;
@@ -422,7 +422,7 @@ fn on_type(
         Type::Tuple(t) => {
             handle_tuple_type(t, path, on_edge, on_var);
         }
-        Type::Unpack(inner) => {
+        Type::Unpack(inner, _) => {
             on_type(path, inner, on_edge, on_var);
         }
         Type::Int(dim) => {
@@ -840,7 +840,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if ty.is_toplevel_callable() {
                 let range = class_fields
                     .and_then(|f| f.field_decl_range(name))
-                    .unwrap_or_else(|| class.range());
+                    .unwrap_or_else(|| class.range(self));
                 self.check_method_shallow(ty, range, &mut violations);
             }
         }
@@ -943,7 +943,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Type::Quantified(q) => {
                 check_typevar(q.name(), position, q.variance(), range, violations);
             }
-            Type::Unpack(inner) => {
+            Type::Unpack(inner, _) => {
                 self.check_annotation_variance(inner, position, range, violations);
             }
             Type::Tuple(Tuple::Unpacked(parts))

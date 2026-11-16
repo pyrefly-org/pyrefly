@@ -18,7 +18,8 @@ use pyrefly_types::class::ClassType;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::special_form::SpecialForm;
 use pyrefly_types::type_info::TypeInfo;
-use pyrefly_types::typed_dict::TypedDict;
+use pyrefly_util::display::DisplayWith;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::display::commas_iter;
 use ruff_python_ast::Expr;
 use ruff_text_size::Ranged;
@@ -37,6 +38,7 @@ use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 use crate::error::style::ErrorStyle;
 use crate::types::class::Class;
+use crate::types::env::TypeEnv;
 use crate::types::quantified::Quantified;
 use crate::types::tuple::Tuple;
 use crate::types::types::Type;
@@ -107,9 +109,13 @@ impl ClassBases {
     }
 }
 
-impl fmt::Display for ClassBases {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ClassBases({})", commas_iter(|| self.base_types.iter()))
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for ClassBases {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
+        write!(
+            f,
+            "ClassBases({})",
+            commas_iter(|| self.base_types.iter().map(|b| b.display_with(env)))
+        )
     }
 }
 
@@ -125,9 +131,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) -> (Type, bool) {
         if let Type::Var(v) = base {
-            base = self.solver().force_var(v);
+            base = self.solver().force_var(v, self);
         }
-        if matches!(&base, Type::ClassDef(t) if t.name() == "tuple") {
+        if matches!(&base, Type::ClassDef(t) if t.name(self) == "tuple") {
             base = self
                 .heap
                 .mk_type_of(self.heap.mk_special_form(SpecialForm::Tuple));
@@ -206,7 +212,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::UnsupportedOperation,
                 format!(
                     "`{}` is not a subscriptable type on base class list",
-                    self.for_display(t)
+                    self.display(t)
                 ),
             ),
         };
@@ -334,7 +340,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let class_of = |ty: &Type| match ty {
             Type::ClassType(class) => Some(class.class_object().dupe()),
             Type::Tuple(_) => Some(self.stdlib.tuple_object().dupe()),
-            Type::TypedDict(TypedDict::TypedDict(dict)) => Some(dict.class_object().dupe()),
             Type::Int(_) => Some(self.stdlib.int().class_object().dupe()),
             _ => None,
         };
@@ -539,6 +544,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .filter_map(|base_type_and_position| {
                 // Return Ok() if the base class is valid, or Err() if it is not.
                 match base_type_and_position {
+                    // A NewType cannot be based on a TypedDict. The error is reported in
+                    // `class_metadata_of`; don't record a base class for it here.
+                    (Type::ClassType(c), _)
+                        if is_new_type && self.is_typed_dict_class(c.class_object()) =>
+                    {
+                        None
+                    }
                     (Type::ClassType(c), base_position) => {
                         let bases = self.get_base_types_for_class(c.class_object());
                         // Propagate has_strict from parent class
@@ -551,32 +563,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         let class_ty = self.erase_tuple_type(tuple);
                         let bases = self.get_base_types_for_class(class_ty.class_object());
                         Some((class_ty, bases, base_position))
-                    }
-                    (Type::TypedDict(typed_dict), base_position) => {
-                        if is_new_type {
-                            // Error will be reported in `class_metadata_of`
-                            None
-                        } else {
-                            // HACK HACK HACK - TypedDict instances behave very differently from instances of other
-                            // classes, so we don't represent them as ClassType in normal typechecking logic. However,
-                            // class ancestors are represented as ClassType all over the code base, and changing this
-                            // would be quite painful. So we convert TypedDict to ClassType in this one spot. Please do
-                            // not do this anywhere else.
-                            match typed_dict {
-                                TypedDict::TypedDict(inner) => Some((
-                                    ClassType::new(
-                                        inner.class_object().dupe(),
-                                        inner.targs().clone(),
-                                    ),
-                                    self.get_base_types_for_class(inner.class_object()),
-                                    base_position,
-                                )),
-                                TypedDict::Anonymous(_) => {
-                                    // Anonymous TypedDict cannot be used as a base class
-                                    None
-                                }
-                            }
-                        }
                     }
                     (Type::Type(f), base_position) if f.is_any() => {
                         // `type[Any]` is equivalent to `type` or `Type`
@@ -645,11 +631,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         {
             self.error(
                 errors,
-                cls.range(),
+                cls.range(self),
                 ErrorKind::InvalidInheritance,
                 format!(
                     "Class `{}` has a nonlinearizable inheritance chain detected at `object`",
-                    cls.name()
+                    cls.name(self)
                 ),
             );
         }

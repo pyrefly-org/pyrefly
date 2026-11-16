@@ -6,8 +6,6 @@
  */
 
 use std::fmt;
-use std::fmt::Display;
-use std::fmt::Formatter;
 use std::iter;
 use std::sync::Arc;
 
@@ -19,6 +17,8 @@ use pyrefly_python::dunder;
 use pyrefly_types::function::Deprecation;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::typed_dict::ExtraItems;
+use pyrefly_util::display::DisplayWith;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::display::commas_iter;
 use pyrefly_util::visit::Visit as VisitTrait;
 use pyrefly_util::visit::VisitMut;
@@ -36,6 +36,7 @@ use crate::error::collector::ErrorCollector;
 use crate::types::class::Class;
 use crate::types::class::ClassType;
 use crate::types::display::ClassDisplayContext;
+use crate::types::env::TypeEnv;
 use crate::types::keywords::DataclassFieldKeywords;
 use crate::types::keywords::DataclassKeywords;
 use crate::types::keywords::DataclassTransformMetadata;
@@ -171,12 +172,12 @@ impl VisitTrait<Type> for ClassMetadata {
     }
 }
 
-impl Display for ClassMetadata {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for ClassMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         let metaclass = self
             .metaclass
             .as_ref()
-            .map_or("type".to_owned(), |m| format!("{m}"));
+            .map_or("type".to_owned(), |m| m.display_with(env).to_string());
         write!(f, "ClassMetadata(metaclass={metaclass})")
     }
 }
@@ -474,9 +475,9 @@ impl VisitTrait<Type> for ClassSynthesizedField {
     }
 }
 
-impl Display for ClassSynthesizedField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.inner)
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for ClassSynthesizedField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
+        write!(f, "{}", self.inner.display_with(env))
     }
 }
 
@@ -532,15 +533,15 @@ impl ClassSynthesizedFields {
     }
 }
 
-impl Display for ClassSynthesizedFields {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for ClassSynthesizedFields {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         write!(
             f,
             "ClassSynthesizedFields {{ {} }}",
             commas_iter(|| self
                 .0
                 .iter()
-                .map(|(name, field)| format!("{name} => {field}")))
+                .map(|(name, field)| format!("{name} => {}", field.display_with(env))))
         )
     }
 }
@@ -556,9 +557,9 @@ pub struct Metaclass {
     is_explicitly_abstract: bool,
 }
 
-impl Display for Metaclass {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self.metaclass)
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for Metaclass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
+        write!(f, "{}", self.metaclass.display_with(env))
     }
 }
 
@@ -586,16 +587,6 @@ impl Metaclass {
 /// separately as part of `ClassMetadata`.
 #[derive(Clone, Debug, TypeEq, PartialEq, Eq, Default)]
 struct Keywords(Vec<(Name, Type)>);
-
-impl Display for Keywords {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(
-            f,
-            "[{}]",
-            commas_iter(|| self.0.iter().map(|(n, ty)| format!("{n}: {ty}")))
-        )
-    }
-}
 
 #[derive(Clone, Debug, TypeEq, PartialEq, Eq)]
 pub struct TypedDictMetadata {
@@ -755,8 +746,8 @@ impl DjangoReverseRelationIndex {
     }
 }
 
-impl Display for DjangoReverseRelationIndex {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for DjangoReverseRelationIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, _env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         write!(f, "DjangoReverseRelationIndex(len={})", self.0.len())
     }
 }
@@ -825,11 +816,15 @@ pub enum ClassMro {
 
 static RECURSIVE_CLASS_MRO: ClassMro = ClassMro::Cyclic;
 
-impl Display for ClassMro {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for ClassMro {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         match self {
             ClassMro::Resolved { ancestors, .. } => {
-                write!(f, "[{}]", commas_iter(|| ancestors.iter()))
+                write!(
+                    f,
+                    "[{}]",
+                    commas_iter(|| ancestors.iter().map(|a| a.display_with(env)))
+                )
             }
             ClassMro::Cyclic => write!(f, "Cyclic"),
         }
@@ -851,19 +846,20 @@ impl ClassMro {
     /// TODO: We currently omit some classes that are in the runtime MRO:
     /// `Generic`, `Protocol`, and `object`.
     pub fn new(
+        env: &dyn TypeEnv,
         cls: &Class,
         bases_with_mro: Vec<(&ClassType, &ClassMro)>,
         errors: &ErrorCollector,
         targs_consistent: &dyn Fn(&ClassType, &ClassType) -> bool,
     ) -> Self {
-        match Linearization::new(cls, bases_with_mro, errors, targs_consistent) {
+        match Linearization::new(env, cls, bases_with_mro, errors, targs_consistent) {
             Linearization::Cyclic => Self::Cyclic,
             Linearization::Resolved {
                 ancestor_chains,
                 all_bases_complete,
             } => {
                 let (ancestors, merge_complete) =
-                    Linearization::merge(cls, ancestor_chains, errors);
+                    Linearization::merge(env, cls, ancestor_chains, errors);
                 Self::Resolved {
                     ancestors,
                     linearization_complete: all_bases_complete && merge_complete,
@@ -922,10 +918,10 @@ static RECURSIVE_CLASS_DISJOINT_BASE: ClassDisjointBase = ClassDisjointBase {
     representative: None,
 };
 
-impl Display for ClassDisjointBase {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for ClassDisjointBase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         match &self.representative {
-            Some(cls) => write!(f, "ClassDisjointBase({})", cls.name()),
+            Some(cls) => write!(f, "ClassDisjointBase({})", cls.name(env)),
             None => write!(f, "ClassDisjointBase(None)"),
         }
     }
@@ -987,6 +983,7 @@ impl Linearization {
     /// - One for each base class's MRO, in the order that base classes are defined
     /// - One consisting of the base classes themselves in the order defined.
     fn new(
+        env: &dyn TypeEnv,
         cls: &Class,
         bases_with_mro: Vec<(&ClassType, &ClassMro)>,
         errors: &ErrorCollector,
@@ -1016,7 +1013,7 @@ impl Linearization {
                     }
                     let ancestors_through_base = ancestors
                         .iter()
-                        .map(|ancestor| ancestor.substitute_with(&base.substitution()))
+                        .map(|ancestor| ancestor.substitute_with(&base.substitution(), env))
                         .rev()
                         .collect::<Vec<_>>();
                     let mut check_conflicting_targs = |ctype: &ClassType| -> bool {
@@ -1025,19 +1022,20 @@ impl Linearization {
                             // MRO keeps, so every later one is checked against it and the
                             // recorded specialization never changes.
                             Some(prev) if !targs_consistent(prev, ctype) => {
-                                let ctx = ClassDisplayContext::new(&[cls, ctype.class_object()]);
+                                let ctx =
+                                    ClassDisplayContext::new(env, &[cls, ctype.class_object()]);
                                 // TODO: Extend this error message to say where in the class bases the mismatch comes from
                                 // we will need to wire additional information for this.
                                 errors
                                     .error_builder(
-                                        cls.range(),
+                                        cls.range(env),
                                         ErrorKind::InvalidInheritance,
                                         format!(
                                             "Class `{}` has inconsistent type arguments for base class `{}`: `{}` and `{}`",
                                             ctx.display(cls),
                                             ctx.display(ctype.class_object()),
-                                            Type::ClassType(prev.clone()),
-                                            Type::ClassType(ctype.clone()),
+                                            prev.display_with(env),
+                                            ctype.display_with(env),
                                         ),
                                     )
                                     .emit();
@@ -1067,10 +1065,10 @@ impl Linearization {
                 // depends on how exactly the recursion in resolving keys plays out.
                 ClassMro::Cyclic => {
                     let base = base.class_object();
-                    let ctx = ClassDisplayContext::new(&[cls, base]);
+                    let ctx = ClassDisplayContext::new(env, &[cls, base]);
                     errors
                         .error_builder(
-                            cls.range(),
+                            cls.range(env),
                             ErrorKind::InvalidInheritance,
                             format!(
                                 "Class `{}` inheriting from `{}` creates a cycle",
@@ -1095,6 +1093,7 @@ impl Linearization {
     ///
     /// Returns a recovery prefix and `false` after reporting nonlinearizable inheritance.
     fn merge(
+        env: &dyn TypeEnv,
         cls: &Class,
         mut ancestor_chains: Vec<AncestorChain>,
         errors: &ErrorCollector,
@@ -1118,7 +1117,7 @@ impl Linearization {
                         .iter()
                         .rev()
                         .skip(1)
-                        .any(|class| class.qname() == candidate.qname())
+                        .any(|class| class.qname(env) == candidate.qname(env))
                     {
                         rejected = true;
                         break;
@@ -1133,7 +1132,8 @@ impl Linearization {
                 // Strip the selected class from all chains. Any empty chain is removed.
                 let mut chains_to_remove = Vec::new();
                 for (idx, ancestors) in ancestor_chains.iter_mut().enumerate() {
-                    if ancestors.0.last().class_object().qname() == selected.class_object().qname()
+                    if ancestors.0.last().class_object().qname(env)
+                        == selected.class_object().qname(env)
                     {
                         match ancestors.0.pop() {
                             Ok(_) => {}
@@ -1157,10 +1157,10 @@ impl Linearization {
                     .last()
                     .class_object()
                     .dupe();
-                let ctx = ClassDisplayContext::new(&[cls, first_candidate]);
+                let ctx = ClassDisplayContext::new(env, &[cls, first_candidate]);
                 errors
                     .error_builder(
-                        cls.range(),
+                        cls.range(env),
                         ErrorKind::InvalidInheritance,
                         format!(
                             "Class `{}` has a nonlinearizable inheritance chain detected at `{}`",
