@@ -492,6 +492,51 @@ fn get_test_report(state: &State, handle: &Handle, position: TextSize) -> String
     )
 }
 
+#[test]
+fn test_prepare_rename_identifier_without_answers() {
+    let source = "value = 1\nvalue\n";
+    let (state, handle) = TestEnv::one("main", source)
+        .with_run_require(Require::Exports)
+        .to_state();
+    let handle = handle("main");
+    let mut transaction = state.transaction();
+    transaction.set_evict_answers_after_scip_hook(true);
+    transaction.run(&[handle.dupe()], Require::Everything, None);
+    assert!(transaction.get_ast(&handle).is_some());
+    assert!(transaction.get_answers(&handle).is_none());
+    for start in [
+        source.find("value").unwrap(),
+        source.rfind("value").unwrap(),
+    ] {
+        let range = TextRange::at(TextSize::try_from(start).unwrap(), TextSize::of("value"));
+        assert_eq!(
+            transaction.prepare_rename(&handle, range.start()),
+            Some(range),
+        );
+    }
+}
+
+#[test]
+fn test_prepare_rename_ordinary_alias_of_bundled_symbol() {
+    let source = "from math import sin as alias\nalias(0)\n";
+    let (state, handle) = TestEnv::one("main", source).to_state();
+    let handle = handle("main");
+    for start in [
+        source.find("alias").unwrap(),
+        source.rfind("alias").unwrap(),
+    ] {
+        let range = TextRange::at(TextSize::try_from(start).unwrap(), TextSize::of("alias"));
+        assert_eq!(
+            state.transaction().prepare_rename(&handle, range.start()),
+            Some(range),
+        );
+        assert_eq!(
+            rename_local_symbol(source, start),
+            source.replace("alias", "renamed"),
+        );
+    }
+}
+
 // BUG: prepare_rename returns None for the __slots__ entry (issue #4344).
 #[test]
 fn prepare_rename_symbol_literals() {
