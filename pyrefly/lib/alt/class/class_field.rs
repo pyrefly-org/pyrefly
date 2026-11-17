@@ -3815,9 +3815,46 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .filter(|sig| {
                 let (func, tparams) = match sig {
                     OverloadType::Function(f) => (f, None),
-                    OverloadType::Forall(forall) => (&forall.body, Some(&*forall.tparams)),
+                    OverloadType::Forall(forall) => (&forall.body, Some(&forall.tparams)),
                 };
-                self.overload_accepts_self_type(func, tparams, self_type)
+                // Only instance methods have a `self` first parameter; static and
+                // class methods' first parameter is a regular argument.
+                if func.metadata.flags.is_staticmethod || func.metadata.flags.is_classmethod {
+                    return true;
+                }
+                func.signature.get_first_param().is_none_or(|p| {
+                    // Replace the overload's own type params in `self:` with `Any`
+                    // (e.g. `self: Array[S, T]` -> `Array[Any, Any]`), matching against a gradual
+                    // `self:` rather than a rigid, unsolvable variable.
+                    let p = match tparams {
+                        Some(tparams) => {
+                            let any = self.heap.mk_any_implicit();
+                            p.clone()
+                                .subst(&tparams.iter().map(|q| (q, &any)).collect())
+                        }
+                        None => p.clone(),
+                    };
+                    // A non-protocol `self:` can't re-enter protocol conformance, so check
+                    // it directly. A protocol-typed `self:`, however, makes
+                    // `is_subset_eq(self_type, p)` re-enter this same filtering on the same
+                    // `(self_type, p)` pair — unbounded recursion for a self-referential
+                    // protocol. Guard only that case coinductively: on re-entry
+                    // of the same pair, assume the overload applies (keep it).
+                    let p_is_protocol = matches!(
+                        &p,
+                        Type::ClassType(cls) if self.type_order().is_protocol(cls.class_object())
+                    );
+                    if !p_is_protocol {
+                        return self.is_subset_eq(self_type, &p);
+                    }
+                    let key = (self_type.clone(), p.clone());
+                    if self.enter_overload_self_filter(key.clone()) {
+                        return true;
+                    }
+                    let applies = self.is_subset_eq(self_type, &p);
+                    self.exit_overload_self_filter(&key);
+                    applies
+                })
             })
             .cloned()
             .collect();
@@ -3830,55 +3867,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             });
         }
         None
-    }
-
-    /// Whether the receiver `self_type` is compatible with an overload signature's `self`
-    /// parameter. Static methods, class methods, and signatures without parameters accept any
-    /// receiver.
-    pub(crate) fn overload_accepts_self_type(
-        &self,
-        func: &Function,
-        tparams: Option<&TParams>,
-        self_type: &Type,
-    ) -> bool {
-        // Only instance methods have a `self` first parameter; static and
-        // class methods' first parameter is a regular argument.
-        if func.metadata.flags.is_staticmethod || func.metadata.flags.is_classmethod {
-            return true;
-        }
-        func.signature.get_first_param().is_none_or(|p| {
-            // Replace the overload's own type params in `self:` with `Any`
-            // (e.g. `self: Array[S, T]` -> `Array[Any, Any]`), matching against a gradual
-            // `self:` rather than a rigid, unsolvable variable.
-            let p = match tparams {
-                Some(tparams) => {
-                    let any = self.heap.mk_any_implicit();
-                    p.clone()
-                        .subst(&tparams.iter().map(|q| (q, &any)).collect())
-                }
-                None => p.clone(),
-            };
-            // A non-protocol `self:` can't re-enter protocol conformance, so check
-            // it directly. A protocol-typed `self:`, however, makes
-            // `is_subset_eq(self_type, p)` re-enter this same filtering on the same
-            // `(self_type, p)` pair — unbounded recursion for a self-referential
-            // protocol. Guard only that case coinductively: on re-entry
-            // of the same pair, assume the overload applies (keep it).
-            let p_is_protocol = matches!(
-                &p,
-                Type::ClassType(cls) if self.type_order().is_protocol(cls.class_object())
-            );
-            if !p_is_protocol {
-                return self.is_subset_eq(self_type, &p);
-            }
-            let key = (self_type.clone(), p.clone());
-            if self.enter_overload_self_filter(key.clone()) {
-                return true;
-            }
-            let applies = self.is_subset_eq(self_type, &p);
-            self.exit_overload_self_filter(&key);
-            applies
-        })
     }
 
     pub(crate) fn as_instance_attribute(

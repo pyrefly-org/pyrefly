@@ -2144,10 +2144,77 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
             }
             CallTarget::BoundMethodOverload(obj, overloads, meta) => {
+                // Bind the receiver before matching the arguments, as for a non-overloaded
+                // method, so that only the overloads that accept it are matched. A receiver with
+                // unsolved vars is matched along with the arguments instead, because checking it
+                // here could pin those vars.
+                let (accepting, rejecting): (Vec<_>, Vec<_>) =
+                    if obj.collect_maybe_placeholder_vars().is_empty() {
+                        overloads
+                            .into_iter()
+                            .partition(|overload| self.accepts_receiver(&overload.1, &obj))
+                    } else {
+                        (overloads.into_vec(), Vec::new())
+                    };
+                let (overloads, self_obj) = match Vec1::try_from_vec(accepting) {
+                    // If the receiver rules out every overload but one, that overload is called
+                    // like a non-overloaded method.
+                    Ok(accepting) if accepting.len() == 1 && !rejecting.is_empty() => {
+                        return self.call_infer_with_callee_range(
+                            CallTarget::BoundMethod(obj, accepting.split_off_first().0),
+                            args,
+                            keywords,
+                            arguments_range,
+                            callee_range,
+                            errors,
+                            call_errors,
+                            return_errors,
+                            context,
+                            hint,
+                            ctor_targs,
+                        );
+                    }
+                    Ok(accepting) => (accepting, Some(obj)),
+                    // No overload accepts the receiver. Report it once, as for a non-overloaded
+                    // method, and match the arguments as if `self` were bound.
+                    Err(_) => {
+                        let rejecting = Vec1::try_from_vec(rejecting)
+                            .expect("an overloaded function has at least one signature");
+                        let signature = &rejecting.first().1.signature;
+                        let self_name = match &signature.params {
+                            Params::List(params) | Params::Partial(params) => {
+                                params.items().first().and_then(|param| param.name())
+                            }
+                            _ => None,
+                        };
+                        let self_ty = signature
+                            .get_first_param()
+                            .expect("a signature that rejects the receiver has a first parameter");
+                        self.check_type(&obj, self_ty, arguments_range, call_errors, &|| {
+                            TypeCheckContext::of_kind(TypeCheckKind::CallArgument(
+                                self_name.cloned(),
+                                Some(meta.kind.clone()),
+                            ))
+                            .with_context(context.map(|ctx| ctx()))
+                        });
+                        let unbound = rejecting.mapped(|TargetWithTParams(tparams, func)| {
+                            TargetWithTParams(
+                                tparams,
+                                Function {
+                                    signature: func.signature.strip_first_param().expect(
+                                        "a signature that rejects the receiver has a first parameter",
+                                    ),
+                                    metadata: func.metadata,
+                                },
+                            )
+                        });
+                        (unbound, None)
+                    }
+                };
                 let (ty, _callable, overload_table, argmap) = self.call_overloads(
                     overloads,
                     &meta,
-                    Some(obj),
+                    self_obj,
                     args,
                     keywords,
                     arguments_range,

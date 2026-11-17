@@ -496,17 +496,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         break;
                     }
                 }
-                // A unique arity match still supplies recovery when checking fails. So does a
-                // call that fails only on `self`, since the overloads don't explain that failure.
-                // The overload's errors don't carry the call's context, though, so a call with a
-                // context (e.g. an operator) keeps the overload error, which does.
-                let matched = matched
-                    || arity_compatible_overloads.len() == 1
-                    || (context.is_none()
-                        && self_obj.as_ref().is_some_and(|self_obj| {
-                            self.fails_only_on_self(&overloads, &closest_overload, self_obj)
-                        }));
-                (closest_overload, matched)
+                // A unique arity match still supplies recovery when checking fails.
+                (
+                    closest_overload,
+                    matched || arity_compatible_overloads.len() == 1,
+                )
             }
         };
 
@@ -658,28 +652,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 result
             }
         }
-    }
-
-    /// Whether the closest overload failed only because the receiver doesn't match a `self`
-    /// parameter that every overload shares. Such a failure is the same as for a non-overloaded
-    /// method, so it shouldn't be reported in terms of overloads.
-    fn fails_only_on_self(
-        &self,
-        overloads: &[TargetWithTParams<Function>],
-        closest_overload: &CalledOverload<'_>,
-        self_obj: &Type,
-    ) -> bool {
-        let self_param = closest_overload.func.1.signature.get_first_param();
-        closest_overload.num_match_errors() == 1
-            && self_param.is_some()
-            && overloads
-                .iter()
-                .all(|overload| overload.1.signature.get_first_param() == self_param)
-            && !self.overload_accepts_self_type(
-                &closest_overload.func.1,
-                closest_overload.func.0.as_deref(),
-                self_obj,
-            )
     }
 
     fn arity_mismatch_size(

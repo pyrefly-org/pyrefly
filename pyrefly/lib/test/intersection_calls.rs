@@ -619,12 +619,12 @@ class D:
     def method(self, callback: Callable[[int], int]) -> RetA: ...
 def int_first(a: A):
     if isinstance(a, B):
-        reveal_type(a.method(lambda v: v + 1))  # E: revealed type: RetA & RetB
+        reveal_type(a.method(lambda v: v + 1))  # E: revealed type: RetA
         typed: Callable[[int], int] = lambda v: v + 1
         reveal_type(a.method(typed))  # E: revealed type: RetA
 def str_first(c: C):
     if isinstance(c, D):
-        reveal_type(c.method(lambda v: v + 1))  # E: revealed type: RetA & RetB
+        reveal_type(c.method(lambda v: v + 1))  # E: revealed type: RetA
 def ordinary(a: A):
     assert_type(a.method(lambda v: v + 1), RetA)
 def intrinsic_errors(a: A):

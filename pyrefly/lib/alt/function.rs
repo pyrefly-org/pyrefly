@@ -2827,26 +2827,32 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.bind_bound_method_type(&m.func, &m.obj, skip_instantiation, is_subset)
     }
 
-    /// Drop overloads whose first parameter cannot accept `receiver`. Type parameters on both
-    /// sides are replaced with `Any`, so an overload is dropped only if no specialization of it
-    /// could accept the receiver. If every overload would be dropped, `func` is returned
-    /// unchanged so that the callable stays usable.
-    fn filter_overloads_by_receiver(&self, func: Type, receiver: &Type) -> Type {
-        let Type::Overload(overload) = &func else {
-            return func;
-        };
+    /// Whether the first parameter of `function` can accept `receiver`. Type parameters on both
+    /// sides are replaced with `Any`, so this is false only if no specialization of `function`
+    /// could accept the receiver.
+    pub fn accepts_receiver(&self, function: &Function, receiver: &Type) -> bool {
         let any = self.heap.mk_any_implicit();
         let erase_tparams = |ty: &Type| {
             let mut ty = ty.clone();
             ty.subst_mut_fn(&mut |_| Some(any.clone()));
             ty
         };
-        let receiver = erase_tparams(receiver);
+        function
+            .signature
+            .get_first_param()
+            .is_none_or(|param| self.is_subset_eq(&erase_tparams(receiver), &erase_tparams(param)))
+    }
+
+    /// Drop overloads whose first parameter cannot accept `receiver`, as decided by
+    /// `accepts_receiver`. If every overload would be dropped, `func` is returned unchanged so
+    /// that the callable stays usable.
+    fn filter_overloads_by_receiver(&self, func: Type, receiver: &Type) -> Type {
+        let Type::Overload(overload) = &func else {
+            return func;
+        };
         let signatures = overload.signatures.iter().filter(|sig| {
             let (OverloadType::Function(f) | OverloadType::Forall(Forall { body: f, .. })) = sig;
-            f.signature
-                .get_first_param()
-                .is_none_or(|param| self.is_subset_eq(&receiver, &erase_tparams(param)))
+            self.accepts_receiver(f, receiver)
         });
         match Vec1::try_from_vec(signatures.cloned().collect()) {
             Ok(signatures) => self.heap.mk_overload(Overload {

@@ -2552,14 +2552,13 @@ class C[T]:
     def f(self: C[str], x: str) -> str: ...
     def f(self, x: int | str) -> int | str: ...
 
-def test(b: B, c: C[str]):
-    # Only `self` is wrong, and every overload expects the same `self`, so there's no need to
-    # mention overloads.
+def test(b: B, c: C[str], d: C[bytes]):
+    # No overload accepts `b`, so it is reported once, and the arguments are still matched.
     assert_type(b.meth(1), int)  # E: Argument `B` is not assignable to parameter `self` with type `A` in function `A.meth`
-    # The argument doesn't match any overload either.
-    b.meth(1.5)  # E: No matching overload found for function `A.meth`
-    # The overloads expect different types of `self`, and another overload accepts `c`.
-    c.f(1)  # E: No matching overload found for function `C.f`
+    b.meth(1.5)  # E: Argument `B` is not assignable to parameter `self`  # E: No matching overload found for function `A.meth` called with arguments: (float)
+    # Only the overload whose `self` accepts `c` is matched.
+    c.f(1)  # E: Argument `Literal[1]` is not assignable to parameter `x` with type `str`
+    d.f(1)  # E: Argument `C[bytes]` is not assignable to parameter `self` with type `C[int]`
     "#,
 );
 
