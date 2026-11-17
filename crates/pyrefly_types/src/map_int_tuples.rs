@@ -27,6 +27,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
 use pyrefly_python::module_name::ModuleName;
@@ -37,6 +38,7 @@ use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 
 use crate::dimension::ShapeError;
+use crate::env::TypeEnv;
 use crate::equality::TypeEq;
 use crate::equality::TypeEqCtx;
 use crate::quantified::AnchorIndex;
@@ -48,6 +50,8 @@ use crate::tuple::Tuple;
 use crate::type_level_dsl::TypeLevelDslCall;
 use crate::type_level_dsl::TypeLevelDslFunction;
 use crate::type_level_dsl::TypeShapeDslDomain;
+use crate::type_ord::TypeOrd;
+use crate::type_ord::TypeOrdCtx;
 use crate::type_var::PreInferenceVariance;
 use crate::type_var::Restriction;
 use crate::types::Type;
@@ -76,7 +80,7 @@ fn normalized_mapper(depth: u32) -> Quantified {
 /// `def consume[S: IntTuples](xs: MapIntTuples[lambda T: Box[T], S]) -> S`, the argument is known;
 /// the parameter pattern derives an ordinary `Sequence[Box[IntTuple]]` view from the mapped member
 /// stored here, and parameter inference recovers `S` from the argument's elements.
-#[derive(Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash)]
 #[derive(Visit, VisitMut)]
 pub enum MapIntTuplesInterpretation {
     Forward,
@@ -84,7 +88,7 @@ pub enum MapIntTuplesInterpretation {
 }
 
 /// A possibly deferred `MapIntTuples[<mapper>, <source>]` operation.
-#[derive(Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash)]
 #[derive(Visit, VisitMut)]
 pub struct MapIntTuples {
     mapper: TypeLambda,
@@ -138,24 +142,24 @@ impl MapIntTuples {
         }
     }
 
-    pub(crate) fn evaluate(&self) -> Result<Type, ShapeError> {
+    pub(crate) fn evaluate(&self, env: &dyn TypeEnv) -> Result<Type, ShapeError> {
         if let MapIntTuplesInterpretation::ParameterPattern { mapped_member } = &self.interpretation
         {
             return Ok(Type::unbounded_tuple(mapped_member.clone()));
         }
-        self.evaluate_source(&self.source)
+        self.evaluate_source(&self.source, &TypeOrdCtx::new(env))
     }
 
-    fn evaluate_source(&self, source: &Type) -> Result<Type, ShapeError> {
+    fn evaluate_source(&self, source: &Type, ctx: &TypeOrdCtx) -> Result<Type, ShapeError> {
         match source {
             Type::Tuple(tuple) => self.mapper.apply_to_tuple(tuple.clone()),
             Type::Union(union) => {
                 let mut mapped = union
                     .members
                     .iter()
-                    .map(|member| self.evaluate_source(member))
+                    .map(|member| self.evaluate_source(member, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
-                mapped.sort();
+                mapped.sort_by(|x, y| x.type_cmp(y, ctx));
                 mapped.dedup();
                 Ok(match mapped.as_slice() {
                     [result] => result.clone(),
@@ -248,7 +252,9 @@ impl TypeLevelDslCall {
 
 fn invalid_source() -> ShapeError {
     ShapeError::ShapeComputation {
-        message: "Source argument to `MapIntTuples` must be an `IntTuples` value".to_owned(),
+        message: "Source argument to `MapIntTuples` must be an `IntTuples` value"
+            .to_owned()
+            .into(),
     }
 }
 
@@ -346,7 +352,8 @@ impl TypeLambda {
                 .ok_or_else(|| ShapeError::ShapeComputation {
                     message:
                         "Source argument to `MapIntTuples` must contain only `IntTuple` values"
-                            .to_owned(),
+                            .to_owned()
+                            .into(),
                 })
         };
         let map_all = |types: Vec<Type>| types.iter().map(map).collect::<Result<Vec<_>, _>>();
@@ -456,14 +463,16 @@ fn normalize_tuple(tuple: Tuple) -> Result<NormalizedTuple, ShapeError> {
             if middle.is_kind_type_var_tuple() {
                 return Err(ShapeError::ShapeComputation {
                     message: "`MapIntTuples` does not support an unresolved `TypeVarTuple`"
-                        .to_owned(),
+                        .to_owned()
+                        .into(),
                 });
             }
             let Type::Tuple(middle) = middle else {
                 return Err(ShapeError::ShapeComputation {
                     message:
                         "Source argument to `MapIntTuples` must be an eagerly reducible tuple type"
-                            .to_owned(),
+                            .to_owned()
+                            .into(),
                 });
             };
             match normalize_tuple(middle)? {
@@ -490,11 +499,26 @@ fn normalize_tuple(tuple: Tuple) -> Result<NormalizedTuple, ShapeError> {
     }
 }
 
+impl TypeOrd for TypeLambda {
+    fn type_cmp(&self, other: &Self, ctx: &TypeOrdCtx) -> Ordering {
+        self.parameter
+            .kind()
+            .cmp(&other.parameter.kind())
+            .then_with(|| {
+                self.parameter
+                    .restriction()
+                    .type_cmp(other.parameter.restriction(), ctx)
+            })
+            .then_with(|| self.normalized_body.type_cmp(&other.normalized_body, ctx))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::hash_map::DefaultHasher;
 
     use pyrefly_python::module_name::ModuleName;
+    use pyrefly_util::display::DisplayWithCtx;
     use ruff_python_ast::name::Name;
     use ruff_text_size::TextRange;
 
@@ -506,6 +530,7 @@ mod tests {
     use crate::quantified::QuantifiedIdentity;
     use crate::quantified::QuantifiedKind;
     use crate::quantified::QuantifiedOrigin;
+    use crate::test_type_env::TestTypeEnv;
     use crate::type_level_dsl::TypeLevelDslCall;
     use crate::type_var::PreInferenceVariance;
     use crate::type_var::Restriction;
@@ -621,7 +646,7 @@ mod tests {
         );
 
         assert_eq!(
-            call.evaluate().unwrap(),
+            call.evaluate(&TestTypeEnv::new()).unwrap(),
             Type::union(vec![
                 Type::concrete_tuple(vec![int_tuple(&[1])]),
                 Type::unbounded_tuple(IntTuple::shapeless().to_shape_arg_type()),
@@ -633,7 +658,7 @@ mod tests {
     fn preserves_never_source() {
         let call = TypeLevelDslCall::map_int_tuples(identity_lambda(), Type::never());
 
-        assert_eq!(call.evaluate().unwrap(), Type::never());
+        assert_eq!(call.evaluate(&TestTypeEnv::new()).unwrap(), Type::never());
     }
 
     #[test]
@@ -661,7 +686,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(
-            error.to_string(),
+            error.display_with(&TestTypeEnv::new()).to_string(),
             "Source argument to `MapIntTuples` must contain only `IntTuple` values"
         );
     }
@@ -686,6 +711,7 @@ mod tests {
             identity_lambda()
                 .apply_to_tuple(source)
                 .unwrap_err()
+                .display_with(&TestTypeEnv::new())
                 .to_string(),
             "`MapIntTuples` does not support an unresolved `TypeVarTuple`"
         );
@@ -791,7 +817,7 @@ mod tests {
             .make_parameter_pattern(member);
 
         assert_eq!(pattern.fallback(), view);
-        assert_eq!(pattern.evaluate().unwrap(), view);
+        assert_eq!(pattern.evaluate(&TestTypeEnv::new()).unwrap(), view);
         assert_ne!(pattern, forward);
     }
 

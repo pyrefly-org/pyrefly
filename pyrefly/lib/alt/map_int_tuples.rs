@@ -24,6 +24,7 @@ use pyrefly_types::tuple::Tuple;
 use pyrefly_types::type_level_dsl::TypeLevelDslCall;
 use pyrefly_types::types::TParams;
 use pyrefly_types::types::Type;
+use pyrefly_util::display::DisplayWithCtx;
 use ruff_python_ast::Expr;
 use ruff_python_ast::Identifier;
 use ruff_text_size::Ranged;
@@ -54,7 +55,7 @@ pub(crate) fn map_int_tuples_parameter_pattern(
     ty: &Type,
 ) -> Option<MapIntTuplesParameterPattern<'_>> {
     let ty = match ty {
-        Type::Unpack(inner) => inner.as_ref(),
+        Type::Unpack(inner, _) => inner.as_ref(),
         ty => ty,
     };
     let Type::TypeLevelDslCall(call) = ty else {
@@ -229,7 +230,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::InvalidAnnotation,
                     format!(
                         "Source argument to `MapIntTuples` must be an `IntTuples` value, got `{}`",
-                        self.for_display(source_type)
+                        self.display(source_type)
                     ),
                 );
                 return fallback();
@@ -242,14 +243,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if source_is_deferred {
             return Type::TypeLevelDslCall(Box::new(call));
         }
-        match call.evaluate() {
+        match call.evaluate(self) {
             Ok(mut mapped) => {
-                for error in mapped.finalize_type_level_dsl_at_boundary() {
+                for error in mapped.finalize_type_level_dsl_at_boundary(self) {
                     self.error(
                         errors,
                         mapper_range,
                         ErrorKind::InvalidAnnotation,
-                        error.to_string(),
+                        error.display_with(self).to_string(),
                     );
                 }
                 mapped
@@ -259,7 +260,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     errors,
                     source.range(),
                     ErrorKind::InvalidAnnotation,
-                    error.to_string(),
+                    error.display_with(self).to_string(),
                 );
                 fallback()
             }
@@ -290,7 +291,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         type_form_context: TypeFormContext<'_>,
     ) -> bool {
         type_form_context == TypeFormContext::ParameterArgsAnnotation
-            && matches!(ty, Type::Unpack(inner)
+            && matches!(ty, Type::Unpack(inner, _)
                 if matches!(inner.as_ref(), Type::TypeLevelDslCall(call)
                     if call.as_map_int_tuples().is_some()))
     }
@@ -305,11 +306,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         match type_form_context {
             TypeFormContext::ParameterAnnotation => self.make_map_int_tuples_parameter_pattern(ty),
             TypeFormContext::ParameterArgsAnnotation => {
-                let Type::Unpack(inner) = ty else {
+                let Type::Unpack(inner, kind) = ty else {
                     return ty;
                 };
                 self.heap
-                    .mk_unpack(self.make_map_int_tuples_parameter_pattern(*inner))
+                    .mk_unpack(self.make_map_int_tuples_parameter_pattern(*inner), kind)
             }
             _ => ty,
         }
@@ -321,7 +322,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     pub(crate) fn map_int_tuples_parameter_body_type(&self, ty: Type) -> Type {
         let (call, unpacked) = match &ty {
             Type::TypeLevelDslCall(call) => (call, false),
-            Type::Unpack(inner) => {
+            Type::Unpack(inner, _) => {
                 let Type::TypeLevelDslCall(call) = inner.as_ref() else {
                     return ty;
                 };
@@ -389,7 +390,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .is_subset_eq(actual, &target, self.type_order(), None)
             .is_ok();
         let finished = self.finish_quantified(handle, false).is_ok();
-        let candidate = self.solver().expand(Type::Var(var));
+        let candidate = self.solver().expand(Type::Var(var), self);
         self.solver().restore_vars(snapshot);
         debug_assert!(
             !self.solver().var_is_quantified(var),
@@ -737,8 +738,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::BadArgumentType,
                 format!(
                     "Shapes `{}` recovered from this argument are not assignable to the `MapIntTuples` source `{}`",
-                    self.for_display(source),
-                    self.for_display(map_source.clone()),
+                    self.display(source),
+                    self.display(map_source.clone()),
                 ),
                 context,
             );

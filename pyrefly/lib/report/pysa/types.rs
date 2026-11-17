@@ -17,7 +17,6 @@ use pyrefly_types::quantified::Quantified;
 use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_types::type_var::Restriction;
 use pyrefly_types::type_var::ShapeExtensionRestriction;
-use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::types::Type;
 use serde::Serialize;
 
@@ -25,6 +24,7 @@ use crate::report::pysa::ModuleContext;
 use crate::report::pysa::class::ClassRef;
 use crate::report::pysa::context::ModuleAnswersContext;
 use crate::types::display::TypeDisplayContext;
+use crate::types::env::TypeEnv;
 
 /// Modifier that was stripped from a type to extract the underlying class.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -149,8 +149,8 @@ impl ClassNamesFromType {
     }
 }
 
-pub fn string_for_type(type_: &Type) -> String {
-    let mut ctx = TypeDisplayContext::new(&[type_]);
+pub fn string_for_type(env: &dyn TypeEnv, type_: &Type) -> String {
+    let mut ctx = TypeDisplayContext::new(env, &[type_]);
     ctx.always_display_module_name_except_builtins();
     ctx.display(type_).to_string()
 }
@@ -327,10 +327,7 @@ fn get_classes_of_type(type_: &Type, context: &ModuleContext) -> ClassNamesFromT
         Type::Tuple(_) => {
             ClassNamesFromType::from_class(context.answers_context.stdlib.tuple_object(), context)
         }
-        Type::TypedDict(TypedDict::TypedDict(inner)) => {
-            ClassNamesFromType::from_class(inner.class_object(), context)
-        }
-        Type::TypedDict(TypedDict::Anonymous(_)) => {
+        Type::AnonymousTypedDict(_) => {
             ClassNamesFromType::from_class(context.answers_context.stdlib.dict_object(), context)
         }
         Type::Union(u) if !u.members.is_empty() => u
@@ -396,7 +393,7 @@ impl PysaType {
 
     pub fn from_type(type_: &Type, context: &ModuleContext) -> PysaType {
         let type_ = preprocess_type(type_, &context.answers_context);
-        let string = string_for_type(&type_);
+        let string = string_for_type(context.resolver.type_env(), &type_);
 
         PysaType {
             string,

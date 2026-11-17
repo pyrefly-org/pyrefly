@@ -15,13 +15,12 @@ use pyrefly_types::simplify::intersect;
 use pyrefly_types::simplify::unions;
 use pyrefly_types::stdlib::Stdlib;
 use pyrefly_types::type_var::Restriction;
-use pyrefly_types::typed_dict::TypedDict;
-use pyrefly_types::typed_dict::TypedDictInner;
 use pyrefly_types::types::TArgs;
 use pyrefly_types::types::Type;
 
 use crate::alt::attr::ClassBase;
 use crate::alt::class::class_field::DescriptorBase;
+use crate::types::env::TypeEnv;
 
 #[derive(Debug)]
 pub enum InstanceKind<'a> {
@@ -59,7 +58,7 @@ impl<'a> Instance<'a> {
         }
     }
 
-    pub fn of_typed_dict(td: &'a TypedDictInner) -> Self {
+    pub fn of_typed_dict(td: &'a ClassType) -> Self {
         Self {
             kind: InstanceKind::TypedDict,
             class: td.class_object(),
@@ -105,18 +104,18 @@ impl<'a> Instance<'a> {
         self.targs.substitute_into_mut(raw_member)
     }
 
-    pub fn to_type(&self, heap: &TypeHeap) -> Type {
+    pub fn to_type(&self, heap: &TypeHeap, env: &dyn TypeEnv) -> Type {
         match &self.kind {
             InstanceKind::ClassType(cls) => heap.mk_class_type((*cls).clone()),
             InstanceKind::TypedDict => {
-                heap.mk_typed_dict(TypedDict::new(self.class.dupe(), self.targs.clone()))
+                heap.mk_class_type(ClassType::new(self.class.dupe(), self.targs.clone()))
             }
             InstanceKind::TypeVar(q) => {
                 let quantified_ty = q.clone().to_type(heap);
                 let ub = match q.restriction() {
                     Restriction::Unrestricted => return quantified_ty,
                     Restriction::Bound(b) => b.clone(),
-                    Restriction::Constraints(cs) => unions(cs.clone(), heap),
+                    Restriction::Constraints(cs) => unions(cs.clone(), env, heap),
                     // Shape-extension restrictions need a Stdlib to materialize their ordinary
                     // upper bound. Preserve the quantified instead of inventing a fallback.
                     Restriction::ShapeExtension(_) => return quantified_ty,
@@ -126,7 +125,12 @@ impl<'a> Instance<'a> {
                 if instance_ty == ub {
                     quantified_ty
                 } else {
-                    intersect(vec![quantified_ty, instance_ty.clone()], instance_ty, heap)
+                    intersect(
+                        vec![quantified_ty, instance_ty.clone()],
+                        instance_ty,
+                        env,
+                        heap,
+                    )
                 }
             }
             InstanceKind::SelfType => {
@@ -158,23 +162,22 @@ impl<'a> Instance<'a> {
         }
     }
 
-    pub fn to_descriptor_base(&self) -> Option<DescriptorBase> {
+    pub fn to_descriptor_base(&self) -> DescriptorBase {
         match &self.kind {
-            // There's no situation in which you can stick a usable descriptor in a TypedDict.
+            InstanceKind::SelfType => {
+                DescriptorBase::SelfInstance(ClassType::new(self.class.dupe(), self.targs.clone()))
+            }
+            InstanceKind::ClassType(cls) => DescriptorBase::Instance((*cls).clone()),
+            // A descriptor is never constructed for a TypedDict field, which is a dict key
+            // rather than an attribute, so `TypedDict` needs no special case here.
             // TODO(rechen): a descriptor in a TypedDict should be an error at class creation time.
-            InstanceKind::TypedDict => None,
-            InstanceKind::SelfType => Some(DescriptorBase::SelfInstance(ClassType::new(
-                self.class.dupe(),
-                self.targs.clone(),
-            ))),
-            InstanceKind::ClassType(cls) => Some(DescriptorBase::Instance((*cls).clone())),
-            InstanceKind::Protocol(..)
+            InstanceKind::TypedDict
+            | InstanceKind::Protocol(..)
             | InstanceKind::Metaclass(..)
             | InstanceKind::TypeVar(..)
-            | InstanceKind::LiteralString => Some(DescriptorBase::Instance(ClassType::new(
-                self.class.dupe(),
-                self.targs.clone(),
-            ))),
+            | InstanceKind::LiteralString => {
+                DescriptorBase::Instance(ClassType::new(self.class.dupe(), self.targs.clone()))
+            }
         }
     }
 }

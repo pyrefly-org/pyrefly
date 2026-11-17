@@ -11,8 +11,10 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use append_only_vec::AppendOnlyVec;
 use dupe::Dupe;
 use pyrefly_python::module::Module;
+use pyrefly_python::module_key::ModuleKey;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_python::nesting_context::NestingContext;
@@ -25,7 +27,6 @@ use starlark_map::small_map::SmallMap;
 use crate::class::Class;
 use crate::class::ClassDefIndex;
 use crate::class::ClassType;
-use crate::class::PrecomputedTParams;
 use crate::env::TypeEnv;
 use crate::quantified::AnchorIndex;
 use crate::quantified::Quantified;
@@ -61,17 +62,36 @@ const STDLIB_TYPE_VARS: &[&str] = &[
 
 /// A `TypeEnv` for unit tests, which defines its own classes.
 ///
-/// Its classes never compare equal to classes of real modules. A class's identity includes its
-/// module's path, and every module here has a namespace package path. A namespace package has no
-/// source, so the checker never defines a class in one.
+/// Defining a class twice, with the same module, name, range and enclosing scope, returns the same
+/// class. Otherwise every class defined here is distinct: it gets the next index in its module.
+///
+/// The classes of `class` and `generic_class` never compare equal to classes of real modules. A
+/// class's identity includes its module's path, and every module they use has a namespace package
+/// path. A namespace package has no source, so the checker never defines a class in one.
 ///
 /// Its `Stdlib` has every standard library class. The generic ones (`list`, `dict` and so on)
 /// have the type parameters that typeshed declares for them.
 pub struct TestTypeEnv {
     stdlib: Stdlib,
-    /// Every module that has classes, with the number of classes defined in it so far. A new
-    /// class gets the next index in its module, so no two classes defined here are equal.
-    modules: RefCell<SmallMap<ModuleName, (Module, u32)>>,
+    /// The modules that `class` and `generic_class` define classes in.
+    modules: RefCell<SmallMap<ModuleName, Module>>,
+    /// Every class defined so far, keyed by its definition.
+    classes: RefCell<SmallMap<ClassKey, Class>>,
+    /// The number of classes defined so far in each module. `ModuleKey` compares modules the way
+    /// class identity does, so classes with different indices in one module are distinct.
+    class_counts: RefCell<SmallMap<ModuleKey, u32>>,
+    /// The type parameters of every generic class. It is append-only, so `class_tparams` can
+    /// return borrows that live as long as the env.
+    tparams: AppendOnlyVec<(Class, Arc<TParams>)>,
+}
+
+/// What identifies a class definition in a `TestTypeEnv`: its module, its name and range, and its
+/// enclosing scope.
+#[derive(PartialEq, Eq, Hash)]
+struct ClassKey {
+    module: ModuleKey,
+    name: Identifier,
+    parent: NestingContext,
 }
 
 impl TestTypeEnv {
@@ -80,12 +100,14 @@ impl TestTypeEnv {
         let mut env = Self {
             stdlib: Stdlib::for_bootstrapping(),
             modules: RefCell::new(SmallMap::new()),
+            classes: RefCell::new(SmallMap::new()),
+            class_counts: RefCell::new(SmallMap::new()),
+            tparams: AppendOnlyVec::new(),
         };
-        let defined = RefCell::new(SmallMap::new());
         let stdlib = Stdlib::new(
             PythonVersion::default(),
             &|module, name| {
-                let cls = env.stdlib_class(&defined, module, name);
+                let cls = env.stdlib_class(module, name);
                 let tparams = env.class_tparams(&cls);
                 let tparams = (!tparams.is_empty()).then(|| Arc::new(tparams.clone()));
                 Some((cls, tparams))
@@ -96,34 +118,22 @@ impl TestTypeEnv {
         env
     }
 
-    /// The standard library class `name` in `module`. `defined` holds the classes defined so
-    /// far, so a class that a type parameter's bound refers to is the class that `Stdlib` holds.
-    fn stdlib_class(
-        &self,
-        defined: &RefCell<SmallMap<(ModuleName, Name), Class>>,
-        module: ModuleName,
-        name: &Name,
-    ) -> Class {
-        if let Some(cls) = defined.borrow().get(&(module, name.clone())) {
-            return cls.dupe();
-        }
-        let tparams = self.stdlib_tparams(defined, module, name);
-        let cls = self.define_class(module, name.clone(), tparams);
-        defined
-            .borrow_mut()
-            .insert((module, name.clone()), cls.dupe());
-        cls
+    /// The standard library class `name` in `module`. Defining it again returns the class defined
+    /// first, so a class that a type parameter's bound refers to is the class that `Stdlib` holds.
+    fn stdlib_class(&self, module: ModuleName, name: &Name) -> Class {
+        let tparams = self.stdlib_tparams(module, name);
+        self.define(
+            Identifier::new(name.clone(), TextRange::default()),
+            NestingContext::toplevel(),
+            self.namespace_module(module),
+            tparams,
+        )
     }
 
     /// The type parameters that typeshed declares for the standard library class `name` in
     /// `module`, with their kinds, variances, bounds and defaults. Every class that `Stdlib` looks
     /// up and that is missing here is not generic.
-    fn stdlib_tparams(
-        &self,
-        defined: &RefCell<SmallMap<(ModuleName, Name), Class>>,
-        module: ModuleName,
-        name: &Name,
-    ) -> TParams {
+    fn stdlib_tparams(&self, module: ModuleName, name: &Name) -> TParams {
         use PreInferenceVariance::Contravariant;
         use PreInferenceVariance::Covariant;
         use PreInferenceVariance::Invariant;
@@ -148,7 +158,7 @@ impl TestTypeEnv {
             )
         };
         let builtin = |name: &'static str| {
-            let cls = self.stdlib_class(defined, ModuleName::builtins(), &Name::new_static(name));
+            let cls = self.stdlib_class(ModuleName::builtins(), &Name::new_static(name));
             ClassType::new(cls, TArgs::default()).to_type()
         };
         let quantified = |q: &Quantified| Type::Quantified(Box::new(q.clone()));
@@ -225,31 +235,66 @@ impl TestTypeEnv {
 
     /// Define a class `name` with type parameters `tparams` at the top level of `module`.
     pub fn generic_class(&self, module: &str, name: &str, tparams: TParams) -> Class {
-        self.define_class(ModuleName::from_str(module), Name::new(name), tparams)
+        self.define(
+            Identifier::new(Name::new(name), TextRange::default()),
+            NestingContext::toplevel(),
+            self.namespace_module(ModuleName::from_str(module)),
+            tparams,
+        )
     }
 
-    fn define_class(&self, module_name: ModuleName, name: Name, tparams: TParams) -> Class {
-        let mut modules = self.modules.borrow_mut();
-        let (module, count) = modules.entry(module_name).or_insert_with(|| {
-            let path = ModulePath::namespace(PathBuf::from(module_name.as_str()));
-            (Module::new(module_name, path, Arc::new(String::new())), 0)
-        });
+    /// Define a non-generic class in a module that the caller provides, for a test that needs
+    /// control over the class's range, enclosing scope, or module path and source.
+    pub fn define_class(&self, name: Identifier, parent: NestingContext, module: Module) -> Class {
+        self.define(name, parent, module, TParams::empty())
+    }
+
+    fn namespace_module(&self, name: ModuleName) -> Module {
+        self.modules
+            .borrow_mut()
+            .entry(name)
+            .or_insert_with(|| {
+                let path = ModulePath::namespace(PathBuf::from(name.as_str()));
+                Module::new(name, path, Arc::new(String::new()))
+            })
+            .dupe()
+    }
+
+    /// Define a class, or return the class already defined with the same definition. The type
+    /// parameters of a class defined again are the ones it was first defined with.
+    fn define(
+        &self,
+        name: Identifier,
+        parent: NestingContext,
+        module: Module,
+        tparams: TParams,
+    ) -> Class {
+        let key = ClassKey {
+            module: module.key(),
+            name,
+            parent,
+        };
+        if let Some(cls) = self.classes.borrow().get(&key) {
+            return cls.dupe();
+        }
+        let mut class_counts = self.class_counts.borrow_mut();
+        let count = class_counts.entry(key.module).or_insert(0);
         let index = ClassDefIndex(*count);
         *count += 1;
-        let tparams = if tparams.is_empty() {
-            PrecomputedTParams::NotGeneric
-        } else {
-            PrecomputedTParams::Precomputed(Arc::new(tparams))
-        };
-        Class::new(
+        let cls = Class::new(
             index,
-            Identifier::new(name, TextRange::default()),
-            NestingContext::toplevel(),
-            module.dupe(),
-            tparams,
+            key.name.clone(),
+            key.parent.dupe(),
+            module,
+            !tparams.is_empty(),
             false,
             None,
-        )
+        );
+        if !tparams.is_empty() {
+            self.tparams.push((cls.dupe(), Arc::new(tparams)));
+        }
+        self.classes.borrow_mut().insert(key, cls.dupe());
+        cls
     }
 }
 
@@ -259,18 +304,17 @@ impl TypeEnv for TestTypeEnv {
     }
 
     fn class_tparams<'a>(&'a self, cls: &'a Class) -> &'a TParams {
-        match cls.precomputed_tparams() {
-            PrecomputedTParams::NotGeneric => TParams::empty_ref(),
-            PrecomputedTParams::Precomputed(tparams) => tparams,
-            PrecomputedTParams::FromBinding => {
-                unreachable!("`TestTypeEnv` defines every class with precomputed type parameters")
-            }
-        }
+        self.tparams
+            .iter()
+            .find(|(c, _)| c == cls)
+            .map_or(TParams::empty_ref(), |(_, tparams)| tparams)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ruff_text_size::TextSize;
+
     use super::*;
     use crate::class::ClassKind;
     use crate::heap::TypeHeap;
@@ -308,6 +352,38 @@ mod tests {
     }
 
     #[test]
+    fn test_defining_a_class_again() {
+        let env = TestTypeEnv::new();
+        let module = Module::new(
+            ModuleName::from_str("foo"),
+            ModulePath::filesystem(PathBuf::from("foo.py")),
+            Arc::new("class Bar: ...".to_owned()),
+        );
+        let define = |start: u32| {
+            env.define_class(
+                Identifier::new(Name::new("Bar"), TextRange::empty(TextSize::new(start))),
+                NestingContext::toplevel(),
+                module.dupe(),
+            )
+        };
+        assert_eq!(
+            define(6),
+            define(6),
+            "the same definition is the same class"
+        );
+        assert_ne!(
+            define(6),
+            define(7),
+            "a definition at another range is another class"
+        );
+        assert_eq!(
+            env.class("foo", "Bar"),
+            env.class("foo", "Bar"),
+            "the same top-level definition is the same class"
+        );
+    }
+
+    #[test]
     fn test_classes_differ_from_real_classes() {
         let env = TestTypeEnv::new();
         let fake = env.class("foo", "Bar");
@@ -323,7 +399,7 @@ mod tests {
                 Identifier::new(Name::new("Bar"), TextRange::default()),
                 NestingContext::toplevel(),
                 real_module(path),
-                PrecomputedTParams::NotGeneric,
+                false,
                 false,
                 None,
             );
@@ -340,15 +416,15 @@ mod tests {
         let cls = env.class("foo", "Bar");
         // Read through a trait object to check that `TypeEnv` is object safe.
         let env: &dyn TypeEnv = &env;
-        assert!(std::ptr::eq(cls.def_in(env), cls.inline_def()));
-        assert_eq!(cls.name_in(env).as_str(), "Bar");
-        assert_eq!(cls.qname_in(env).id().as_str(), "Bar");
-        assert_eq!(cls.module_in(env).name(), ModuleName::from_str("foo"));
-        assert_eq!(cls.range_in(env), TextRange::default());
-        assert!(!cls.is_protocol_in(env));
-        assert!(cls.deprecation_in(env).is_none());
-        assert_eq!(cls.kind_in(env), ClassKind::Class);
-        assert!(cls.tparams_in(env).is_empty());
+        assert!(std::ptr::eq(cls.def(env), cls.inline_def()));
+        assert_eq!(cls.name(env).as_str(), "Bar");
+        assert_eq!(cls.qname(env).id().as_str(), "Bar");
+        assert_eq!(cls.module(env).name(), ModuleName::from_str("foo"));
+        assert_eq!(cls.range(env), TextRange::default());
+        assert!(!cls.is_protocol(env));
+        assert!(cls.deprecation(env).is_none());
+        assert_eq!(cls.kind(env), ClassKind::Class);
+        assert!(cls.tparams(env).is_empty());
         assert_eq!(cls.known(), None, "`foo.Bar` is not a known class");
     }
 
@@ -358,32 +434,32 @@ mod tests {
         let t = type_var("T", Restriction::Unrestricted, None);
         let tparams = TParams::new(vec![t]);
         let cls = env.generic_class("foo", "Box", tparams.clone());
-        assert_eq!(cls.tparams_in(&env), &tparams);
+        assert_eq!(cls.tparams(&env), &tparams);
 
         let class_type = ClassType::new(
             cls,
             TArgs::new(Arc::new(tparams.clone()), vec![Type::any_implicit()]),
         );
-        assert_eq!(class_type.tparams_in(&env), &tparams);
-        assert_eq!(class_type.name_in(&env).as_str(), "Box");
+        assert_eq!(class_type.class_object().tparams(&env), &tparams);
+        assert_eq!(class_type.name(&env).as_str(), "Box");
     }
 
     #[test]
     fn test_stdlib_classes() {
         let env = TestTypeEnv::new();
         let int = env.stdlib().int();
-        assert_eq!(int.name_in(&env).as_str(), "int");
+        assert_eq!(int.name(&env).as_str(), "int");
         assert!(int.is(KnownClass::Int));
-        assert!(int.tparams_in(&env).is_empty());
+        assert!(int.class_object().tparams(&env).is_empty());
         assert_ne!(
             env.stdlib().int().class_object(),
             env.stdlib().str().class_object(),
             "stdlib classes in one module are distinct"
         );
-        assert_ne!(
+        assert_eq!(
             env.class("builtins", "int"),
             *int.class_object(),
-            "a class defined later continues the module's indices"
+            "defining a standard library class again returns the class that `Stdlib` holds"
         );
     }
 

@@ -9,7 +9,6 @@ use std::cell::Cell;
 use std::cell::LazyCell;
 use std::cell::RefCell;
 use std::fmt;
-use std::fmt::Display;
 use std::iter::once;
 use std::slice;
 
@@ -39,9 +38,11 @@ use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_types::type_level_dsl::TypeShapeDslDomain;
 use pyrefly_types::typed_dict::AnonymousTypedDictInner;
 use pyrefly_types::typed_dict::ExtraItems;
-use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::typed_dict::TypedDictField;
 use pyrefly_types::types::Forallable;
+use pyrefly_types::types::UnpackKind;
+use pyrefly_util::display::DisplayWith;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::owner::Owner;
 use pyrefly_util::prelude::SliceExt;
 use pyrefly_util::prelude::VecExt;
@@ -59,6 +60,7 @@ use ruff_python_ast::ExprBinOp;
 use ruff_python_ast::ExprCall;
 use ruff_python_ast::ExprGenerator;
 use ruff_python_ast::ExprList;
+use ruff_python_ast::ExprName;
 use ruff_python_ast::ExprNumberLiteral;
 use ruff_python_ast::ExprSlice;
 use ruff_python_ast::ExprStarred;
@@ -88,7 +90,7 @@ use crate::alt::answers_solver::AnswersSolver;
 use crate::alt::answers_solver::TypeCheckOptions;
 use crate::alt::call::CallStyle;
 use crate::alt::callable::CallArg;
-use crate::alt::class::typed_dict::TypedDictErrorKind;
+use crate::alt::class::typed_dict::TypedDictHint;
 use crate::alt::nn_module_specials::is_nn_module_dict;
 use crate::alt::polars_specials::is_polars_api_series;
 use crate::alt::regex::RegexValidationError;
@@ -121,6 +123,7 @@ use crate::types::callable::Params;
 use crate::types::callable::Required;
 use crate::types::class::Class;
 use crate::types::class::ClassType;
+use crate::types::env::TypeEnv;
 use crate::types::facet::FacetKind;
 use crate::types::literal::Lit;
 use crate::types::quantified::Quantified;
@@ -398,7 +401,7 @@ impl ConditionRedundantReason {
         }
     }
 
-    fn description(&self) -> String {
+    fn description(&self, env: &dyn TypeEnv) -> String {
         match self {
             ConditionRedundantReason::IntLiteral(..) => {
                 "Integer literal used as condition".to_owned()
@@ -416,7 +419,7 @@ impl ConditionRedundantReason {
             ConditionRedundantReason::Function(module_name, func_id) => {
                 format!(
                     "Function object `{}` used as condition",
-                    func_id.format(module_name.dupe())
+                    func_id.format(env, module_name.dupe())
                 )
             }
             ConditionRedundantReason::Class(name) => {
@@ -429,12 +432,12 @@ impl ConditionRedundantReason {
     }
 }
 
-impl Display for ConditionRedundantReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for ConditionRedundantReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         write!(
             f,
             "{}. It's equivalent to {}",
-            self.description(),
+            self.description(env),
             match self.equivalent_boolean() {
                 Some(true) => "`True`",
                 Some(false) => "`False`",
@@ -581,8 +584,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ErrorKind::InvalidFormatSpec,
                         format!(
                             "Incompatible types in string interpolation (expression has type `{}`, placeholder has type `{}`)",
-                            self.for_display(actual.clone()),
-                            self.for_display(expected),
+                            self.display(actual.clone()),
+                            self.display(expected),
                         ),
                     )
                     .emit();
@@ -645,7 +648,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ErrorKind::InvalidFormatSpec,
                         format!(
                             "Invalid format specification `{spec}` for type `{}`: {reason}",
-                            self.for_display(actual.clone()),
+                            self.display(actual.clone()),
                         ),
                     )
                     .emit();
@@ -658,7 +661,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::InvalidFormatSpec,
                 format!(
                     "The type `{}` doesn't support format specifiers",
-                    self.for_display(actual.clone()),
+                    self.display(actual.clone()),
                 ),
             )
             .with_detail("Maybe you want to add `!s` to the conversion".to_owned())
@@ -809,6 +812,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         options: ExprOptions<'_, '_, '_>,
         cache: Option<&ArgumentCache>,
     ) -> TypeInfo {
+        self.expr_with_argument_cache_and_inferred(x, options, cache)
+            .0
+    }
+
+    /// Like `expr_with_argument_cache`, and also returns the type the argument was inferred as
+    /// before it was checked. When the check fails, the first result has the expected type so that
+    /// the failure isn't reported again downstream, while the second keeps the inferred type.
+    pub(crate) fn expr_with_argument_cache_and_inferred(
+        &self,
+        x: &Expr,
+        options: ExprOptions<'_, '_, '_>,
+        cache: Option<&ArgumentCache>,
+    ) -> (TypeInfo, Type) {
         match options.expectation {
             ExprExpectation::Check {
                 want,
@@ -829,20 +845,37 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                     None => TypeCheckOptions::new(errors, context),
                 };
+                let inferred = got.ty().clone();
                 if self
                     .check_type_with_options(got.ty(), want, x.range(), check_options)
                     .is_none()
                 {
-                    got
+                    (got, inferred)
                 } else {
-                    got.with_ty(want.clone())
+                    (got.with_ty(want.clone()), inferred)
                 }
             }
             ExprExpectation::Check { .. } => {
-                self.expr_infer_argument(x, None, options.errors, options.type_form_context, cache)
+                let got = self.expr_infer_argument(
+                    x,
+                    None,
+                    options.errors,
+                    options.type_form_context,
+                    cache,
+                );
+                let inferred = got.ty().clone();
+                (got, inferred)
             }
             ExprExpectation::Infer(hint) => {
-                self.expr_infer_argument(x, hint, options.errors, options.type_form_context, cache)
+                let got = self.expr_infer_argument(
+                    x,
+                    hint,
+                    options.errors,
+                    options.type_form_context,
+                    cache,
+                );
+                let inferred = got.ty().clone();
+                (got, inferred)
             }
         }
     }
@@ -957,21 +990,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // Assignment values and branches of conditional and boolean expressions are checked separately.
         let mut check_deprecation = !matches!(x, Expr::Named(..) | Expr::If(..) | Expr::BoolOp(..));
         let res = match x {
-            Expr::Name(x) => {
-                if Ast::is_synthesized_empty_name(x) {
-                    TypeInfo::of_ty(self.heap.mk_any_error())
-                } else {
-                    let result = self
-                        .get(&Key::BoundName(ShortIdentifier::expr_name(x)))
-                        .clone();
-                    // Complements PromoteForward for seeded captures.
-                    if self.bindings().should_promote_at_range(x.range) {
-                        result.map_ty(|ty| ty.promote_shallow(self.stdlib))
-                    } else {
-                        result
-                    }
-                }
-            }
+            Expr::Name(x) => self.expr_infer_name(x, errors, type_form_context),
             Expr::Attribute(x) => {
                 let base = self.expr_infer_impl(&x.value, None, errors, type_form_context);
                 self.attr_access_infer(x, &base, errors)
@@ -1041,6 +1060,62 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         self.record_type_trace(x.range(), res.ty());
         res
+    }
+
+    fn expr_infer_name(
+        &self,
+        x: &ExprName,
+        errors: &ErrorCollector,
+        type_form_context: Option<TypeFormContext<'_>>,
+    ) -> TypeInfo {
+        if Ast::is_synthesized_empty_name(x) {
+            TypeInfo::of_ty(self.heap.mk_any_error())
+        } else {
+            let mut result = self
+                .get(&Key::BoundName(ShortIdentifier::expr_name(x)))
+                .clone();
+            // See `Bindings::class_scope_fallback`. A module is not a type form, but a
+            // type expression may access its attributes, so it needs no fallback.
+            if type_form_context.is_some()
+                && let Some(fallback) = self.bindings().class_scope_fallback(x.range)
+                && !matches!(result.ty(), Type::Module(_))
+                && self
+                    .untype_opt(result.ty().clone(), x.range, &self.error_swallower())
+                    .is_none()
+            {
+                let fallback = self.get_idx(fallback);
+                errors
+                    .error_builder(
+                        x.range,
+                        ErrorKind::NotAType,
+                        format!(
+                            "Expected a type form, got class attribute `{}` of type `{}`",
+                            x.id,
+                            self.display(result.ty().clone()),
+                        ),
+                    )
+                    .with_detail_from(|| {
+                        // The fallback shares the member's name but not its scope, so display it
+                        // with its module for disambiguation.
+                        let fallback_name = if let Type::ClassDef(cls) = fallback.ty() {
+                            cls.qname(self).module_qualified_name()
+                        } else {
+                            x.id.to_string()
+                        };
+                        Some(format!(
+                            "Note: falling back to `{fallback_name}` from an enclosing scope"
+                        ))
+                    })
+                    .emit();
+                result = fallback.clone();
+            }
+            // Complements PromoteForward for seeded captures.
+            if self.bindings().should_promote_at_range(x.range) {
+                result.map_ty(|ty| ty.promote_shallow(self.stdlib))
+            } else {
+                result
+            }
+        }
     }
 
     /// This function should not be used directly: we want every expression to record a type trace,
@@ -1179,7 +1254,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                         param_hint
                                     } else if let Some(default_ty) = default_ty {
                                         let mut resolved = default_ty.clone();
-                                        self.solver().expand_with_bounds(&mut resolved);
+                                        self.solver().expand_with_bounds(&mut resolved, self);
                                         let promoted = resolved
                                             .with_literal_style(LitStyle::Implicit)
                                             .promote(self.stdlib);
@@ -1212,7 +1287,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             let ty =
                                 vararg_hint.unwrap_or_else(|| implicit_any(&name.id, name.range()));
                             let body_ty = match &ty {
-                                Type::Unpack(inner) => (**inner).clone(),
+                                Type::Unpack(inner, ..) => (**inner).clone(),
                                 _ => self.heap.mk_unbounded_tuple(ty.clone()),
                             };
                             self.set_lambda_param_type(id, body_ty);
@@ -1222,7 +1297,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             let ty =
                                 kwarg_hint.unwrap_or_else(|| implicit_any(&name.id, name.range()));
                             let body_ty = match &ty {
-                                Type::Unpack(inner) => (**inner).clone(),
+                                Type::Unpack(inner, ..) => (**inner).clone(),
                                 _ => {
                                     let str_ty = self.heap.mk_class_type(self.stdlib.str().clone());
                                     self.heap
@@ -1433,7 +1508,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         x.range,
                         ErrorKind::NotAsync,
-                        ErrorContext::Await(self.for_display(ty.clone())).format(),
+                        ErrorContext::Await(self.for_display(ty.clone())).format(self),
                     ),
                 })
             }
@@ -1515,7 +1590,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
             Expr::Starred(ExprStarred { value, .. }) => {
                 let ty = self.expr_untype(value, TypeFormContext::type_argument(), errors);
-                self.heap.mk_unpack(ty)
+                self.heap.mk_unpack(ty, UnpackKind::Args)
             }
             Expr::Slice(x) => {
                 let none = self.heap.mk_none();
@@ -1788,7 +1863,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             _ => None,
         };
         let deprecation = cls
-            .and_then(|cls| cls.deprecation())
+            .and_then(|cls| cls.deprecation(self))
             .or_else(|| ty.function_deprecation());
         let Some(deprecation) = deprecation else {
             return;
@@ -1808,13 +1883,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         let deprecated_name = match cls {
             Some(cls) => Some(if cls.module_name() == self.module().name() {
-                cls.qname().name_relative_to_module()
+                cls.qname(self).name_relative_to_module()
             } else {
-                cls.qname().module_qualified_name()
+                cls.qname(self).module_qualified_name()
             }),
             _ => ty
                 .to_func_kind()
-                .map(|func_kind| func_kind.format(self.module().name())),
+                .map(|func_kind| func_kind.format(self, self.module().name())),
         };
         if let Some(deprecated_name) = deprecated_name {
             let header = format!("`{deprecated_name}` is deprecated");
@@ -2086,6 +2161,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             match elt {
                 Expr::Starred(ExprStarred { value, .. }) => {
                     let ty = self.expr_infer(value, errors);
+                    // Unpacking a `NamedTuple` uses its underlying tuple's elements; the
+                    // iterable fallback below would only recover their joined type.
+                    let ty = if let Type::ClassType(cls) | Type::SelfType(cls) = &ty
+                        && !self.has_named_tuple_iter_override(cls)
+                        && let Some(tuple) = self.as_tuple(cls)
+                    {
+                        self.heap.mk_tuple(tuple)
+                    } else {
+                        ty
+                    };
                     match ty {
                         Type::Tuple(Tuple::Concrete(elts)) => {
                             if unbounded.is_empty() {
@@ -2118,7 +2203,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     errors,
                                     x.range(),
                                     ErrorKind::NotIterable,
-                                    format!("Expected an iterable, got `{}`", self.for_display(ty)),
+                                    format!("Expected an iterable, got `{}`", self.display(ty)),
                                 );
                                 encountered_invalid_star = true;
                                 hint_ts_iter.nth(usize::MAX);
@@ -2225,8 +2310,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if let Some(hint) = hint {
             for hint_ty in hint.types() {
                 let (typed_dict, is_update) = match hint_ty {
-                    Type::TypedDict(td) => (td, false),
-                    Type::PartialTypedDict(td) => (td, true),
+                    Type::ClassType(ct) if self.is_typed_dict_class(ct.class_object()) => {
+                        (TypedDictHint::Declared(ct), false)
+                    }
+                    Type::PartialTypedDict(ct) => (TypedDictHint::Declared(ct), true),
+                    Type::AnonymousTypedDict(inner) => (TypedDictHint::Anonymous(inner), false),
                     _ => continue,
                 };
                 let check_errors = self.error_collector();
@@ -2245,8 +2333,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // anonymous TypedDict is considered a soft hint because it is an inferred type. A named
                 // TypedDict is also used if all its check errors are soft (see `ErrorKind::is_soft`).
                 let use_hint = match typed_dict {
-                    TypedDict::Anonymous(_) => check_errors.is_empty(),
-                    TypedDict::TypedDict(_) => {
+                    TypedDictHint::Anonymous(_) => check_errors.is_empty(),
+                    TypedDictHint::Declared(_) => {
                         !check_errors.has_hard()
                             || hint.types().len() == 1 && hint.errors().is_some()
                     }
@@ -2423,8 +2511,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                     // If the unpacked value is an anonymous typed dict, merge its fields.
                     // Later fields override earlier ones with the same name.
-                    if can_create_anonymous_typed_dict
-                        && let Type::TypedDict(TypedDict::Anonymous(inner)) = &ty
+                    if can_create_anonymous_typed_dict && let Type::AnonymousTypedDict(inner) = &ty
                     {
                         key_tys.push(self.stdlib.str().clone().to_type());
                         for (name, field) in inner.fields.iter() {
@@ -2462,7 +2549,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors,
                             x.value.range(),
                             ErrorKind::InvalidArgument,
-                            format!("Expected a mapping, got {}", self.for_display(ty)),
+                            format!("Expected a mapping, got {}", self.display(ty)),
                         );
                         if let Some(keys) = &mut iteration_keys {
                             keys.push(ty);
@@ -2488,11 +2575,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 && (!bare_partial_hint || any_field_has_open_placeholder)
             {
                 let typed_dict_fields: Vec<_> = typed_dict_fields_map.into_iter().collect();
-                return self.heap.mk_typed_dict(TypedDict::Anonymous(Box::new(
-                    AnonymousTypedDictInner {
-                        fields: typed_dict_fields,
-                    },
-                )));
+                return self.heap.mk_anonymous_typed_dict(AnonymousTypedDictInner {
+                    fields: typed_dict_fields,
+                });
             }
             if key_tys.is_empty() {
                 key_tys.push(self.heap.mk_any_error())
@@ -2535,7 +2620,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 return None;
             }
             let class = metadata.kind.class();
-            let class = class.as_ref().map(|class| class.name().as_str());
+            let class = class.as_ref().map(|class| class.name(self).as_str());
             let function = metadata.kind.function_name();
             match (class, function.as_ref().as_str()) {
                 (None, "compile" | "template") => Some(1),
@@ -2676,10 +2761,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return None;
         }
         let (obj_ty, _key_expr, key) = self.dict_method_literal_key(func, args, method, errors)?;
-        let Type::TypedDict(td @ TypedDict::Anonymous(_)) = obj_ty.ty() else {
+        let Type::AnonymousTypedDict(td) = obj_ty.ty() else {
             return None;
         };
-        let field = self.typed_dict_field(td, &Name::new(key.to_str()))?;
+        let field = td.field(&Name::new(key.to_str()))?.clone();
         // A presence-narrowed key (e.g. after `if "x" in d:`) is known to be present, so the
         // value cannot be `None` and any default is unreachable.
         if obj_ty.has_value_less_presence(&FacetKind::Key(key.to_string())) {
@@ -2713,10 +2798,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return None;
         }
         let (obj_ty, _key_expr, key) = self.dict_method_literal_key(func, args, "pop", errors)?;
-        let Type::TypedDict(td @ TypedDict::Anonymous(_)) = obj_ty.ty() else {
+        let Type::AnonymousTypedDict(td) = obj_ty.ty() else {
             return None;
         };
-        let field = self.typed_dict_field(td, &Name::new(key.to_str()))?;
+        let field = td.field(&Name::new(key.to_str()))?.clone();
         // A presence-narrowed key is known to be present, so any default is unreachable.
         if obj_ty.has_value_less_presence(&FacetKind::Key(key.to_string())) {
             return Some(field.ty);
@@ -2741,7 +2826,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if ty.is_any() {
             return false;
         }
-        if ty.is_typed_dict() {
+        if self.is_typed_dict(ty) {
             return true;
         }
         let dict_type = self.heap.mk_class_type(
@@ -2757,14 +2842,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ///   and looking at the `__bool__` method, if it is present).
     /// - `None` if it's truthiness is not statically known.
     pub fn as_bool(&self, ty: &Type, range: TextRange, errors: &ErrorCollector) -> Option<bool> {
-        if let Type::TypedDict(td) = ty {
+        if let Type::ClassType(ct) = ty
+            && self.is_typed_dict_class(ct.class_object())
+        {
             // If a TypedDict has ANY required keys, it can never be empty.
             // Therefore, it is always Truthy.
-            if self
-                .typed_dict_fields(td)
-                .values()
-                .any(|field| field.required)
-            {
+            if self.typed_dict_fields(ct).values().any(|f| f.required) {
                 return Some(true);
             }
         } else if let Type::ClassType(cls) = ty {
@@ -3117,7 +3200,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// is the result of looking up the class `tparams` and synthesizing default `targs` that
     /// are gradual if needed (e.g. `list` is treated as `list[Any]` when used as an annotation).
     ///
-    /// This function canonicalizes to `Type::ClassType` or `Type::TypedDict`
+    /// This function canonicalizes to `Type::ClassType`.
     pub fn canonicalize_all_class_types(
         &self,
         ty: Type,
@@ -3261,7 +3344,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 errors,
                                 kw.range,
                                 ErrorKind::InvalidSentinel,
-                                format!("Invalid type for sentinel `repr` {got}"),
+                                format!(
+                                    "Invalid type for sentinel `repr` {}",
+                                    got.display_with(self)
+                                ),
                             );
                         }
                     }
@@ -3359,10 +3445,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         x.range(),
                         ErrorKind::NotIterable,
-                        format!(
-                            "Expected an iterable, got `{}`",
-                            self.for_display(unpacked_ty)
-                        ),
+                        format!("Expected an iterable, got `{}`", self.display(unpacked_ty)),
                     );
                     self.observe_iteration_element(&ty, iteration_types.as_mut());
                     ty
@@ -3549,14 +3632,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.distribute_over_union(target.base, |base| {
             let mut base = base.clone();
             if let Type::Var(v) = base {
-                base = self.solver().force_var(v);
+                base = self.solver().force_var(v, self);
             }
-            if matches!(&base, Type::ClassDef(t) if t.name() == "tuple") {
+            if matches!(&base, Type::ClassDef(t) if t.name(self) == "tuple") {
                 base = self.heap.mk_type_of(self.heap.mk_special_form(SpecialForm::Tuple));
             }
             if let Type::Intersect(x) = &base {
                 let (specialized, generic): (Vec<_>, Vec<_>) = x.0.iter().partition(|member| {
-                    is_builtin_sequence(member) || matches!(member, Type::TypedDict(_))
+                    is_builtin_sequence(member)
+                        || matches!(member, Type::AnonymousTypedDict(_))
+                        || matches!(member, Type::ClassType(cls) if self.is_typed_dict_class(cls.class_object()))
                 });
                 if !specialized.is_empty() {
                     let index_ty = &*slice_ty;
@@ -3588,7 +3673,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         if member_errors.has_hard() {
                             failures.push((member_errors, None));
                         } else {
-                            results.push(self.solver().expand(result));
+                            results.push(self.solver().expand(result, self));
                             errors.extend(member_errors);
                         }
                         self.solver().restore_vars(snapshot);
@@ -3640,10 +3725,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 failures.push((member_errors, Some(return_errors)));
                             } else {
                                 let returns = self.solver().per_row(&outcome.overload_table, || {
-                                    self.solver().expand(outcome.ty.clone())
+                                    self.solver().expand(outcome.ty.clone(), self)
                                 });
                                 results.push(
-                                    Type::combine_overload_results(returns.into_vec(), self.heap)
+                                    Type::combine_overload_results(returns.into_vec(), self.heap, self)
                                         .expect("an applicable index has at least one return"),
                                 );
                                 errors.extend(member_errors);
@@ -3777,27 +3862,29 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                     ))
                 }
+                // An enum cannot be generic, so a class with type parameters skips the enum
+                // check and the class metadata that it reads.
                 Type::ClassDef(ref cls)
-                    if let Expr::StringLiteral(ExprStringLiteral { value: key, .. }) = slice
+                    if self.get_class_tparams(cls).is_none_or(|t| t.is_empty())
                         && self.get_enum_from_class(cls).is_some() =>
                 {
-                    if let Some(member) = self.get_enum_member(cls, &Name::new(key.to_str())) {
-                        member.to_implicit_type()
-                    } else {
-                        self.error(
-                            errors,
-                            slice.range(),
-                            ErrorKind::BadIndex,
-                            format!(
-                                "Enum `{}` does not have a member named `{}`",
-                                cls.name(),
-                                key.to_str()
-                            ),
-                        )
-                    }
-                }
-                Type::ClassDef(ref cls) if self.get_enum_from_class(cls).is_some() => {
-                    if self.is_subset_eq(
+                    if let Expr::StringLiteral(ExprStringLiteral { value: key, .. }) = slice {
+                        if let Some(member) = self.get_enum_member(cls, &Name::new(key.to_str()))
+                        {
+                            member.to_implicit_type()
+                        } else {
+                            self.error(
+                                errors,
+                                slice.range(),
+                                ErrorKind::BadIndex,
+                                format!(
+                                    "Enum `{}` does not have a member named `{}`",
+                                    cls.name(self),
+                                    key.to_str()
+                                ),
+                            )
+                        }
+                    } else if self.is_subset_eq(
                         &self.expr_check(slice, None, errors),
                         &self.heap.mk_class_type(self.stdlib.str().clone()),
                     ) {
@@ -3807,7 +3894,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors,
                             slice.range(),
                             ErrorKind::BadIndex,
-                            format!("Enum `{}` can only be indexed by strings", cls.name()),
+                            format!("Enum `{}` can only be indexed by strings", cls.name(self)),
                         )
                     }
                 }
@@ -3840,7 +3927,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::BadIndex,
                                 format!(
                                     "Enum type `{}` can only be indexed by strings",
-                                    self.for_display(base_display_ty)
+                                    self.display(base_display_ty)
                                 ),
                             )
                         }
@@ -3851,7 +3938,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::UnsupportedOperation,
                             format!(
                                 "`{}` is not subscriptable",
-                                self.for_display(base_display_ty)
+                                self.display(base_display_ty)
                             ),
                         )
                     }
@@ -3871,7 +3958,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::BadIndex,
                             format!(
                                 "Enum type `{}` can only be indexed by strings",
-                                self.for_display(base_display_ty)
+                                self.display(base_display_ty)
                             ),
                         )
                     }
@@ -3992,6 +4079,90 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         Some(&|| ErrorContext::Index(self.for_display(receiver.clone()))),
                     )
                 }
+                Type::ClassType(ref typed_dict)
+                    if self.is_typed_dict_class(typed_dict.class_object()) =>
+                {
+                    let key_ty = &*slice_ty;
+                    self.distribute_over_union(key_ty, |ty| match self.literal_typed_dict_key_name(ty) {
+                        Some(key_name) => {
+                            if let Some(field) =
+                                self.typed_dict_field(typed_dict, &key_name)
+                            {
+                                if !field.required && !key_present {
+                                    errors
+                                        .error_builder(
+                                            slice.range(),
+                                            ErrorKind::NotRequiredKeyAccess,
+                                            format!(
+                                                "TypedDict key `{}` may be absent",
+                                                key_name
+                                            ),
+                                        )
+                                        .with_detail(format!(
+                                            "Hint: guard this access with `'{}' in obj` or `obj.get('{}')`",
+                                            key_name, key_name
+                                        ))
+                                        .emit();
+                                }
+                                field.ty.clone()
+                            } else {
+                                match self.typed_dict_extra_items(typed_dict) {
+                                    ExtraItems::Extra(extra) => extra.ty,
+                                    extra_items if key_present => {
+                                        extra_items.extra_item(self.stdlib).ty
+                                    }
+                                    _ => {
+                                        let mut builder = errors.error_builder(
+                                            slice.range(),
+                                            ErrorKind::BadTypedDictKey,
+                                            format!(
+                                                "TypedDict `{}` does not have key `{key_name}`",
+                                                typed_dict.name(self)
+                                            ),
+                                        );
+                                        let fields = self.typed_dict_fields(typed_dict);
+                                        if let Some(suggestion) = best_suggestion(
+                                            &key_name,
+                                            fields
+                                                .keys()
+                                                .map(|candidate| Candidate::measured(candidate, 0)),
+                                        ) {
+                                            builder = builder.with_detail(format!(
+                                                "Did you mean `{suggestion}`?"
+                                            ));
+                                        }
+                                        builder.emit();
+                                        self.heap.mk_any_error()
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            if self.is_subset_eq(
+                                ty,
+                                &self.heap.mk_class_type(self.stdlib.str().clone()),
+                            )
+                                && !matches!(
+                                    self.typed_dict_extra_items(typed_dict),
+                                    ExtraItems::Default
+                                )
+                            {
+                                self.get_typed_dict_value_type(typed_dict)
+                            } else {
+                                self.error(
+                                    errors,
+                                    slice.range(),
+                                    ErrorKind::BadTypedDictKey,
+                                    format!(
+                                        "Invalid key for TypedDict `{}`, got `{}`",
+                                        typed_dict.name(self),
+                                        self.display(ty.clone())
+                                    ),
+                                )
+                            }
+                        }
+                    })
+                }
                 Type::ClassType(_) | Type::SelfType(_) => {
                     let receiver = target.with_base(&base).getitem_receiver();
                     self.call_method_or_error(
@@ -4105,7 +4276,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         Restriction::ShapeExtension(extension) => self
                             .subscript_infer_for_type_with_key_present_inner(
                                 SubscriptTarget {
-                                    base: &extension.upper_bound(self.stdlib, self.heap),
+                                    base: &extension.upper_bound(self, self.heap),
                                     receiver: Some(&base),
                                     index_ty: target.index_ty,
                                 },
@@ -4121,85 +4292,32 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         }
                     }
                 }
-                Type::TypedDict(typed_dict) => {
-                    let key_ty = &*slice_ty;
-                    // Don't warn on anonymous typed dicts
-                    let warn_on_not_required_access = matches!(typed_dict, TypedDict::TypedDict(_));
-                    self.distribute_over_union(key_ty, |ty| match self.literal_typed_dict_key_name(ty) {
-                        Some(key_name) => {
-                            if let Some(field) = self.typed_dict_field(&typed_dict, &key_name) {
-                                if warn_on_not_required_access && !field.required && !key_present {
-                                    errors
-                                        .error_builder(
-                                            slice.range(),
-                                            ErrorKind::NotRequiredKeyAccess,
-                                            format!(
-                                                "TypedDict key `{}` may be absent",
-                                                key_name
-                                            ),
-                                        )
-                                        .with_detail(format!(
-                                            "Hint: guard this access with `'{}' in obj` or `obj.get('{}')`",
-                                            key_name, key_name
-                                        ))
-                                        .emit();
-                                }
-                                field.ty.clone()
-                            } else {
-                                match self.typed_dict_extra_items(&typed_dict) {
-                                    ExtraItems::Extra(extra) => extra.ty,
-                                    extra_items if key_present => {
-                                        extra_items.extra_item(self.stdlib).ty
-                                    }
-                                    _ => {
-                                        let mut builder = errors.error_builder(
-                                            slice.range(),
-                                            typed_dict.key_error_kind(),
-                                            format!(
-                                                "{} does not have key `{key_name}`",
-                                                typed_dict.label()
-                                            ),
-                                        );
-                                        let fields = self.typed_dict_fields(&typed_dict);
-                                        if let Some(suggestion) = best_suggestion(
-                                            &key_name,
-                                            fields
-                                                .keys()
-                                                .map(|candidate| Candidate::measured(candidate, 0)),
-                                        ) {
-                                            builder = builder.with_detail(format!(
-                                                "Did you mean `{suggestion}`?"
-                                            ));
-                                        }
-                                        builder.emit();
-                                        self.heap.mk_any_error()
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            if self.is_subset_eq(
-                                ty,
-                                &self.heap.mk_class_type(self.stdlib.str().clone()),
-                            )
-                                && !matches!(
-                                    self.typed_dict_extra_items(&typed_dict),
-                                    ExtraItems::Default
-                                )
+                Type::AnonymousTypedDict(typed_dict) => {
+                    // Every key of an anonymous TypedDict is optional and its extra items type is
+                    // the union of its field types, so an unknown key is not an error.
+                    let value_ty = typed_dict.compute_value_type(self.heap, self);
+                    self.distribute_over_union(&slice_ty, |ty| {
+                        match self.literal_typed_dict_key_name(ty) {
+                            Some(key_name) => typed_dict
+                                .field(&key_name)
+                                .map_or_else(|| value_ty.clone(), |field| field.ty.clone()),
+                            None
+                                if self.is_subset_eq(
+                                    ty,
+                                    &self.heap.mk_class_type(self.stdlib.str().clone()),
+                                ) =>
                             {
-                                self.get_typed_dict_value_type(&typed_dict)
-                            } else {
-                                self.error(
-                                    errors,
-                                    slice.range(),
-                                    typed_dict.key_error_kind(),
-                                    format!(
-                                        "Invalid key for {}, got `{}`",
-                                        typed_dict.label(),
-                                        self.for_display(ty.clone())
-                                    ),
-                                )
+                                value_ty.clone()
                             }
+                            None => self.error(
+                                errors,
+                                slice.range(),
+                                ErrorKind::BadIndex,
+                                format!(
+                                    "Invalid key for dict, got `{}`",
+                                    self.display(ty.clone())
+                                ),
+                            ),
                         }
                     })
                 }
@@ -4227,7 +4345,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     errors,
                     range,
                     ErrorKind::UnsupportedOperation,
-                    format!("`{}` is not subscriptable", self.for_display(t)),
+                    format!("`{}` is not subscriptable", self.display(t)),
                 ),
             }
         })
@@ -4252,8 +4370,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .or_else(|| tuple_carrier_to_shape(shape_arg))
             .or_else(|| {
                 let upper_bound = match shape_arg {
-                    Type::Quantified(q) if q.is_type_var() => q.upper_bound(self.stdlib, self.heap),
-                    Type::TypeVar(tv) => tv.upper_bound(self.stdlib, self.heap),
+                    Type::Quantified(q) if q.is_type_var() => q.upper_bound(self, self.heap),
+                    Type::TypeVar(tv) => tv.upper_bound(self, self.heap),
                     _ => return None,
                 };
                 let int_type = self.stdlib.int().clone().to_type();
@@ -4453,7 +4571,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     ErrorKind::InvalidAnnotation,
                                     format!(
                                         "Tensor shape dimensions must be integer literals or type variables, got `{}`",
-                                        self.for_display(expr_type)
+                                        self.display(expr_type)
                                     ),
                                 );
                                 Err(DimensionExprError::Invalid)
@@ -4558,7 +4676,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::InvalidAnnotation,
                     format!(
                         "Tensor shape dimensions must be integer literals, string literals, type variables, or expressions, got `{}`",
-                        self.for_display(expr_type)
+                        self.display(expr_type)
                     ),
                 );
                 Err(DimensionExprError::Invalid)
@@ -4788,14 +4906,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         type_form_context: TypeFormContext<'_>,
         errors: &ErrorCollector,
     ) -> Type {
-        let metadata = self.get_metadata_for_class(cls);
         let class_ty = Type::ClassDef(cls.dupe());
         let allow_dunder_lookup = self
             .get_class_tparams(cls)
             .as_ref()
             .is_none_or(|tparams| tparams.is_empty())
-            && !metadata.has_base_any()
-            && !metadata.is_new_type();
+            && {
+                let metadata = self.get_metadata_for_class(cls);
+                !metadata.has_base_any() && !metadata.is_new_type()
+            };
         let class_getitem_result = if allow_dunder_lookup {
             let class_ty = self.heap.mk_class_def(cls.dupe());
             // TODO(stroxler): Add a new API, similar to `type_of_attr_get` but returning a
@@ -4835,8 +4954,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let targs = self.parse_class_type_args(cls, xs.iter(), type_form_context, errors);
             match self.specialize(cls, targs, range, errors) {
                 Type::ClassType(class_type) => Type::SpecializedClassDef(class_type),
-                Type::TypedDict(typed_dict) => self.heap.mk_type_of(Type::TypedDict(typed_dict)),
-                _ => unreachable!("specializing a class produces a class or TypedDict instance"),
+                _ => unreachable!("specializing a class produces a class instance"),
             }
         }
     }
@@ -4915,7 +5033,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         return self.parse_int_var_argument(arg, shape_argument_context, errors);
                     }
                     if param.kind() == QuantifiedKind::TypeVar
-                        && is_int_tuple_bound(&param.upper_bound(self.stdlib, self.heap), &int_type)
+                        && is_int_tuple_bound(&param.upper_bound(self, self.heap), &int_type)
                     {
                         if let Expr::List(ExprList { elts, .. }) = arg {
                             return self
@@ -4947,8 +5065,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Type::TypeLevelDslCall(call) => {
                 return call.result_domain() == Some(TypeShapeDslDomain::IntTuple);
             }
-            Type::Quantified(q) if q.is_type_var() => q.upper_bound(self.stdlib, self.heap),
-            Type::TypeVar(tv) => tv.upper_bound(self.stdlib, self.heap),
+            Type::Quantified(q) if q.is_type_var() => q.upper_bound(self, self.heap),
+            Type::TypeVar(tv) => tv.upper_bound(self, self.heap),
             _ => return false,
         };
         let int_type = self.stdlib.int().clone().to_type();
@@ -5048,7 +5166,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::InvalidAnnotation,
                     format!(
                         "`Elements[...]` requires an `IntTuple` or integer tuple, got `{}`",
-                        self.for_display(argument)
+                        self.display(argument)
                     ),
                 );
                 Err(())
@@ -5117,7 +5235,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::InvalidAnnotation,
                             format!(
                                 "Unpacked type in `IntTuple` must be an `IntTuple` or integer tuple, or a type variable bounded by one, got `{}`",
-                                self.for_display(got)
+                                self.display(got)
                             ),
                         );
                         return None;
@@ -5260,7 +5378,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
             Type::Literal(lit) if let Lit::Enum(e) = &lit.value => {
                 Some(ConditionRedundantReason::EnumLiteral(
-                    e.class.class_object().name().clone(),
+                    e.class.class_object().name(self).clone(),
                     e.member.clone(),
                 ))
             }
@@ -5276,7 +5394,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 self.module().name(),
                 kind.clone(),
             )),
-            Type::ClassDef(cls) => Some(ConditionRedundantReason::Class(cls.name().clone())),
+            Type::ClassDef(cls) => Some(ConditionRedundantReason::Class(cls.name(self).clone())),
             Type::ClassType(ct) => {
                 let cls = ct.class_object();
                 // Skip warning for `object` itself and for abstract/protocol types:
@@ -5303,7 +5421,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     && self.class_instances_always_truthy(cls)
                 {
                     Some(ConditionRedundantReason::InstanceAlwaysTruthy(
-                        cls.name().clone(),
+                        cls.name(self).clone(),
                     ))
                 } else {
                     None
@@ -5325,7 +5443,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors,
                 range,
                 ErrorKind::RedundantCondition,
-                format!("{reason}"),
+                reason.display_with(self).to_string(),
             );
         }
     }
@@ -5360,7 +5478,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::ImplicitBool,
                 format!(
                     "Implicit conversion of `{}` to `bool` is not allowed",
-                    self.for_display(condition_type.clone())
+                    self.display(condition_type.clone())
                 ),
             );
         }

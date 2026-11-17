@@ -10,7 +10,24 @@
 use crate::test::util::TestEnv;
 use crate::testcase;
 
-// Constructor phases must deduplicate equivalent diagnostics at the same call range.
+testcase!(
+    test_overload_error_keeps_non_lambda_input_types,
+    r#"
+from typing import overload
+
+@overload
+def consume(items: list[str], *, label: int) -> None: ...
+@overload
+def consume(items: list[bytes], *, label: str) -> None: ...
+def consume(items, *, label): ...
+
+consume([], label=None)  # E: called with arguments: (list[@_], label=None)
+consume([1], label=None)  # E: called with arguments: (list[int], label=None)
+consume({"value": 1}, label=None)  # E: called with arguments: (dict[str, int], label=None)
+consume(list[int](), label=None)  # E: called with arguments: (list[int], label=None)
+"#,
+);
+
 testcase!(
     test_signature_unresolved_import_constructor_details,
     r#"
@@ -24,7 +41,7 @@ class Model:
         pass
 
 def construct(array: Array, other: Other) -> Model:
-    return Model(array, other)  # E: Call uses a signature that depends on unresolved imports
+    return Model(array, other)
 "#,
 );
 
@@ -44,9 +61,7 @@ assert_type(transform(1), str)
 "#,
 );
 
-// This records a debatable policy edge, not an established correctness bug.
-// Rejecting a direct missing-import return may be reasonable; a union can
-// still contain usable return alternatives. The input-only policy accepts it.
+// Return-only recovery does not affect the input contract used for overload preference.
 testcase!(
     test_signature_unresolved_import_return_only,
     r#"
@@ -73,7 +88,7 @@ import another_missing_backend as backend  # E: Cannot find module `another_miss
 def transform(x: Array, y: Other) -> backend.Array[int]:
     return x
 
-assert_type(transform(1, 2), Any)  # E: Call uses a signature that depends on unresolved imports
+assert_type(transform(1, 2), Any)
 "#,
 );
 
@@ -102,7 +117,7 @@ Alias = Array[int]
 def transform(x: Alias) -> Alias:
     return x
 
-assert_type(transform(1), Any)  # E: Call uses a signature that depends on unresolved imports
+assert_type(transform(1), Any)
 "#,
 );
 
@@ -160,7 +175,7 @@ from missing_backend import Array  # E: Cannot find module `missing_backend`
 def transform[T](x: Array) -> list[T]:
     raise RuntimeError
 
-result: list[str] = transform(1)  # E: Call uses a signature that depends on unresolved imports
+result: list[str] = transform(1)
 assert_type(result, list[str])
 "#,
 );
@@ -179,7 +194,7 @@ class Right:
     def __radd__(self, other: object) -> int:
         return 0
 
-assert_type(Left() + Right(), str)  # E: Call uses a signature that depends on unresolved imports
+assert_type(Left() + Right(), str)
 "#,
 );
 
@@ -219,7 +234,7 @@ class Model:
     array: Array
     other: Other
 
-assert_type(Model(1, 2), Model)  # E: Call uses a signature that depends on unresolved imports
+assert_type(Model(1, 2), Model)
 
 @dataclass
 class GenericModel[T]:
@@ -242,8 +257,8 @@ def transform(x: Array) -> int: ...
 def transform(x: Other, y: Other) -> str: ...
 def transform(x: Any, y: Any = None) -> Any: ...
 
-assert_type(transform(1), int)  # E: Call uses a signature that depends on unresolved imports
-assert_type(transform(1, 2), str)  # E: Call uses a signature that depends on unresolved imports
+assert_type(transform(1), int)
+assert_type(transform(1, 2), str)
 
 @overload
 def ambiguous(x: Array) -> int: ...
@@ -251,7 +266,7 @@ def ambiguous(x: Array) -> int: ...
 def ambiguous(x: Other) -> str: ...
 def ambiguous(x: Any) -> Any: ...
 
-assert_type(ambiguous(1), Any)  # E: No matching overload found
+assert_type(ambiguous(1), int)
 "#,
 );
 
@@ -262,7 +277,7 @@ from typing import Any, Callable, assert_type
 from missing_backend import Array  # E: Cannot find module `missing_backend`
 
 def exercise(transform: Callable[[Array], Array]) -> None:
-    assert_type(transform(1), Any)  # E: Call uses a signature that depends on unresolved imports
+    assert_type(transform(1), Any)
 "#,
 );
 
@@ -285,7 +300,7 @@ def scalar(value: int | Array) -> int:
     return 0
 
 assert_type(scalar(7), int)
-assert_type(scalar("bad"), int)  # E: Call uses a signature that depends on unresolved imports
+assert_type(scalar("bad"), int)
 "#,
 );
 
@@ -302,7 +317,7 @@ assert_type(optional(7), int)
 assert_type(optional(7, None), int)
 assert_type(optional(7, object()), int)
 extra = object()
-assert_type(optional(7, extra), int)  # E: Call uses a signature that depends on unresolved imports
+assert_type(optional(7, extra), int)
 "#,
 );
 
@@ -347,7 +362,7 @@ def choose(value: int) -> bool: ...
 def choose(value: Any) -> Any: ...
 
 def exercise(value: Any) -> None:
-    assert_type(choose(value), bool)
+    assert_type(choose(value), str)
 "#,
 );
 
@@ -393,6 +408,170 @@ def use(callback: Callable[[int], int], extra: Array | None = None) -> None:
 
 def exercise(flag: bool) -> None:
     use((lambda value: value) if flag else (lambda value: value))
+"#,
+);
+
+// Reproductions from https://github.com/meta/pyrefly/issues/5634.
+testcase!(
+    test_missing_import_overload_fallback,
+    r#"
+from collections.abc import Callable
+from typing import Any, Literal, TypeVar, assert_type, overload
+from missing_backend import Tensor, Order, foo  # E: Cannot find module `missing_backend`
+
+@overload
+def compare(a: Tensor, kind: Literal["equal"], b: Tensor) -> bool: ...
+@overload
+def compare(a: Tensor, kind: str, b: Tensor) -> Tensor: ...
+def compare(a: Tensor, kind: str, b: Tensor) -> bool | Tensor:
+    return a == b
+
+def exercise(x: Tensor, y: Tensor) -> None:
+    assert_type(compare(x, "equal", y), bool)
+    compare(x, 1, y)  # E: No matching overload found
+
+def plain(a: int, order: Order = "K") -> int:
+    return a
+
+@overload
+def ones_like(a: int, order: Order = "K") -> int: ...
+@overload
+def ones_like(a: str, order: Order = "K") -> str: ...
+def ones_like(a: int | str, order: Order = "K") -> int | str:
+    return a
+
+assert_type(plain(1), int)
+assert_type(ones_like(1), int)
+assert_type(ones_like("x"), str)
+
+R = TypeVar("R")
+def ident(x: R) -> Callable[[R], R]:
+    raise RuntimeError
+
+assert_type(ident(foo)(1), Any)
+"#,
+);
+
+testcase!(
+    test_missing_import_overload_order,
+    r#"
+from typing import Any, assert_type, overload
+from missing_backend import Array  # E: Cannot find module `missing_backend`
+
+@overload
+def missing_first(value: Array, other: Any) -> Array: ...
+@overload
+def missing_first(value: int, other: Any) -> str: ...
+def missing_first(value: Any, other: Any) -> Any: ...
+
+@overload
+def known_first(value: int, other: Any) -> str: ...
+@overload
+def known_first(value: Array, other: Any) -> Array: ...
+def known_first(value: Any, other: Any) -> Any: ...
+
+def exercise(other: Any) -> None:
+    assert_type(missing_first(1, other), str)
+    assert_type(known_first(1, other), str)
+"#,
+);
+
+testcase!(
+    test_missing_import_overload_gradual_argument,
+    r#"
+from typing import Any, assert_type, overload
+from missing_backend import Array  # E: Cannot find module `missing_backend`
+
+@overload
+def alpha(cutoff: float) -> float: ...
+@overload
+def alpha(cutoff: Array) -> Array: ...
+def alpha(cutoff: Any) -> Any:
+    return cutoff
+
+def exercise(value: Any) -> None:
+    assert_type(alpha(value), Any)
+    assert_type(alpha(cutoff=value), Any)
+    assert_type(alpha(1.0), float)
+
+# Unannotated arguments must retain the same gradual behavior.
+def unannotated(value) -> None:
+    alpha(value)[:, None]
+"#,
+);
+
+testcase!(
+    test_missing_import_overload_gradual_argument_spec,
+    TestEnv::new().enable_spec_compliant_overloads(),
+    r#"
+from typing import Any, assert_type, overload
+from missing_backend import Array  # E: Cannot find module `missing_backend`
+
+@overload
+def alpha(cutoff: Array) -> Array: ...
+@overload
+def alpha(cutoff: float) -> float: ...
+def alpha(cutoff: Any) -> Any:
+    return cutoff
+
+def exercise(value: Any) -> None:
+    assert_type(alpha(value), Any)
+    assert_type(alpha(cutoff=value), Any)
+    assert_type(alpha(1.0), float)
+"#,
+);
+
+testcase!(
+    test_missing_import_return_only_fallback,
+    r#"
+from typing import Any, Literal, TypedDict, assert_type, overload
+from missing_backend import Frame  # E: Cannot find module `missing_backend`
+
+class Row(TypedDict):
+    frame: Frame
+
+class OptionalRow(TypedDict, total=False):
+    frame: Frame
+
+@overload
+def to(value: int, backend: Literal["torch"]) -> Frame: ...
+@overload
+def to(value: int, backend: str) -> int: ...
+def to(value: int, backend: str) -> Any:
+    raise RuntimeError
+
+def exercise(row: Row, optional: OptionalRow) -> None:
+    assert_type(row.get("frame"), Any)
+    assert_type(optional.get("frame"), Any | None)
+    row.get("frame").head()
+    assert_type(to(1, "torch"), Any)
+    to(1, "torch").cpu()
+"#,
+);
+
+testcase!(
+    test_missing_import_input_preference_boundary,
+    r#"
+from typing import Any, assert_type, overload
+from missing_backend import Array, Device  # E: Cannot find module `missing_backend`
+
+@overload
+def known_arm(value: int | Array) -> list[int]: ...
+@overload
+def known_arm(value: object) -> object: ...
+def known_arm(value: Any) -> Any:
+    raise RuntimeError
+
+@overload
+def omitted(value: int, device: Device | None = None) -> list[int]: ...
+@overload
+def omitted(value: object) -> object: ...
+def omitted(value: Any, device: Any = None) -> Any:
+    raise RuntimeError
+
+# Input-wide preference includes known union arms and omitted optional annotations.
+assert_type(known_arm(7), object)
+assert_type(omitted(7), object)
 "#,
 );
 
@@ -694,9 +873,9 @@ from typing import assert_type, overload
 
 class A:
     @overload
-    def B(self, x: int) -> B: ...  # E: Expected a type form, got instance of `Overload[
+    def B(self, x: int) -> B: ...  # E: Expected a type form, got class attribute `B` of type `Overload[
     @overload
-    def B(self, x: str) -> B: ...  # E: Expected a type form, got instance of `(self: Self@A, x: int) -> Unknown`
+    def B(self, x: str) -> B: ...  # E: Expected a type form, got instance of `(self: Self@A, x: int) -> B`
     def B(self, x):
         return B()
 
@@ -2303,7 +2482,6 @@ g(x=1, y="hello")  # E: No matching overload found for function `g` called with 
 
 // Regression test for https://github.com/facebook/pyrefly/issues/5074
 testcase!(
-    bug = "Lambda arguments are shown with Unknown parameters in the first line",
     test_overload_error_shows_lambda_argument_types,
     r#"
 from typing import Callable, overload
@@ -2314,7 +2492,7 @@ class Key:
         return object()
 
 def sort_values(values: list[Key]) -> None:
-    values.sort(key=lambda value: value)  # E: No matching overload found for function `list.sort` called with arguments: (key=(value: Unknown) -> Unknown)
+    values.sort(key=lambda value: value)  # E: No matching overload found for function `list.sort` called with arguments: (key=(value: Key) -> Key)
 
 class C:
     @overload
@@ -2324,7 +2502,15 @@ class C:
     def m(self, callback, y): ...
 
 # The lambda returns `None`, so like the one above it fails its check against the closest overload.
-C().m(lambda v: None, 1.5)  # E: No matching overload found for function `C.m` called with arguments: ((v: Unknown) -> None, float)
+C().m(lambda v: None, 1.5)  # E: No matching overload found for function `C.m` called with arguments: ((v: int) -> None, float)
+
+@overload
+def va(*args: Callable[[int], int]) -> None: ...
+@overload
+def va(*args: Callable[[str], str]) -> None: ...
+def va(*args): ...
+
+va(lambda v: None)  # E: No matching overload found for function `va` called with arguments: ((v: int) -> None)
     "#,
 );
 

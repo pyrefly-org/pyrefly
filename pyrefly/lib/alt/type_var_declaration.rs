@@ -8,6 +8,7 @@
 //! Parsing of legacy `TypeVar`, `ParamSpec`, and `TypeVarTuple` declarations, and validation
 //! of type variable defaults.
 
+use pyrefly_util::display::DisplayWithCtx;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprCall;
 use ruff_python_ast::Identifier;
@@ -255,7 +256,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::InvalidLiteral,
                     format!(
                         "Expected literal `True` or `False`, got `{}`",
-                        self.for_display(ty)
+                        self.display(ty)
                     ),
                 );
                 false
@@ -288,17 +289,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // the same safe fallback as an ordinary bound.
         let upper_bound = match restriction {
             Restriction::Bound(bound) => Some(bound.clone()),
-            Restriction::ShapeExtension(extension) => {
-                Some(extension.upper_bound(self.stdlib, self.heap))
-            }
+            Restriction::ShapeExtension(extension) => Some(extension.upper_bound(self, self.heap)),
             Restriction::Constraints(_) | Restriction::Unrestricted => None,
         };
         if let Some(bound_ty) = upper_bound {
             // Default must be a subtype of the upper bound.
             // Per PEP 696: when default is a TypeVar, "T1's bound must be a subtype of T2's bound"
             let default_for_check = match default {
-                Type::TypeVar(tv) => tv.upper_bound(self.stdlib, self.heap),
-                Type::Quantified(q) if q.is_type_var() => q.upper_bound(self.stdlib, self.heap),
+                Type::TypeVar(tv) => tv.upper_bound(self, self.heap),
+                Type::Quantified(q) if q.is_type_var() => q.upper_bound(self, self.heap),
                 _ => default.clone(),
             };
             if !self.is_subset_eq(&default_for_check, &bound_ty) {
@@ -307,7 +306,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     range,
                     quantified_kind_error(kind),
                     format!(
-                        "Expected default `{default}` of `{name}` to be assignable to the upper bound of `{bound_ty}`",
+                        "Expected default `{}` of `{name}` to be assignable to the upper bound of `{}`",
+                        default.display_with(self),
+                        bound_ty.display_with(self),
                     ),
                 );
                 return self.heap.mk_any_error();
@@ -339,7 +340,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if !valid {
                 let formatted_constraints = constraints
                     .iter()
-                    .map(|x| format!("`{x}`"))
+                    .map(|x| format!("`{}`", x.display_with(self)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.error(
@@ -347,7 +348,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     range,
                     quantified_kind_error(kind),
                     format!(
-                        "Expected default `{default}` of `{name}` to be one of the following constraints: {formatted_constraints}"
+                        "Expected default `{}` of `{name}` to be one of the following constraints: {formatted_constraints}",
+                        default.display_with(self)
                     ),
                 );
                 return self.heap.mk_any_error();
@@ -362,13 +364,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         range,
                         ErrorKind::InvalidParamSpec,
-                        format!("Default for `ParamSpec` must be a parameter list, `...`, or another `ParamSpec`, got `{default}`"),
+                        format!("Default for `ParamSpec` must be a parameter list, `...`, or another `ParamSpec`, got `{}`", default.display_with(self)),
                     );
                     self.heap.mk_any_error()
                 }
             }
             QuantifiedKind::TypeVarTuple => {
-                if let Type::Unpack(inner) = default
+                if let Type::Unpack(inner, ..) = default
                     && (matches!(&**inner, Type::Tuple(_)) || inner.is_kind_type_var_tuple())
                 {
                     (**inner).clone()
@@ -377,7 +379,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         range,
                         ErrorKind::InvalidTypeVarTuple,
-                        format!("Default for `TypeVarTuple` must be an unpacked tuple form or another `TypeVarTuple`, got `{default}`"),
+                        format!("Default for `TypeVarTuple` must be an unpacked tuple form or another `TypeVarTuple`, got `{}`", default.display_with(self)),
                     );
                     self.heap.mk_any_error()
                 }
@@ -389,7 +391,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         range,
                         ErrorKind::InvalidTypeVar,
                         format!(
-                            "Default for `{kind}` may not be a `TypeVarTuple` or `ParamSpec`, got `{default}`"
+                            "Default for `{kind}` may not be a `TypeVarTuple` or `ParamSpec`, got `{}`",
+                            default.display_with(self)
                         ),
                     );
                     self.heap.mk_any_error()

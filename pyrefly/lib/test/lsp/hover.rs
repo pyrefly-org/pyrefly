@@ -17,6 +17,7 @@ use pyrefly_build::handle::Handle;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_python::sys_info::PythonVersion;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::thread_pool::TEST_THREAD_COUNT;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
@@ -1231,11 +1232,12 @@ Record(value='text')
             transaction.get_answers(&lib).is_some(),
             retention == Require::Everything
         );
+        let type_env = transaction.type_env(&main);
         for (offset, _) in caller.match_indices("value=") {
             let position = TextSize::try_from(offset).unwrap();
             let call_type = transaction
                 .get_expected_type_at(&main, position)
-                .map(|ty| ty.to_string());
+                .map(|ty| ty.display_with(&type_env).to_string());
             // Signature help cannot currently recover this generic call's parameter type.
             if caller[..offset]
                 .lines()
@@ -1255,14 +1257,14 @@ Record(value='text')
             assert_eq!(
                 transaction
                     .get_type_at(&main, position)
-                    .map(|ty| ty.to_string()),
+                    .map(|ty| ty.display_with(&type_env).to_string()),
                 expected,
                 "retention {retention:?}; position {position:?}",
             );
             assert_eq!(
                 transaction
                     .get_type_at_preserving_declaration(&main, position)
-                    .map(|ty| ty.to_string()),
+                    .map(|ty| ty.display_with(&type_env).to_string()),
                 expected,
             );
             assert_eq!(
@@ -1271,7 +1273,7 @@ Record(value='text')
                         &main,
                         TextRange::new(position, position + TextSize::from(5))
                     )
-                    .map(|ty| ty.to_string()),
+                    .map(|ty| ty.display_with(&type_env).to_string()),
                 expected,
             );
             let hover = get_hover(&transaction, &main, position, false);
@@ -4514,4 +4516,125 @@ fn hover_repeated_live_conditional_method() {
     assert!(report.contains("Last."), "got: {report}");
     assert!(!report.contains("First."), "got: {report}");
     assert!(report.contains("int"), "got: {report}");
+}
+
+#[test]
+fn hover_shows_parameter_doc_for_method_keyword_argument() {
+    let code = r#"
+class C:
+    def method(self, x: int) -> None:
+        """
+        Args:
+            x: documentation for x
+        """
+
+C().method(x=1)
+#          ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(
+        report.contains("documentation for x"),
+        "Expected parameter documentation for x, got: {report}"
+    );
+}
+
+#[test]
+fn hover_on_function_shows_annotated_doc_parameter_documentation() {
+    let lib = r#"
+from typing import Annotated
+from typing_extensions import Doc
+
+def greet(
+#    ^
+    name: Annotated[str, Doc("The user's name.")],
+    greeting: Annotated[str, Doc("How to greet the user.")] = "Hello",
+    loud: bool = False,
+) -> None:
+    """Greet a user."""
+"#;
+    let main = r#"
+from lib import greet
+greet("Ada")
+# ^
+"#;
+    let report = get_batched_lsp_operations_report(
+        &[("lib", lib), ("main", main)],
+        |state, handle, position| match get_hover(&state.transaction(), handle, position, false) {
+            Some(Hover {
+                contents: Contents::MarkupContent(markup),
+                ..
+            }) => markup.value,
+            _ => "None".to_owned(),
+        },
+    );
+    assert_eq!(
+        r#"
+# lib.py
+5 | def greet(
+         ^
+```python
+(function) greet: def greet(
+    name    : str,
+    greeting: str  = 'Hello',
+    loud    : bool = False
+) -> None: ...
+```
+---
+Greet a user.
+
+---
+**Parameter `name`**
+The user's name.
+
+**Parameter `greeting`**
+How to greet the user.
+
+
+# main.py
+3 | greet("Ada")
+      ^
+```python
+(function) greet: def greet(
+    name    : str,
+    greeting: str  = 'Hello',
+    loud    : bool = False
+) -> None: ...
+```
+---
+Greet a user.
+
+---
+**Parameter `name`**
+The user's name.
+
+**Parameter `greeting`**
+How to greet the user.
+"#
+        .trim(),
+        report.trim(),
+    );
+}
+
+#[test]
+fn hover_shows_annotated_doc_parameter_documentation() {
+    let code = r#"
+from typing import Annotated
+
+class Doc:
+    def __init__(self, documentation: str, /) -> None: ...
+
+def greet(name: Annotated[str, Doc("Who to greet")]) -> None:
+    print(name)
+#         ^
+
+greet(name="x")
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert_eq!(
+        report.matches("**Parameter `name`**").count(),
+        2,
+        "Expected parameter documentation at both cursors, got: {report}"
+    );
+    assert_eq!(report.matches("Who to greet").count(), 2);
 }

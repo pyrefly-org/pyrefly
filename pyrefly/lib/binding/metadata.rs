@@ -58,13 +58,29 @@ impl BindingsMetadata {
         &self.classes[idx.0 as usize]
     }
 
-    /// Bounds-checked version for cross-module lookups where the
-    /// `ClassDefIndex` may be stale after an incremental rebuild.
+    /// Bounds-checked version for lookups where the `ClassDefIndex` may be
+    /// stale after an incremental rebuild.
     pub fn get_class_checked(&self, idx: ClassDefIndex) -> Option<&ClassMetadata> {
         self.classes.get(idx.0 as usize)
     }
 
     pub fn get_class_mut(&mut self, idx: ClassDefIndex) -> &mut ClassMetadata {
         &mut self.classes[idx.0 as usize]
+    }
+
+    /// The classes whose declared fields differ between `self` and `other`, wherever in the file
+    /// they are declared, including the classes that only one of them has.
+    pub fn changed_class_rows<'a>(
+        &'a self,
+        other: &'a Self,
+    ) -> impl Iterator<Item = ClassDefIndex> + 'a {
+        (0..self.classes.len().max(other.classes.len()))
+            .filter(move |&i| {
+                !matches!(
+                    (self.classes.get(i), other.classes.get(i)),
+                    (Some(x), Some(y)) if x.fields.same_declarations(&y.fields)
+                )
+            })
+            .map(|i| ClassDefIndex(i as u32))
     }
 }

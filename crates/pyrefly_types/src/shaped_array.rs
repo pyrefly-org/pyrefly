@@ -6,19 +6,23 @@
  */
 
 use std::fmt;
-use std::fmt::Display;
 
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
+use pyrefly_util::display::DisplayWith;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::display::commas_iter;
 
 use crate::dimension::Int;
 use crate::dimension::ShapeError;
+use crate::dimension::ShapeMessage;
 use crate::dimension::canonicalize;
 use crate::dimension::gradual_size;
 use crate::dimension::is_gradual_size;
 use crate::dimension::is_gradual_size_bound_type_var;
+use crate::env::TypeEnv;
 use crate::known_class::KnownClass;
 use crate::lit_int::LitInt;
 use crate::literal::Lit;
@@ -34,11 +38,11 @@ use crate::types::Type;
 /// canonical `Int`s, while variadic middles carry the original tuple/type
 /// variable shape carrier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct IntTuple(IntTupleRepr);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 enum IntTupleRepr {
     Concrete(Vec<Int>),
     Gradual,
@@ -556,14 +560,18 @@ impl IntTuple {
     }
 }
 
-impl Display for IntTuple {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for IntTuple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         match &self.0 {
             IntTupleRepr::Concrete(dims) => {
                 if dims.is_empty() {
                     write!(f, "()") // Scalar tensor: Tensor[()]
                 } else {
-                    write!(f, "{}", commas_iter(|| dims.iter()))
+                    write!(
+                        f,
+                        "{}",
+                        commas_iter(|| dims.iter().map(|d| d.display_with(env)))
+                    )
                 }
             }
             IntTupleRepr::Gradual => write!(f, "*IntTuple"),
@@ -573,11 +581,19 @@ impl Display for IntTuple {
                 suffix,
             } => {
                 if !prefix.is_empty() {
-                    write!(f, "{}, ", commas_iter(|| prefix.iter()))?;
+                    write!(
+                        f,
+                        "{}, ",
+                        commas_iter(|| prefix.iter().map(|d| d.display_with(env)))
+                    )?;
                 }
-                write!(f, "*{}", fmt_unpacked_middle(middle))?;
+                write!(f, "*{}", fmt_unpacked_middle(middle, env))?;
                 if !suffix.is_empty() {
-                    write!(f, ", {}", commas_iter(|| suffix.iter()))?;
+                    write!(
+                        f,
+                        ", {}",
+                        commas_iter(|| suffix.iter().map(|d| d.display_with(env)))
+                    )?;
                 }
                 Ok(())
             }
@@ -585,14 +601,14 @@ impl Display for IntTuple {
     }
 }
 
-fn fmt_unpacked_middle(middle: &Type) -> String {
+fn fmt_unpacked_middle(middle: &Type, env: &dyn TypeEnv) -> String {
     // Type-variable middles render bare, matching the compact input spelling;
     // `Elements[...]` is only needed for runtime evaluation, not for display.
     match middle {
         Type::IntTuple(shape) if shape.is_shapeless() => "tuple[int, ...]".to_owned(),
         Type::Tuple(Tuple::Unbounded(elt)) if elt.is_any() => "tuple[int, ...]".to_owned(),
         Type::Tuple(Tuple::Unbounded(elt)) if is_gradual_size(elt) => "tuple[int, ...]".to_owned(),
-        _ => format!("{middle}"),
+        _ => middle.display_with(env).to_string(),
     }
 }
 
@@ -1119,13 +1135,13 @@ pub fn reduce_axis_shape(
                 }
             } else {
                 ShapeError::ShapeComputation {
-                    message: policy.invalid_axis_message.to_owned(),
+                    message: policy.invalid_axis_message.to_owned().into(),
                 }
             });
         };
         if *selected {
             return Err(ShapeError::ShapeComputation {
-                message: policy.duplicate_axis_message.to_owned(),
+                message: policy.duplicate_axis_message.to_owned().into(),
             });
         }
         *selected = true;
@@ -1281,7 +1297,8 @@ fn broadcast_concrete_with_unpacked(
     } else {
         Err(ShapeError::ShapeComputation {
             message: "Cannot broadcast concrete dims with variadic shape: alignment is ambiguous"
-                .to_owned(),
+                .to_owned()
+                .into(),
         })
     }
 }
@@ -1403,12 +1420,12 @@ pub(crate) fn broadcast_dim(a_ty: &Int, b_ty: &Int, position: usize) -> Result<I
         (_, Int::Int) => Ok(a_ty.clone()),
         // Different non-broadcastable types: incompatible
         _ => Err(ShapeError::ShapeComputation {
-            message: format!(
-                "Cannot broadcast dimension {} with dimension {} at position {}",
-                dim_to_type(&a_ty),
-                dim_to_type(&b_ty),
-                position
-            ),
+            message: ShapeMessage::default()
+                .text("Cannot broadcast dimension ")
+                .ty(dim_to_type(&a_ty))
+                .text(" with dimension ")
+                .ty(dim_to_type(&b_ty))
+                .text(format!(" at position {position}")),
         }),
     }
 }
@@ -1422,7 +1439,7 @@ mod tests {
     use pyrefly_python::module::Module;
     use pyrefly_python::module_name::ModuleName;
     use pyrefly_python::module_path::ModulePath;
-    use pyrefly_python::nesting_context::NestingContext;
+    use pyrefly_util::display::DisplayWithCtx;
     use pyrefly_util::visit::VisitMut;
     use ruff_python_ast::Identifier;
     use ruff_python_ast::Int as AstInt;
@@ -1430,10 +1447,7 @@ mod tests {
     use ruff_text_size::TextRange;
     use ruff_text_size::TextSize;
 
-    use crate::class::Class;
-    use crate::class::ClassDefIndex;
     use crate::class::ClassType;
-    use crate::class::PrecomputedTParams;
     use crate::dimension::Int;
     use crate::dimension::gradual_size;
     use crate::lit_int::LitInt;
@@ -1458,6 +1472,7 @@ mod tests {
     use crate::shaped_array::shape_to_tuple_carrier;
     use crate::shaped_array::shape_to_tuple_carrier_arg;
     use crate::shaped_array::tuple_carrier_to_shape;
+    use crate::test_type_env::TestTypeEnv;
     use crate::tuple::Tuple;
     use crate::type_var::PreInferenceVariance;
     use crate::type_var::Restriction;
@@ -1518,20 +1533,8 @@ mod tests {
         )
     }
 
-    fn fake_class_type(module: &str, name: &str) -> ClassType {
-        let module = fake_module(module);
-        ClassType::new(
-            Class::new(
-                ClassDefIndex(0),
-                Identifier::new(Name::new(name), TextRange::empty(TextSize::new(0))),
-                NestingContext::toplevel(),
-                module,
-                PrecomputedTParams::NotGeneric,
-                false,
-                None,
-            ),
-            TArgs::default(),
-        )
+    fn fake_class_type(env: &TestTypeEnv, module: &str, name: &str) -> ClassType {
+        ClassType::new(env.class(module, name), TArgs::default())
     }
 
     fn fake_type_var(name: &str, kind: QuantifiedKind) -> TypeVar {
@@ -1767,7 +1770,8 @@ mod tests {
 
     #[test]
     fn unpacked_invalid_unbounded_middle_recovers_to_gradual() {
-        let elt = Type::ClassType(fake_class_type("torch", "Materialization"));
+        let env = TestTypeEnv::new();
+        let elt = Type::ClassType(fake_class_type(&env, "torch", "Materialization"));
         let shape = IntTuple::from_tuple(Tuple::Unbounded(Box::new(elt)));
 
         assert_eq!(shape, IntTuple::shapeless());
@@ -1875,7 +1879,10 @@ mod tests {
         let right = IntTuple::new(vec![dim(5), dim(4)]);
 
         assert_eq!(
-            broadcast_shapes(&left, &right).unwrap_err().to_string(),
+            broadcast_shapes(&left, &right)
+                .unwrap_err()
+                .display_with(&TestTypeEnv::new())
+                .to_string(),
             "Cannot broadcast dimension Int[3] with dimension Int[5] at position 1"
         );
     }
@@ -1899,7 +1906,10 @@ mod tests {
 
         for (left, right) in [(&concrete, &unpacked), (&unpacked, &concrete)] {
             assert_eq!(
-                broadcast_shapes(left, right).unwrap_err().to_string(),
+                broadcast_shapes(left, right)
+                    .unwrap_err()
+                    .display_with(&TestTypeEnv::new())
+                    .to_string(),
                 "Cannot broadcast concrete dims with variadic shape: alignment is ambiguous"
             );
         }
@@ -1950,6 +1960,7 @@ mod tests {
 
     #[test]
     fn concrete_projects_to_int_dims_not_literals() {
+        let env = TestTypeEnv::new();
         let n = Type::Quantified(Box::new(Quantified::new(
             QuantifiedIdentity::new(
                 ModuleName::from_str("__test__"),
@@ -1971,7 +1982,10 @@ mod tests {
                 Type::Int(Int::Symbolic(Box::new(n))),
             ]))
         );
-        assert_eq!(projected.to_string(), "tuple[Int[2], Int[N]]");
+        assert_eq!(
+            projected.display_with(&env).to_string(),
+            "tuple[Int[2], Int[N]]"
+        );
     }
 
     #[test]
@@ -2039,6 +2053,7 @@ mod tests {
 
     #[test]
     fn affixed_tuple_carrier_middle_displays_as_bare_splat() {
+        let env = TestTypeEnv::new();
         let middle = Type::Quantified(Box::new(Quantified::new(
             QuantifiedIdentity::new(
                 ModuleName::from_str("__test__"),
@@ -2053,20 +2068,28 @@ mod tests {
         )));
 
         assert_eq!(
-            IntTuple::unpacked(vec![dim(1)], middle, vec![dim(2)]).to_string(),
+            IntTuple::unpacked(vec![dim(1)], middle, vec![dim(2)])
+                .display_with(&env)
+                .to_string(),
             "1, *S, 2"
         );
-        assert_eq!(IntTuple::shapeless().to_string(), "*IntTuple");
+        assert_eq!(
+            IntTuple::shapeless().display_with(&env).to_string(),
+            "*IntTuple"
+        );
     }
 
     #[test]
     fn int_tuple_display_strips_top_level_parens() {
+        let env = TestTypeEnv::new();
         // Build the reprs directly: the public constructors constant-fold.
         let add = || Int::Add(Box::new(dim(2)), Box::new(dim(3)));
         let mul = || Int::Mul(Box::new(dim(2)), Box::new(dim(3)));
         let middle = || Box::new(Type::IntTuple(Box::new(IntTuple::shapeless())));
         assert_eq!(
-            IntTuple(IntTupleRepr::Concrete(vec![add(), mul()])).to_string(),
+            IntTuple(IntTupleRepr::Concrete(vec![add(), mul()]))
+                .display_with(&env)
+                .to_string(),
             "2 + 3, 2 * 3"
         );
         assert_eq!(
@@ -2075,6 +2098,7 @@ mod tests {
                 middle: middle(),
                 suffix: vec![mul()],
             })
+            .display_with(&env)
             .to_string(),
             "2 + 3, *tuple[int, ...], 2 * 3"
         );
@@ -2184,7 +2208,8 @@ mod tests {
 
     #[test]
     fn other_type_variables_do_not_project_as_dimensions() {
-        let int_class = Type::ClassType(fake_class_type("builtins", "int"));
+        let env = TestTypeEnv::new();
+        let int_class = Type::ClassType(fake_class_type(&env, "builtins", "int"));
         for restriction in [
             Restriction::Bound(int_class.clone()),
             Restriction::Bound(Type::Int(Int::Literal(5))),
@@ -2305,9 +2330,10 @@ mod tests {
 
     #[test]
     fn invalid_concrete_tuple_middle_recovers_with_gradual_dims() {
+        let env = TestTypeEnv::new();
         let middle = Type::Tuple(Tuple::Concrete(vec![
             literal(2),
-            Type::ClassType(fake_class_type("builtins", "str")),
+            Type::ClassType(fake_class_type(&env, "builtins", "str")),
             size(3),
             bool_literal(),
             Type::Quantified(Box::new(fake_tparam("T", QuantifiedKind::TypeVar))),
@@ -2335,7 +2361,8 @@ mod tests {
 
     #[test]
     fn invalid_non_tuple_middle_recovers_as_shapeless() {
-        let middle = Type::ClassType(fake_class_type("builtins", "str"));
+        let env = TestTypeEnv::new();
+        let middle = Type::ClassType(fake_class_type(&env, "builtins", "str"));
         let shape = IntTuple::unpacked(vec![dim(1)], middle, vec![dim(2)]);
 
         assert_eq!(shape, IntTuple::shapeless());
@@ -2366,8 +2393,9 @@ mod tests {
 
     #[test]
     fn invalid_unbounded_tuple_middle_element_recovers_to_gradual() {
+        let env = TestTypeEnv::new();
         let middle = Type::Tuple(Tuple::Unbounded(Box::new(Type::ClassType(
-            fake_class_type("builtins", "str"),
+            fake_class_type(&env, "builtins", "str"),
         ))));
         let shape = IntTuple::unpacked(vec![dim(1)], middle, vec![dim(2)]);
 
@@ -2408,9 +2436,10 @@ mod tests {
 
     #[test]
     fn valid_unbounded_middle_elements_are_canonicalized() {
+        let env = TestTypeEnv::new();
         let quantified = Type::Quantified(Box::new(fake_tparam("N", QuantifiedKind::IntVar)));
         let type_var = Type::TypeVar(fake_type_var("N", QuantifiedKind::IntVar));
-        let int_type = Type::ClassType(fake_class_type("builtins", "int"));
+        let int_type = Type::ClassType(fake_class_type(&env, "builtins", "int"));
         for (elt, expected) in [
             (literal(5), size(5)),
             (Type::Any(AnyStyle::Explicit), gradual_size()),
@@ -2540,10 +2569,11 @@ mod tests {
 
     #[test]
     fn invalid_unbounded_carriers_fail() {
+        let env = TestTypeEnv::new();
         // Canonicalizing to shapeless would hide the invalid element, so an
         // unbounded carrier is only a carrier when its element is a dimension.
         let direct = Type::Tuple(Tuple::Unbounded(Box::new(Type::ClassType(
-            fake_class_type("builtins", "str"),
+            fake_class_type(&env, "builtins", "str"),
         ))));
         assert_eq!(tuple_carrier_to_shape(&direct), None);
 
@@ -2565,12 +2595,13 @@ mod tests {
 
     #[test]
     fn unbounded_carriers_canonicalize_to_shapeless() {
+        let env = TestTypeEnv::new();
         // Unbounded carriers have no recoverable rank or per-dimension values,
         // whatever dimension their element is.
         let any_unbounded = Type::any_tuple();
         let internal_unbounded = Type::Tuple(Tuple::Unbounded(Box::new(size(5))));
         let int_unbounded = Type::Tuple(Tuple::Unbounded(Box::new(Type::ClassType(
-            fake_class_type("builtins", "int"),
+            fake_class_type(&env, "builtins", "int"),
         ))));
         let shapeless = IntTuple::shapeless();
         assert_eq!(
@@ -2586,6 +2617,7 @@ mod tests {
 
     #[test]
     fn unpacked_tuple_carrier_middle_is_validated_strictly() {
+        let env = TestTypeEnv::new();
         let valid = Type::Tuple(Tuple::unpacked(
             vec![literal(1)],
             Type::Tuple(Tuple::Concrete(vec![literal(3)])),
@@ -2599,7 +2631,7 @@ mod tests {
         let invalid = Type::Tuple(Tuple::unpacked(
             vec![literal(1)],
             Type::Tuple(Tuple::Concrete(vec![Type::ClassType(fake_class_type(
-                "builtins", "str",
+                &env, "builtins", "str",
             ))])),
             vec![literal(2)],
         ));
@@ -2654,6 +2686,7 @@ mod tests {
 
     #[test]
     fn unpacked_tuple_carrier_unbounded_middle_recovers_to_gradual() {
+        let env = TestTypeEnv::new();
         let carrier = Type::Tuple(Tuple::unpacked(
             vec![literal(1)],
             Type::Tuple(Tuple::Unbounded(Box::new(literal(5)))),
@@ -2670,7 +2703,7 @@ mod tests {
         );
 
         let invalid_prefix = Type::Tuple(Tuple::unpacked(
-            vec![Type::ClassType(fake_class_type("builtins", "str"))],
+            vec![Type::ClassType(fake_class_type(&env, "builtins", "str"))],
             Type::Tuple(Tuple::Unbounded(Box::new(literal(5)))),
             vec![literal(2)],
         ));

@@ -13,10 +13,12 @@ use std::hash::Hasher;
 
 use parse_display::Display;
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::qname::QName;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::display::Fmt;
 use pyrefly_util::visit::Visit;
 use pyrefly_util::visit::VisitMut;
@@ -28,6 +30,7 @@ use crate::dimension::gradual_size;
 use crate::env::TypeEnv;
 use crate::heap::TypeHeap;
 use crate::stdlib::Stdlib;
+use crate::type_ord::TypeOrd;
 use crate::type_var::PreInferenceVariance;
 use crate::type_var::Restriction;
 use crate::types::Type;
@@ -222,6 +225,9 @@ impl Ord for Quantified {
     }
 }
 
+/// A quantified's identity holds no class, so `TypeOrd` is `Ord`.
+impl TypeOrd for Quantified {}
+
 impl PartialOrd for Quantified {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -229,7 +235,7 @@ impl PartialOrd for Quantified {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum QuantifiedKind {
     TypeVar,
     IntVar,
@@ -276,12 +282,6 @@ pub trait TypeVarLike {
     fn default(&self) -> Option<&Type>;
     fn restriction(&self) -> &Restriction;
     fn variance(&self) -> PreInferenceVariance;
-}
-
-impl Display for Quantified {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
-    }
 }
 
 impl Quantified {
@@ -381,18 +381,18 @@ impl Quantified {
 
     /// Display this type parameter with its bounds/constraints and default,
     /// in the format used for type parameter lists (e.g. `T: int = str`).
-    pub fn display_with_bounds(&self) -> impl Display + '_ {
+    pub fn display_with_bounds<'a>(&'a self, env: &'a dyn TypeEnv) -> impl Display + 'a {
         Fmt(move |f| {
             write!(f, "{}", self.display_name_with_prefix())?;
             match self.restriction() {
-                Restriction::Bound(t) => write!(f, ": {}", t)?,
+                Restriction::Bound(t) => write!(f, ": {}", t.display_with(env))?,
                 Restriction::Constraints(ts) => {
                     write!(f, ": (")?;
                     for (i, t) in ts.iter().enumerate() {
                         if i > 0 {
                             write!(f, ", ")?;
                         }
-                        write!(f, "{}", t)?;
+                        write!(f, "{}", t.display_with(env))?;
                     }
                     write!(f, ")")?;
                 }
@@ -400,7 +400,7 @@ impl Quantified {
                 Restriction::Unrestricted => {}
             }
             if let Some(default) = self.default() {
-                write!(f, " = {}", default)?;
+                write!(f, " = {}", default.display_with(env))?;
             }
             Ok(())
         })

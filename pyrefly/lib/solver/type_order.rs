@@ -36,7 +36,6 @@ use crate::types::env::TypeEnv;
 use crate::types::quantified::Quantified;
 use crate::types::stdlib::Stdlib;
 use crate::types::type_var::Restriction;
-use crate::types::typed_dict::TypedDict;
 use crate::types::typed_dict::TypedDictField;
 use crate::types::types::Forall;
 use crate::types::types::Forallable;
@@ -89,6 +88,10 @@ impl<'solver, Ans: LookupAnswer> TypeOrder<'solver, Ans> {
         self.0.has_active_scc()
     }
 
+    pub fn scc_local_reads(self) -> u64 {
+        self.0.stack().scc_local_reads()
+    }
+
     pub fn stdlib(self) -> &'solver Stdlib {
         self.0.stdlib
     }
@@ -114,7 +117,7 @@ impl<'solver, Ans: LookupAnswer> TypeOrder<'solver, Ans> {
     }
 
     pub fn is_protocol(self, cls: &Class) -> bool {
-        cls.is_protocol()
+        cls.is_protocol(&self)
     }
 
     pub fn is_subclassable(self, cls: &Class) -> bool {
@@ -177,25 +180,37 @@ impl<'solver, Ans: LookupAnswer> TypeOrder<'solver, Ans> {
         self.0.promote_silently(cls)
     }
 
-    pub fn typed_dict_fields(self, typed_dict: &TypedDict) -> SmallMap<Name, TypedDictField> {
+    pub fn is_typed_dict_class(self, cls: &Class) -> bool {
+        self.0.is_typed_dict_class(cls)
+    }
+
+    pub fn typed_dict_fields(self, typed_dict: &ClassType) -> SmallMap<Name, TypedDictField> {
         self.0.typed_dict_fields(typed_dict)
     }
 
-    pub fn typed_dict_kw_param_info(self, typed_dict: &TypedDict) -> Vec<(Name, Type, Required)> {
+    pub fn typed_dict_field(self, typed_dict: &ClassType, name: &Name) -> Option<TypedDictField> {
+        self.0.typed_dict_field(typed_dict, name)
+    }
+
+    pub fn typed_dict_field_requiredness(self, typed_dict: &ClassType) -> SmallMap<Name, bool> {
+        self.0.typed_dict_field_requiredness(typed_dict)
+    }
+
+    pub fn typed_dict_kw_param_info(self, typed_dict: &ClassType) -> Vec<(Name, Type, Required)> {
         self.0.typed_dict_kw_param_info(typed_dict)
     }
 
-    pub fn typed_dict_extra_items(self, typed_dict: &TypedDict) -> ExtraItems {
+    pub fn typed_dict_extra_items(self, typed_dict: &ClassType) -> ExtraItems {
         self.0.typed_dict_extra_items(typed_dict)
     }
 
-    pub fn get_typed_dict_value_type(self, typed_dict: &TypedDict) -> Type {
+    pub fn get_typed_dict_value_type(self, typed_dict: &ClassType) -> Type {
         self.0.get_typed_dict_value_type(typed_dict)
     }
 
     pub fn get_typed_dict_value_type_as_builtins_dict(
         self,
-        typed_dict: &TypedDict,
+        typed_dict: &ClassType,
     ) -> Option<Type> {
         self.0
             .get_typed_dict_value_type_as_builtins_dict(typed_dict)

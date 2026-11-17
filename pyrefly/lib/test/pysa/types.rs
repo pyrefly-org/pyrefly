@@ -22,7 +22,6 @@ use pyrefly_types::type_var::FlagMember;
 use pyrefly_types::type_var::PreInferenceVariance;
 use pyrefly_types::type_var::Restriction;
 use pyrefly_types::typed_dict::AnonymousTypedDictInner;
-use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::typed_dict::TypedDictField;
 use pyrefly_types::types::Type;
 use ruff_python_ast::name::Name;
@@ -329,7 +328,8 @@ class MyTypedDict(TypedDict):
                         Default::default()
                     )),
                 ],
-                context.answers_context.answers.heap()
+                context.resolver.type_env(),
+                context.answers_context.answers.heap(),
             ),
             &context
         ),
@@ -363,7 +363,8 @@ class MyTypedDict(TypedDict):
                             context.answers_context.answers.heap().mk_none()
                         )),
                 ],
-                context.answers_context.answers.heap()
+                context.resolver.type_env(),
+                context.answers_context.answers.heap(),
             ),
             &context
         ),
@@ -392,7 +393,8 @@ class MyTypedDict(TypedDict):
                     Type::ClassType(context.answers_context.stdlib.float().clone()),
                     Type::ClassType(context.answers_context.stdlib.int().clone()),
                 ],
-                context.answers_context.answers.heap()
+                context.resolver.type_env(),
+                context.answers_context.answers.heap(),
             ),
             &context
         ),
@@ -531,6 +533,7 @@ class MyTypedDict(TypedDict):
             context.answers_context.stdlib.int().clone().to_type(),
             context.answers_context.stdlib.str().clone().to_type(),
         ],
+        context.resolver.type_env(),
         context.answers_context.answers.heap(),
     ))
     .expect("int and str form a valid Flag domain");
@@ -647,7 +650,8 @@ class MyTypedDict(TypedDict):
                         Default::default()
                     )),
                 ],
-                context.answers_context.answers.heap()
+                context.resolver.type_env(),
+                context.answers_context.answers.heap(),
             ))),
             &context
         ),
@@ -722,7 +726,8 @@ class MyTypedDict(TypedDict):
                             )),
                     ),
                 ],
-                context.answers_context.answers.heap()
+                context.resolver.type_env(),
+                context.answers_context.answers.heap(),
             ),
             &context,
         ),
@@ -739,7 +744,7 @@ class MyTypedDict(TypedDict):
                 .answers_context
                 .answers
                 .heap()
-                .mk_typed_dict(TypedDict::new(
+                .mk_class_type(ClassType::new(
                     get_class("test", "MyTypedDict", &context),
                     Default::default()
                 )),
@@ -758,7 +763,7 @@ class MyTypedDict(TypedDict):
                 .answers_context
                 .answers
                 .heap()
-                .mk_typed_dict(TypedDict::Anonymous(Box::new(AnonymousTypedDictInner {
+                .mk_anonymous_typed_dict(AnonymousTypedDictInner {
                     fields: vec![(
                         Name::new_static("x"),
                         TypedDictField {
@@ -771,7 +776,7 @@ class MyTypedDict(TypedDict):
                             read_only_reason: None,
                         },
                     )],
-                }))),
+                }),
             &context,
         ),
     );
