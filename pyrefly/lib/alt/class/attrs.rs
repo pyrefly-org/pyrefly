@@ -45,6 +45,7 @@ use crate::types::callable::Param;
 use crate::types::class::Class;
 use crate::types::class::ClassType;
 use crate::types::function::FunctionKind;
+use crate::types::keywords::DataclassFieldDefault;
 use crate::types::keywords::DataclassFieldKeywords;
 use crate::types::keywords::DataclassKeywords;
 use crate::types::keywords::TypeMap;
@@ -344,7 +345,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 self.as_param(
                     &field,
                     &name,
-                    true,
+                    Some(DataclassFieldDefault::Unknown),
                     true,
                     flags.strict.unwrap_or(strict_default),
                     flags.converter_param.clone(),

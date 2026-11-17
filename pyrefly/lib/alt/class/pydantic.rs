@@ -19,6 +19,7 @@ use pyrefly_types::callable::Required;
 use pyrefly_types::function::FuncMetadata;
 use pyrefly_types::function::Function;
 use pyrefly_types::function::FunctionKind;
+use pyrefly_types::keywords::DataclassFieldDefault;
 use pyrefly_types::keywords::DataclassFieldKeywords;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::lit_int::LitInt;
@@ -761,7 +762,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         range: TextRange,
         errors: &ErrorCollector,
     ) {
-        let Some(default_ty) = &keywords.default else {
+        let Some(default_ty) = keywords
+            .default
+            .as_ref()
+            .and_then(DataclassFieldDefault::as_type)
+        else {
             return;
         };
         let Some(value_lit) = int_literal_from_type(default_ty) else {
