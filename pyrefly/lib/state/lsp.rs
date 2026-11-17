@@ -5832,7 +5832,7 @@ fn compute_transitive_rdeps_for_definition_impl<T: RdepTransaction>(
     sys_info: SysInfo,
     definition: &TextRangeWithModule,
 ) -> Result<Vec<Handle>, Cancelled> {
-    let transitive_rdeps = match definition.module.path().details() {
+    let mut transitive_rdeps = match definition.module.path().details() {
         ModulePathDetails::Memory(path_buf) => {
             let handle_of_filesystem_counterpart = Handle::new(
                 definition.module.name(),
@@ -5861,7 +5861,20 @@ fn compute_transitive_rdeps_for_definition_impl<T: RdepTransaction>(
             rdeps
         }
     };
-    // Keep the definition's module identity for local reference lookup. Other
+    // Existing memory candidates take precedence, including the definition in an import cycle.
+    for filesystem_handle in transitive_rdeps
+        .iter()
+        .filter_map(|handle| match handle.path().details() {
+            ModulePathDetails::Memory(path) => {
+                Some(handle.for_module(handle.module(), ModulePath::filesystem((**path).clone())))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+    {
+        transitive_rdeps.remove(&filesystem_handle);
+    }
+    // Keep the remaining definition's module identity for local reference lookup. Other
     // candidates use editor contents even if an edit removed their last dependency.
     let candidate_handles: HashSet<Handle> = transitive_rdeps
         .into_iter()

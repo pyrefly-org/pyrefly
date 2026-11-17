@@ -87,6 +87,74 @@ fn references_ignore_removed_imports_in_unsaved_files() {
     }
 }
 
+/// Buffered definitions in import cycles must not restore references from their disk copies.
+#[test]
+fn references_ignore_deleted_calls_in_buffered_import_cycles() {
+    for options in [
+        ReferenceOptions::all(false),
+        ReferenceOptions::textual_only(true),
+    ] {
+        let root = TempDir::new().unwrap();
+        let definition_path = root.path().join("definitions.py");
+        let usage_path = root.path().join("usage.py");
+        let buffered_source = "from usage import marker\ndef target() -> None:\n    pass\n";
+        fs::write(&definition_path, format!("{buffered_source}target()\n")).unwrap();
+        fs::write(
+            &usage_path,
+            "from definitions import target\nmarker = 1\ntarget()\n",
+        )
+        .unwrap();
+        let mut env = TestEnv::new().with_default_require_level(Require::Everything);
+        env.add_real_path("definitions", definition_path.clone());
+        env.add_real_path("usage", usage_path);
+        let (state, handle) = env.to_state();
+        let usage_handle = handle("usage");
+        let memory_path = ModulePath::memory(definition_path.clone());
+        let memory_handle =
+            handle("definitions").for_module(handle("definitions").module(), memory_path.dupe());
+        let mut transaction = state.transaction();
+        transaction.set_memory(vec![(
+            definition_path.clone(),
+            Some(Arc::new(FileContents::from_source(
+                buffered_source.to_owned(),
+            ))),
+        )]);
+        transaction.run(&[memory_handle], Require::Everything, None);
+        let definition = transaction
+            .find_definition(&usage_handle, TextSize::new(24), FindPreference::default())
+            .unwrap()
+            .first()
+            .clone();
+        assert_eq!(
+            definition.module.path(),
+            &ModulePath::filesystem(definition_path.clone()),
+        );
+        let references = transaction
+            .find_global_references_from_definition(
+                *usage_handle.sys_info(),
+                definition.metadata,
+                TextRangeWithModule::new(definition.module, definition.definition_range),
+                options,
+            )
+            .unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|(_, ranges)| ranges.len())
+                .sum::<usize>(),
+            2,
+        );
+        assert!(references.iter().all(|(module, _)| {
+            module.path() != &ModulePath::filesystem(definition_path.clone())
+        }));
+        assert!(
+            references
+                .iter()
+                .any(|(module, _)| module.path() == usage_handle.path())
+        );
+    }
+}
+
 /// Applies the reference edits used by rename to a source file, its stub, and a consumer.
 ///
 /// The rename starts in `lib.py` unless `shadowing_source` is given. In that case, the rename
