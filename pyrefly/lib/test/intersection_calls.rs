@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use crate::test::util::TestEnv;
 use crate::testcase;
 
 testcase!(
@@ -631,6 +632,38 @@ def intrinsic_errors(a: A):
     if isinstance(a, B):
         a.method(lambda v: unknown)  # E: Could not find name `unknown`
         a.method(lambda v: (1).missing)  # E: Object of class `int` has no attribute `missing`
+"#,
+);
+
+testcase!(
+    test_intersection_call_contextual_diagnostics,
+    TestEnv::new()
+        .enable_deprecated_error()
+        .enable_incompatible_comparison_error(),
+    r#"
+from typing import Callable, cast
+from typing_extensions import deprecated
+
+class A:
+    def method(self, cb: Callable[[int], object]) -> object: ...
+class B:
+    def method(self, cb: Callable[[str], object]) -> object: ...
+
+@deprecated("old callback")
+def old(value: object) -> object: ...
+
+def f(a: A, fixed: str) -> None:
+    if isinstance(a, B):
+        a.method(lambda arg: arg == "a")
+        a.method(lambda arg: str(arg))
+        a.method(lambda arg: cast(int, arg))
+        a.method(lambda arg: str(fixed))  # E: Unnecessary `str()` call
+        a.method(lambda arg: old(arg))  # E: `old` is deprecated
+        a.method(lambda arg: arg.missing)  # E: has no attribute `missing`
+
+def reversed_order(b: B) -> None:
+    if isinstance(b, A):
+        b.method(lambda arg: arg.missing)  # E: has no attribute `missing`
 "#,
 );
 

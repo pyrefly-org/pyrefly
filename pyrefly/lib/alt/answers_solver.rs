@@ -1887,60 +1887,6 @@ struct LambdaBindingFrame {
     generation: u64,
 }
 
-#[derive(Clone, Copy)]
-struct ConstructorBudgetState {
-    scope: usize,
-    remaining: usize,
-    speculative: bool,
-}
-
-/// Shares speculative work within a constructor tree, not across independent binding solves.
-pub(crate) struct ConstructorBudget<'a> {
-    remaining: &'a Cell<Option<ConstructorBudgetState>>,
-    scope: usize,
-    previous: Option<ConstructorBudgetState>,
-    owner: bool,
-}
-
-impl ConstructorBudget<'_> {
-    pub(crate) fn spend(&self) {
-        if let Some(mut state) = self.remaining.get()
-            && state.scope == self.scope
-            && state.speculative
-        {
-            state.remaining = state.remaining.saturating_sub(1);
-            self.remaining.set(Some(state));
-        }
-    }
-
-    pub(crate) fn exhausted(&self) -> bool {
-        self.remaining
-            .get()
-            .is_some_and(|state| state.scope == self.scope && state.remaining == 0)
-    }
-
-    /// Failed probes keep their cost charged, but ordinary argument inference spends no fuel.
-    pub(crate) fn speculate<T>(&self, f: impl FnOnce() -> T) -> T {
-        let mut state = self.remaining.get().expect("Expansion owns a budget");
-        let previous = state.speculative;
-        state.speculative = true;
-        self.remaining.set(Some(state));
-        let result = f();
-        let mut state = self.remaining.get().expect("Expansion retains its budget");
-        state.speculative = previous;
-        self.remaining.set(Some(state));
-        result
-    }
-}
-
-impl Drop for ConstructorBudget<'_> {
-    fn drop(&mut self) {
-        if self.owner {
-            self.remaining.set(self.previous);
-        }
-    }
-}
-
 pub(crate) struct LambdaBindingContext<'a> {
     state: &'a ThreadState,
     depth: usize,
@@ -1973,8 +1919,6 @@ impl Drop for LambdaBindingContext<'_> {
 /// we always pass the current `ThreadState`.
 pub struct ThreadState {
     stack: CalcStack,
-    /// Nested constructors share this budget until the outer constructor returns.
-    constructor_budget: Cell<Option<ConstructorBudgetState>>,
     /// For debugging only: thread-global that allows us to control debug logging across components.
     debug: RefCell<bool>,
     /// Configuration for recursion depth limiting. None means disabled.
@@ -2022,7 +1966,6 @@ impl ThreadState {
     pub fn new(recursion_limit_config: Option<RecursionLimitConfig>) -> Self {
         Self {
             stack: CalcStack::new(),
-            constructor_budget: Cell::new(None),
             debug: RefCell::new(false),
             recursion_limit_config,
             partial_answers: RefCell::new(FxHashMap::default()),
@@ -2176,6 +2119,8 @@ pub struct AnswersSolver<'ctx, 'answer, Ans: LookupAnswer> {
     thread_state: &'answer ThreadState,
     answer_scope: &'answer AnswerScope,
     comprehension_frame: Option<(usize, Option<CalcId>)>,
+    /// Constructor probes do not recursively search nested union hints.
+    constructor_probe: bool,
     // The base solver is only used to reset the error collector at binding
     // boundaries. Answers code should generally use the error collector passed
     // along the call stack instead.
@@ -2309,6 +2254,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             thread_state,
             answer_scope,
             comprehension_frame: None,
+            constructor_probe: false,
             heap,
         }
     }
@@ -2339,6 +2285,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             thread_state: self.thread_state,
             answer_scope,
             comprehension_frame: self.comprehension_frame.clone(),
+            constructor_probe: self.constructor_probe,
             base_errors: self.base_errors,
             exports: self.exports,
             uniques: self.uniques,
@@ -2392,25 +2339,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.answers.get_class_fields(cls)
     }
 
-    /// Only expandable constructors own a budget. Independent bindings receive fresh fuel.
-    pub(crate) fn enter_constructor_budget(&self, expandable: bool) -> ConstructorBudget<'_> {
-        let remaining = &self.thread_state.constructor_budget;
-        let scope = self.stack().len();
-        let previous = remaining.get();
-        let owner = expandable && previous.is_none_or(|state| state.scope != scope);
-        if owner {
-            remaining.set(Some(ConstructorBudgetState {
-                scope,
-                remaining: 1000,
-                speculative: false,
-            }));
-        }
-        ConstructorBudget {
-            remaining,
-            scope,
-            previous,
-            owner,
-        }
+    pub(crate) fn in_constructor_probe(&self) -> bool {
+        self.constructor_probe
+    }
+
+    /// Keep nested union searches out of probes without affecting independent solves.
+    pub(crate) fn for_constructor_probe(&self) -> AnswersSolver<'ctx, '_, Ans> {
+        let mut solver = self.for_answer_scope(self.answer_scope);
+        solver.constructor_probe = true;
+        solver
+    }
+
+    /// A cached binding must not inherit an enclosing call's speculative precision limit.
+    fn for_binding(&self) -> AnswersSolver<'ctx, '_, Ans> {
+        let mut solver = self.for_answer_scope(self.answer_scope);
+        solver.constructor_probe = false;
+        solver
     }
 
     /// Start an independent lambda-hint or speculative-call inference attempt.
@@ -2530,13 +2474,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .cloned()
     }
 
-    /// Capture contextual lambda types owned by the current binding for a speculative call.
-    pub(crate) fn snapshot_lambda_param_types(&self) -> Vec<(LambdaParamId, Option<Type>)> {
-        let Some(CalcId(_, AnyIdx::Key(owner))) = self.stack().peek() else {
-            return Vec::new();
-        };
-        self.bindings()
-            .owned_lambda_params(owner)
+    /// Capture only the lambda parameters in the speculative call's argument subtree.
+    pub(crate) fn snapshot_lambda_param_types(
+        &self,
+        parameters: &[LambdaParamId],
+    ) -> Vec<(LambdaParamId, Option<Type>)> {
+        parameters
             .iter()
             .map(|id| (*id, self.get_lambda_param_type(*id)))
             .collect()
@@ -2907,7 +2850,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let range = K::range_with(idx, self.bindings());
 
         let local_errors = self.error_collector();
-        let solve_result = K::solve(self, binding, range, &local_errors);
+        let solve_result = K::solve(&self.for_binding(), binding, range, &local_errors);
 
         // Take accumulated traces.
         let trace_side_effects = if tracing_enabled {
@@ -3133,7 +3076,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // each result is independently deep-forced before convergence comparison.
         // Preserving sharing would require identifying the fully forced target
         // from the final generation and keeping that allocation alive.
-        let raw_answer = K::solve(self, binding, range, &local_errors)
+        let raw_answer = K::solve(&self.for_binding(), binding, range, &local_errors)
             .into_answer(|target| self.get_idx(target).clone());
 
         // Take accumulated traces. Discard during cold iteration (like errors).

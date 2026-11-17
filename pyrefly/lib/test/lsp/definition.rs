@@ -64,6 +64,25 @@ fn get_test_report(state: &State, handle: &Handle, position: TextSize) -> String
     }
 }
 
+#[test]
+fn goto_def_constructor_union_contexts() {
+    let code = r#"
+from typing import Callable
+class A[T]:
+    def __init__(self, cb: Callable[[T], object], value: T) -> None: ...
+class X:
+    def meth(self) -> int: ...
+class Y:
+    def meth(self) -> str: ...
+def f(value: X | Y) -> None:
+    result: A[X] | A[Y] = A(lambda arg: arg.meth(), value)
+#                                           ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(report.contains("def meth(self) -> int"), "{report}");
+    assert!(report.contains("def meth(self) -> str"), "{report}");
+}
+
 fn get_test_report_do_not_jump_through_renamed_import(
     state: &State,
     handle: &Handle,

@@ -667,6 +667,39 @@ fn overloads(c: &mut Criterion) {
 }
 
 fn nested_generic_constructor(c: &mut Criterion) {
+    for count in [3200, 6400] {
+        let calls = "A(lambda x: None), ".repeat(count);
+        measure(
+            c,
+            &format!("sibling_constructor_lambdas_{count}"),
+            format!(
+                r#"
+from typing import Callable
+class A[T]:
+    def __init__(self, cb: Callable[[T], None]) -> None: ...
+items: list[A[int]] = [{calls}]
+"#,
+            ),
+            0,
+        );
+    }
+    for count in [800, 1600] {
+        let calls = "A(lambda x: None, value), ".repeat(count);
+        measure(
+            c,
+            &format!("sibling_distributed_constructor_lambdas_{count}"),
+            format!(
+                r#"
+from typing import Callable
+class A[T]:
+    def __init__(self, cb: Callable[[T], None], value: T) -> None: ...
+def f(value: int | str) -> None:
+    items: list[A[int] | A[str]] = [{calls}]
+"#,
+            ),
+            0,
+        );
+    }
     measure(
         c,
         "nested_generic_constructor_soft_error_12",
@@ -686,16 +719,16 @@ fn nested_generic_constructor(c: &mut Criterion) {
             c,
             &format!("nested_init_only_constructor_union_distribution_{depth}"),
             nested_init_only_constructor_hints(depth, "int | str", false),
-            0,
+            depth,
         );
     }
-    // Deep contextual calls can exhaust the shared budget and retain fallback errors.
-    for (depth, errors) in [(3, 0), (4, 1), (6, 6), (8, 8)] {
+    // Nested union hints are disabled inside a constructor probe.
+    for depth in [3, 4, 6, 8] {
         measure(
             c,
             &format!("nested_contextual_constructor_union_{depth}"),
             nested_init_only_constructor_hints(depth, "int | str", true),
-            errors,
+            depth,
         );
     }
     for depth in [4, 6, 8] {

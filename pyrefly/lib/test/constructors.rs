@@ -262,8 +262,9 @@ def f(value: int | str, fixed: int) -> None:
 "#,
 );
 
+// Expansion probes retain ordinary contextual checks but do not distribute nested calls.
 testcase!(
-    test_constructor_union_distribution_contextual_nested,
+    test_constructor_union_distribution_contextual_nested_limit,
     TestEnv::new().enable_implicit_any_lambda_error(),
     r#"
 from typing import Callable
@@ -273,7 +274,7 @@ class Node[T]:
                  child: Node[int] | Node[str] | None = None) -> None: ...
 
 def f(value: int | str) -> None:
-    result: Node[int] | Node[str] = Node(lambda arg: None, value, Node(lambda arg: None, value, Node(lambda arg: None, value)))
+    result: Node[int] | Node[str] = Node(lambda arg: None, value, Node(lambda arg: None, value, Node(lambda arg: None, value)))  # E: is not assignable # E: is not assignable # E: is not assignable
 "#,
 );
 
@@ -368,6 +369,21 @@ def f(value: int | str, fixed: str) -> None:
 );
 
 testcase!(
+    test_constructor_union_distribution_contextual_comparison,
+    TestEnv::new().enable_incompatible_comparison_error(),
+    r#"
+from typing import Callable
+
+class A[T]:
+    def __init__(self, cb: Callable[[T], object], value: T) -> None: ...
+
+def f(value: int | str, fixed: int) -> None:
+    valid: A[int] | A[str] = A(lambda arg: arg == "a", value)
+    invalid: A[int] | A[str] = A(lambda arg: fixed == "a", value)  # E: Comparison `==` between incompatible types
+"#,
+);
+
+testcase!(
     test_constructor_union_distribution_binding_budget,
     TestEnv::new().with_thread_count(ThreadCount::Inline),
     r#"
@@ -422,10 +438,11 @@ class P: ...
 class Wrap:
     def __init__(self, value: object) -> None: ...
 class A[T]:
-    def __init__(self, value: T) -> None: ...
+    def __init__(self, value: T, *other: object) -> None: ...
 def need(value: A[int] | A[str]) -> int: ...
 def f(value: int | str) -> None:
     Wrap(({calls}need(A(value))))
+    expanded: A[int] | A[str] = A(value, ({calls}))
 "#
     );
     testcase_for_macro(
@@ -474,7 +491,31 @@ class Node[T]:
     def __init__(self, value: T, child: Node[int] | Node[str] | None = None) -> None: ...
 
 def f(value: int | str) -> None:
-    root: Node[int] | Node[str] = Node(value, Node(value, Node(value, Node(value, Node(value, Node(value, Node(value, Node(value))))))))
+    child: Node[int] | Node[str] = Node(value)
+    separate: Node[int] | Node[str] = Node(value, child)
+    # Nested constructors retain ordinary inference inside a distribution probe.
+    root: Node[int] | Node[str] = Node(  # E: is not assignable
+        value,
+        Node(  # E: is not assignable
+            value,
+            Node(  # E: is not assignable
+                value,
+                Node(  # E: is not assignable
+                    value,
+                    Node(  # E: is not assignable
+                        value,
+                        Node(  # E: is not assignable
+                            value,
+                            Node(  # E: is not assignable
+                                value,
+                                Node(value),  # E: is not assignable
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
 "#,
 );
 

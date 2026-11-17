@@ -41,6 +41,7 @@ use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use starlark_map::Hashed;
 use starlark_map::small_map::SmallMap;
+use vec1::Vec1;
 
 use crate::alt::answers_solver::AnswerScope;
 use crate::alt::answers_solver::AnswersSolver;
@@ -166,31 +167,12 @@ impl VisitMut<Type> for Traces {
             }
         }
         for callee in self.overloaded_callees.values_mut() {
-            // Note: `tparams` does not need to be visited, as this comes from an answer
-            // which is already visited. `TArgs` skips tparams for the same reason.
-            match callee {
-                OverloadedCallee::Resolved { callable: trace } => {
-                    let OverloadTrace {
-                        callable,
-                        tparams: _,
-                    } = trace;
-                    callable.visit_mut(f);
-                }
-                OverloadedCallee::Candidates { all, closest, .. } => {
-                    for OverloadTrace {
-                        callable,
-                        tparams: _,
-                    } in all.iter_mut().chain(std::iter::once(closest))
-                    {
-                        callable.visit_mut(f);
-                    }
-                }
-            }
+            callee.recurse_mut(f);
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverloadTrace {
     callable: Callable,
     tparams: Option<Arc<TParams>>,
@@ -212,7 +194,7 @@ impl OverloadTrace {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverloadedCallee {
     Resolved {
         callable: OverloadTrace,
@@ -222,6 +204,87 @@ pub enum OverloadedCallee {
         closest: OverloadTrace,
         is_closest_chosen: bool,
     },
+    /// Chosen callees from mutually exclusive, accepted contextual checks.
+    Alternatives(Vec1<OverloadedCallee>),
+}
+
+impl OverloadedCallee {
+    fn chosen_type(&self) -> Option<Type> {
+        match self {
+            Self::Resolved { callable } => Some(callable.as_type()),
+            Self::Candidates {
+                closest,
+                is_closest_chosen: true,
+                ..
+            } => Some(closest.as_type()),
+            Self::Candidates { .. } => None,
+            Self::Alternatives(alternatives) => alternatives
+                .iter()
+                .map(Self::chosen_type)
+                .collect::<Option<Vec<_>>>()
+                .map(Type::union),
+        }
+    }
+
+    fn signatures(&self) -> (Vec<Callable>, Option<usize>) {
+        match self {
+            Self::Resolved { callable } => (vec![callable.callable.clone()], Some(0)),
+            Self::Candidates { all, closest, .. } => (
+                all.iter().map(|trace| trace.callable.clone()).collect(),
+                all.iter()
+                    .position(|trace| trace.callable == closest.callable),
+            ),
+            Self::Alternatives(alternatives) => (
+                alternatives
+                    .iter()
+                    .flat_map(|callee| callee.signatures().0)
+                    .collect(),
+                None,
+            ),
+        }
+    }
+
+    fn merge_alternative(&mut self, other: Self) {
+        if *self == other {
+            return;
+        }
+        match self {
+            Self::Alternatives(alternatives) => match other {
+                Self::Alternatives(others) => {
+                    for other in others {
+                        if !alternatives.contains(&other) {
+                            alternatives.push(other);
+                        }
+                    }
+                }
+                other if !alternatives.contains(&other) => alternatives.push(other),
+                _ => {}
+            },
+            _ => {
+                let mut alternatives = Vec1::new(self.clone());
+                alternatives.push(other);
+                *self = Self::Alternatives(alternatives);
+            }
+        }
+    }
+}
+
+impl VisitMut<Type> for OverloadedCallee {
+    fn recurse_mut(&mut self, f: &mut dyn FnMut(&mut Type)) {
+        match self {
+            Self::Resolved { callable } => callable.callable.visit_mut(f),
+            Self::Candidates { all, closest, .. } => {
+                for trace in all.iter_mut().chain(std::iter::once(closest)) {
+                    trace.callable.visit_mut(f);
+                }
+            }
+            Self::Alternatives(alternatives) => {
+                for alternative in alternatives {
+                    alternative.recurse_mut(f);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -261,6 +324,53 @@ pub struct TraceSideEffects {
     pub overloaded_callees: SmallMap<TextRange, OverloadedCallee>,
     pub invoked_properties: SmallMap<TextRange, Arc<Type>>,
     pub expected_types: SmallMap<TextRange, Arc<Type>>,
+}
+
+impl VisitMut<Type> for TraceSideEffects {
+    fn recurse_mut(&mut self, f: &mut dyn FnMut(&mut Type)) {
+        for map in [
+            &mut self.types,
+            &mut self.invoked_properties,
+            &mut self.expected_types,
+        ] {
+            for ty in map.values_mut() {
+                f(Arc::make_mut(ty));
+            }
+        }
+        for callee in self.overloaded_callees.values_mut() {
+            callee.recurse_mut(f);
+        }
+    }
+}
+
+impl TraceSideEffects {
+    /// Preserve every accepted context at each source range, rather than the last writer.
+    pub(crate) fn merge_alternatives(&mut self, other: Self, union: impl Fn(Vec<Type>) -> Type) {
+        for (destination, source) in [
+            (&mut self.types, other.types),
+            (&mut self.invoked_properties, other.invoked_properties),
+            (&mut self.expected_types, other.expected_types),
+        ] {
+            for (range, ty) in source {
+                destination
+                    .entry(range)
+                    .and_modify(|current| {
+                        if current != &ty {
+                            *current = Arc::new(union(vec![(**current).clone(), (*ty).clone()]));
+                        }
+                    })
+                    .or_insert(ty);
+            }
+        }
+        for (range, callee) in other.overloaded_callees {
+            match self.overloaded_callees.get_mut(&range) {
+                Some(current) => current.merge_alternative(callee),
+                None => {
+                    self.overloaded_callees.insert(range, callee);
+                }
+            }
+        }
+    }
 }
 
 /// Invariants:
@@ -1877,15 +1987,7 @@ impl Answers {
 
     pub fn get_chosen_overload_trace(&self, range: TextRange) -> Option<Type> {
         let lock = self.trace.as_ref()?.lock();
-        match lock.overloaded_callees.get(&range)? {
-            OverloadedCallee::Resolved { callable } => Some(callable.as_type()),
-            OverloadedCallee::Candidates {
-                closest,
-                is_closest_chosen,
-                ..
-            } if *is_closest_chosen => Some(closest.as_type()),
-            _ => None,
-        }
+        lock.overloaded_callees.get(&range)?.chosen_type()
     }
 
     /// Returns all the overload, and the index of a chosen one
@@ -1894,18 +1996,7 @@ impl Answers {
         range: TextRange,
     ) -> Option<(Vec<Callable>, Option<usize>)> {
         let lock = self.trace.as_ref()?.lock();
-        match lock.overloaded_callees.get(&range)? {
-            OverloadedCallee::Resolved { callable } => {
-                Some((vec![callable.callable.clone()], Some(0)))
-            }
-            OverloadedCallee::Candidates { all, closest, .. } => {
-                let chosen_index = all
-                    .iter()
-                    .position(|signature| signature.callable == closest.callable);
-                let signatures = all.iter().map(|trace| trace.callable.clone()).collect();
-                Some((signatures, chosen_index))
-            }
-        }
+        Some(lock.overloaded_callees.get(&range)?.signatures())
     }
 
     pub fn add_parent_method_mapping(

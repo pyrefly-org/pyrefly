@@ -73,34 +73,30 @@ impl ModuleDiagnostics {
         }
     }
 
-    /// Merge mutually exclusive contexts while preserving each collector's diagnostic role.
-    pub(crate) fn replay_alternatives<const N: usize>(
-        alternatives: &[[Self; N]],
-        destinations: [&ErrorCollector; N],
+    /// Contextual diagnostics must agree in range, kind, and message across accepted checks.
+    /// Deprecation and directives remain visible even when only one context emits them.
+    pub(crate) fn replay_contexts(
+        alternatives: &[Self],
+        destination: &ErrorCollector,
+        contextual_ranges: &[TextRange],
     ) {
-        let required = |diagnostics: &[Self; N]| {
-            diagnostics
-                .iter()
-                .flat_map(Self::iter)
-                .filter(|error| error.error_kind().requires_all_contexts())
-                .map(|error| (error.range(), error.error_kind()))
-                .collect::<SmallSet<_>>()
-        };
         let Some((first, rest)) = alternatives.split_first() else {
             return;
         };
-        let mut common = required(first);
+        let mut common = first.iter().collect::<SmallSet<_>>();
         for alternative in rest {
-            let current = required(alternative);
-            common.retain(|key| current.contains(key));
+            let current = alternative.iter().collect::<SmallSet<_>>();
+            common.retain(|error| current.contains(error));
         }
         for alternative in alternatives {
-            for (diagnostics, destination) in alternative.iter().zip(destinations) {
-                diagnostics.replay_filtered(destination, |error| {
-                    !error.error_kind().requires_all_contexts()
-                        || common.contains(&(error.range(), error.error_kind()))
-                });
-            }
+            alternative.replay_filtered(destination, |error| {
+                error.error_kind() == ErrorKind::Deprecated
+                    || error.error_kind().is_directive()
+                    || !contextual_ranges
+                        .iter()
+                        .any(|range| range.contains_range(error.range()))
+                    || common.contains(error)
+            });
         }
     }
 }
@@ -914,6 +910,67 @@ mod tests {
 
     fn add(errors: &ErrorCollector, range: TextRange, kind: ErrorKind, msg: String) {
         errors.error_builder(range, kind, msg).emit();
+    }
+
+    #[test]
+    fn test_contextual_diagnostic_agreement() {
+        let module = ModuleInfo::new(
+            ModuleName::from_str("main"),
+            ModulePath::filesystem(PathBuf::from("main.py")),
+            Arc::new("0123456789".to_owned()),
+        );
+        let range = TextRange::new(TextSize::new(1), TextSize::new(2));
+        let outside = TextRange::new(TextSize::new(8), TextSize::new(9));
+        let first = ErrorCollector::new(module.dupe(), ErrorStyle::Delayed);
+        let second = ErrorCollector::new(module.dupe(), ErrorStyle::Delayed);
+        for collector in [&first, &second] {
+            add(
+                collector,
+                range,
+                ErrorKind::RedundantCast,
+                "common".to_owned(),
+            );
+        }
+        add(
+            &first,
+            range,
+            ErrorKind::IncompatibleComparison,
+            "int comparison".to_owned(),
+        );
+        add(
+            &second,
+            range,
+            ErrorKind::IncompatibleComparison,
+            "str comparison".to_owned(),
+        );
+        add(
+            &first,
+            range,
+            ErrorKind::UnnecessaryTypeConversion,
+            "branch only".to_owned(),
+        );
+        add(
+            &first,
+            range,
+            ErrorKind::Deprecated,
+            "deprecated".to_owned(),
+        );
+        add(
+            &first,
+            outside,
+            ErrorKind::RedundantCast,
+            "outside".to_owned(),
+        );
+        let result = ErrorCollector::new(module, ErrorStyle::Delayed);
+        ModuleDiagnostics::replay_contexts(&[first.take(), second.take()], &result, &[range]);
+        assert_eq!(
+            result
+                .finish()
+                .iter()
+                .map(Error::msg_header)
+                .collect::<Vec<_>>(),
+            vec!["common", "deprecated", "outside"],
+        );
     }
 
     #[test]

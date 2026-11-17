@@ -44,6 +44,33 @@ fn get_test_report(state: &State, handle: &Handle, position: TextSize) -> String
 }
 
 #[test]
+fn hover_constructor_union_contexts() {
+    let code = r#"
+from typing import Callable
+class A[T]:
+    def __init__(self, cb: Callable[[T], object], value: T) -> None: ...
+class X:
+    def meth(self) -> int: ...
+class Y:
+    def meth(self) -> str: ...
+def f(value: X | Y) -> None:
+    result: A[X] | A[Y] = A(lambda arg: arg.meth(), value)
+#                                           ^
+    result: A[X] | A[Y] = A(lambda arg: arg.meth(), value)
+#                           ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(
+        report.contains("((self: X) -> int) | ((self: Y) -> str)"),
+        "{report}"
+    );
+    assert!(
+        report.contains("((arg: X) -> int) | ((arg: Y) -> str)"),
+        "{report}"
+    );
+}
+
+#[test]
 fn hover_symbol_literals() {
     let code = r#"
 foo: int = 1
