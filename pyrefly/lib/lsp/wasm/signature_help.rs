@@ -62,8 +62,8 @@ pub(crate) struct CallInfo {
 pub(crate) fn is_constructor_call(callee_type: Type) -> bool {
     matches!(
         callee_type,
-        Type::ClassDef(_) | Type::SpecializedClassDef(_)
-    ) || matches!(callee_type, Type::Type(t) if matches!(*t, Type::ClassType(_)))
+        Type::ClassDef(_) | Type::SpecializedClassDef(_) | Type::Type(_)
+    )
 }
 
 // Normally the constructor for a class returns `None`, but for hover/signature we change it to show the class for clarity
@@ -443,28 +443,31 @@ impl Transaction<'_> {
         active_argument: &ActiveArgument,
         parameter_docs: Option<&HashMap<String, String>>,
         function_docstring: Option<&Docstring>,
-        is_constructor_call: bool,
+        consumes_receiver: bool,
     ) -> SignatureInformation {
-        let type_ = type_.deterministic_printing();
+        let mut display_type = type_.deterministic_printing();
 
-        // Display the return type as the class instance type instead of None
-        let display_type = if is_constructor_call {
-            override_constructor_return_type(type_.clone()).unwrap_or(type_)
-        } else {
-            type_
-        };
+        // Binding consumes the receiver regardless of its parameter name.
+        if consumes_receiver {
+            display_type.transform_toplevel_callable_signatures(|callable, _| {
+                if let Some(stripped) = callable.strip_first_param() {
+                    *callable = stripped;
+                }
+            });
+        }
 
         let label = display_type.as_lsp_string(env, LspDisplayMode::SignatureHelp);
-        let (parameters, active_parameter) = if let Some(params) =
-            Self::normalize_singleton_function_type_into_params(display_type)
+        let (parameters, active_parameter) = if let Some(Params::List(params)) =
+            display_type.to_callable().map(|callable| callable.params)
         {
+            let params = params.items();
             // Create a type display context for consistent parameter formatting
             let param_types: Vec<&Type> = params.iter().map(|p| p.as_type()).collect();
             let mut type_ctx = TypeDisplayContext::new(env, &param_types);
             type_ctx.set_lsp_display_mode(LspDisplayMode::SignatureHelp);
 
             let active_parameter =
-                Self::active_parameter_index(&params, active_argument).map(|idx| idx as u32);
+                Self::active_parameter_index(params, active_argument).map(|idx| idx as u32);
 
             let parameter_info: Vec<ParameterInformation> = params
                 .iter()
@@ -515,21 +518,31 @@ impl Transaction<'_> {
                 let function_docstring = self.function_docstring_for_callee(handle, callee_range);
                 let type_env = self.type_env(handle);
 
-                let is_constructor_call = self
+                // Overload traces omit binding information, so inspect the callee type.
+                let callee_type = self
                     .get_answers(handle)
-                    .and_then(|ans| ans.get_type_trace(callee_range))
-                    .is_some_and(is_constructor_call);
+                    .and_then(|ans| ans.get_type_trace(callee_range));
+                let is_constructor_call = callee_type.clone().is_some_and(is_constructor_call);
+                let consumes_receiver = is_constructor_call
+                    || callee_type
+                        .map(|ty| self.coerce_type_to_callable(handle, ty))
+                        .is_some_and(|ty| matches!(ty, Type::BoundMethod(_)));
 
                 let signatures = callables
                     .into_iter()
                     .map(|t| {
+                        let t = if is_constructor_call {
+                            override_constructor_return_type(t.clone()).unwrap_or(t)
+                        } else {
+                            t
+                        };
                         Self::create_signature_information(
                             &type_env,
                             t,
                             &active_argument,
                             parameter_docs.as_ref(),
                             function_docstring.as_ref(),
-                            is_constructor_call,
+                            consumes_receiver,
                         )
                     })
                     .collect_vec();
