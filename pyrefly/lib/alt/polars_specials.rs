@@ -1553,42 +1553,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             new_columns,
             row_index_name,
         } = common;
-        match schema {
-            CsvSchema::Given(mut columns) => {
-                if matches!(&overrides, CsvDtypeOverrides::Sequence(_))
-                    && !matches!(selection, CsvColumnSelection::All)
-                {
-                    return None;
-                }
-                if !Self::apply_polars_csv_sequence_overrides(&mut columns, overrides) {
-                    return None;
-                }
-                if !matches!(selection, CsvColumnSelection::All) {
-                    if let CsvColumnSelection::Names(names) = &selection
-                        && !names
-                            .iter()
-                            .all(|name| columns.iter().any(|(column, _)| column == name))
-                    {
-                        return None;
-                    }
-                    columns = columns
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(index, (name, _))| match &selection {
-                            CsvColumnSelection::All => true,
-                            CsvColumnSelection::Names(names) => names.contains(name),
-                            CsvColumnSelection::Indices(indices) => indices.contains(index),
-                        })
-                        .map(|(_, column)| column)
-                        .collect();
-                }
-                if !Self::apply_polars_csv_row_index(&mut columns, row_index_name)
-                    || !Self::apply_polars_csv_new_columns(&mut columns, new_columns)
-                {
-                    return None;
-                }
-                Some(columns)
-            }
+        let (mut columns, selection) = match schema {
+            CsvSchema::Given(columns) => (columns, selection),
             CsvSchema::Missing => {
                 let CsvColumnSelection::Names(names) = selection else {
                     return None;
@@ -1601,15 +1567,42 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     .map(|name| (name, PolarsDType::Unknown))
                     .collect();
                 Self::apply_polars_csv_mapping_overrides(&mut columns, &overrides);
-                if !Self::apply_polars_csv_sequence_overrides(&mut columns, overrides)
-                    || !Self::apply_polars_csv_row_index(&mut columns, row_index_name)
-                    || !Self::apply_polars_csv_new_columns(&mut columns, new_columns)
-                {
-                    return None;
-                }
-                Some(columns)
+                (columns, CsvColumnSelection::All)
             }
+        };
+        if matches!(&overrides, CsvDtypeOverrides::Sequence(_))
+            && !matches!(selection, CsvColumnSelection::All)
+        {
+            return None;
         }
+        if !Self::apply_polars_csv_sequence_overrides(&mut columns, overrides) {
+            return None;
+        }
+        if !matches!(selection, CsvColumnSelection::All) {
+            if let CsvColumnSelection::Names(names) = &selection
+                && !names
+                    .iter()
+                    .all(|name| columns.iter().any(|(column, _)| column == name))
+            {
+                return None;
+            }
+            columns = columns
+                .into_iter()
+                .enumerate()
+                .filter(|(index, (name, _))| match &selection {
+                    CsvColumnSelection::All => true,
+                    CsvColumnSelection::Names(names) => names.contains(name),
+                    CsvColumnSelection::Indices(indices) => indices.contains(index),
+                })
+                .map(|(_, column)| column)
+                .collect();
+        }
+        if !Self::apply_polars_csv_row_index(&mut columns, row_index_name)
+            || !Self::apply_polars_csv_new_columns(&mut columns, new_columns)
+        {
+            return None;
+        }
+        Some(columns)
     }
 
     /// Lazy CSV inference applies overrides before inserting the row index.
