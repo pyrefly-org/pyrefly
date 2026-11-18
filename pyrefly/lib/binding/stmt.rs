@@ -2472,7 +2472,7 @@ impl<'a> BindingsBuilder<'a> {
         range: TextRange,
         is_optional_import: bool,
     ) -> Option<ModuleDiagnostic> {
-        if is_directory_import(module_name) || self.scopes.is_unreachable_from_static_test() {
+        if is_directory_import(module_name) {
             None
         } else {
             Some(ModuleDiagnostic {
@@ -2490,7 +2490,6 @@ impl<'a> BindingsBuilder<'a> {
                 is_optional_import: self.scopes.has_try_fallback(bound_name),
                 is_in_type_checking_block: self.type_checking_depth > 0,
             },
-            is_unreachable: self.scopes.is_unreachable_from_static_test(),
         }
     }
 

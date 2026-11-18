@@ -438,6 +438,8 @@ pub struct Bindings {
     annotated_metadata_ranges: Vec<TextRange>,
     /// Ranges of the types that were read from docstrings, sorted and non-overlapping.
     docstring_type_ranges: Vec<TextRange>,
+    /// Ranges of inactive code, sorted and non-overlapping.
+    inactive_ranges: Vec<TextRange>,
     scope_trace: Option<ScopeTrace>,
     /// Names `del`eted at module scope; retained outside the LSP `scope_trace`.
     module_deletes: SmallSet<Name>,
@@ -536,6 +538,9 @@ pub struct BindingsBuilder<'a> {
     pub(crate) annotated_metadata_ranges: Vec<TextRange>,
     /// Ranges of the types that were read from docstrings.
     pub(crate) docstring_type_ranges: Vec<TextRange>,
+    /// Ranges of code that follows an exit taken only because of a test of the environment, e.g.
+    /// the code after `if sys.version_info < (3, 13): return`. See `Bindings::in_inactive_code`.
+    inactive_ranges: Vec<TextRange>,
     pub lookup: &'a dyn LookupExport,
     pub sys_info: SysInfo,
     pub metadata: BindingsMetadata,
@@ -703,6 +708,7 @@ impl Bindings {
             module_ranges: None,
             annotated_metadata_ranges: Vec::new(),
             docstring_type_ranges: Vec::new(),
+            inactive_ranges: Vec::new(),
             scope_trace: None,
             module_deletes: SmallSet::new(),
             unset_nodes: UnsetNodes::default(),
@@ -771,6 +777,14 @@ impl Bindings {
     /// annotation.
     pub fn in_annotated_metadata(&self, range: TextRange) -> bool {
         ranges_contain(&self.annotated_metadata_ranges, range)
+    }
+
+    /// Whether `range` lies inside code that the configuration rules out by a test of the
+    /// environment, but that is still bound because it follows the test rather than being nested
+    /// in it. Like the suites such a test rules out directly, which are not bound at all, the code
+    /// is live under another configuration, so it only reports name resolution errors.
+    pub fn in_inactive_code(&self, range: TextRange) -> bool {
+        ranges_contain(&self.inactive_ranges, range)
     }
 
     /// Whether `range` lies inside a type that was read from a docstring. Such a type is not part
@@ -1142,6 +1156,7 @@ impl Bindings {
             module_info: module_info.dupe(),
             annotated_metadata_ranges: Vec::new(),
             docstring_type_ranges: Vec::new(),
+            inactive_ranges: Vec::new(),
             lookup,
             sys_info,
             errors,
@@ -1320,6 +1335,7 @@ impl Bindings {
             module_ranges,
             annotated_metadata_ranges: merge_ranges(builder.annotated_metadata_ranges),
             docstring_type_ranges: merge_ranges(builder.docstring_type_ranges),
+            inactive_ranges: merge_ranges(builder.inactive_ranges),
             scope_trace: if enable_trace {
                 Some(scope_trace)
             } else {
@@ -1958,9 +1974,15 @@ impl<'a> BindingsBuilder<'a> {
         let mut gates: Vec<SuiteGate> = Vec::new();
         let mut gated_end = None;
         let mut certain_start = None;
+        let mut inactive_start = None;
         let mut prev_end = None;
         let mut iter = xs.into_iter().peekable();
         while let Some(x) = iter.next() {
+            // The flow stays terminated once a test of the environment ends it, so everything from
+            // here to the end of the suite is inactive.
+            if inactive_start.is_none() && self.scopes.is_unreachable_from_static_test() {
+                inactive_start = Some(x.range().start());
+            }
             // A leading `yield` is load-bearing and never blamed, so a region starts past it.
             // See `is_empty_generator_yield`.
             let is_yield = is_empty_generator_yield(&x);
@@ -2108,6 +2130,9 @@ impl<'a> BindingsBuilder<'a> {
         }
         if certain_start.is_some() {
             self.in_unreachable_suite = false;
+        }
+        if let (Some(start), Some(end)) = (inactive_start, suite_end) {
+            self.inactive_ranges.push(TextRange::new(start, end));
         }
     }
 

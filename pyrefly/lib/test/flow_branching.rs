@@ -105,6 +105,65 @@ def f():
 "#,
 );
 
+// https://github.com/facebook/pyrefly/issues/5593
+testcase!(
+    test_version_gated_return_skips_unreachable_module_attribute,
+    TestEnv::new_with_version(PythonVersion::new(3, 10, 0)),
+    r#"
+import copy
+import sys
+
+def via_attribute(x: object) -> object:
+    if sys.version_info < (3, 13):
+        return x
+    return copy.replace(x)
+
+def via_else(x: object) -> object:
+    if sys.version_info < (3, 13):
+        return x
+    else:
+        return copy.replace(x)
+
+def nested(x: object, flag: bool) -> object:
+    if flag:
+        if sys.version_info < (3, 13):
+            return x
+        return copy.replace(x)
+    return copy.replace(x)  # E: No attribute `replace` in module `copy`
+
+def name_errors_are_kept(x: object) -> object:
+    if sys.version_info < (3, 13):
+        return x
+    return undefined_name  # E: Could not find name `undefined_name`
+"#,
+);
+
+testcase!(
+    test_version_gated_assert_skips_unreachable_module_attribute,
+    TestEnv::new_with_version(PythonVersion::new(3, 10, 0)),
+    r#"
+import copy
+import sys
+
+assert sys.version_info >= (3, 13)
+copy.replace(object())
+"#,
+);
+
+testcase!(
+    test_version_gated_module_attribute_is_checked_on_newer_python,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+import copy
+import sys
+
+def f(x: object) -> object:
+    if sys.version_info < (3, 13):
+        return x
+    return copy.nonexistent(x)  # E: No attribute `nonexistent` in module `copy`
+"#,
+);
+
 testcase!(
     test_version_gated_import_is_checked_on_newer_python,
     TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),

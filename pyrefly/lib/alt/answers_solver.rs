@@ -2954,7 +2954,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     self.current().record(
                         idx,
                         AnswerBox::new(raw_answer),
-                        self.retain_annotated_metadata_errors(range, local_errors),
+                        self.retain_unchecked_errors(range, local_errors),
                         trace_side_effects,
                     )
                 }
@@ -2963,7 +2963,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 SolveResult::Alias(target) => self.current().record_alias(
                     idx,
                     target,
-                    self.retain_annotated_metadata_errors(range, local_errors),
+                    self.retain_unchecked_errors(range, local_errors),
                     trace_side_effects,
                 ),
             }
@@ -3181,7 +3181,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let errors = if self.stack().is_cold_iteration() {
             None
         } else {
-            Some(self.retain_annotated_metadata_errors(range, local_errors))
+            Some(self.retain_unchecked_errors(range, local_errors))
         };
         let answer_erased = self.stack().set_iteration_node_done(
             self.answer_scope,
@@ -4192,14 +4192,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.heap.mk_any_error()
     }
 
-    /// Bindings inside `Annotated` metadata are not type-checked, but names in them must still
-    /// resolve, so only name resolution errors are kept for them.
-    fn retain_annotated_metadata_errors(
-        &self,
-        range: TextRange,
-        errors: ErrorCollector,
-    ) -> ErrorCollector {
-        if !self.bindings().in_annotated_metadata(range) {
+    /// Bindings inside `Annotated` metadata or inactive code are not type-checked, but names in
+    /// them must still resolve, so only name resolution errors are kept for them.
+    fn retain_unchecked_errors(&self, range: TextRange, errors: ErrorCollector) -> ErrorCollector {
+        let bindings = self.bindings();
+        if !bindings.in_annotated_metadata(range) && !bindings.in_inactive_code(range) {
             return errors;
         }
         let kept = self.error_collector();

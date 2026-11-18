@@ -6213,7 +6213,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // `__init__.py`-defined name and a submodule of the same name
         // exist, Python prefers the submodule).
         if !is_self_import && self.exports.export_exists(m, name) {
-            if self.exports.is_implicit_reexport(m, name) && !fallback.is_unreachable {
+            if self.exports.is_implicit_reexport(m, name) {
                 errors
                     .error_builder(
                         fallback.diagnostic.range,
@@ -6233,7 +6233,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             FindingOrError::Finding(_) => {
                 // The statement's `Binding::Module` reports any error for `m` itself, so the
                 // submodule's own error is reported only when `m` has none.
-                if !fallback.is_unreachable && self.exports.module_exists(m).error().is_none() {
+                if self.exports.module_exists(m).error().is_none() {
                     self.report_module_find_error(submodule_name, &fallback.diagnostic, errors);
                 }
                 return self.binding_to_type_module(
@@ -6278,15 +6278,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             FindingOrError::Finding(_) => {}
         }
         if matches!(submodule_error, FindError::MissingImport(..)) {
-            if !fallback.is_unreachable {
-                errors
-                    .error_builder(
-                        fallback.diagnostic.range,
-                        ErrorKind::MissingModuleAttribute,
-                        format!("Could not import `{name}` from `{m}`"),
-                    )
-                    .emit();
-            }
+            errors
+                .error_builder(
+                    fallback.diagnostic.range,
+                    ErrorKind::MissingModuleAttribute,
+                    format!("Could not import `{name}` from `{m}`"),
+                )
+                .emit();
             self.heap.mk_any(AnyStyle::MissingImport)
         } else {
             self.heap.mk_any_implicit()

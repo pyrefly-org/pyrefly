@@ -2622,10 +2622,6 @@ pub struct ImportFallback {
     /// The missing-module error for the module itself is handled by a separate
     /// per-statement `Binding::Module`.
     pub diagnostic: ModuleDiagnostic,
-    /// If true, the import site is dead code (statically unreachable).
-    /// Suppress the missing-attribute error in that case — the bind-time
-    /// logic did the same via `is_unreachable_from_static_test`.
-    pub is_unreachable: bool,
 }
 
 /// Data for a name in a class body that wasn't found in the static scope.
