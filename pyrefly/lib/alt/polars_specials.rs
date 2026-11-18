@@ -1351,7 +1351,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     };
                     overrides.insert(
                         self.polars_column_name(key)?,
-                        self.polars_dtype_from_expr(value)?,
+                        self.polars_dtype_from_expr(value)
+                            .unwrap_or(PolarsDType::Unknown),
                     );
                 }
                 CsvDtypeOverrides::Mapping(overrides)
@@ -1359,8 +1360,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Some(expr) => CsvDtypeOverrides::Sequence(
                 literal_sequence(expr)?
                     .iter()
-                    .map(|expr| self.polars_dtype_from_expr(expr))
-                    .collect::<Option<Vec<_>>>()?,
+                    .map(|expr| {
+                        self.polars_dtype_from_expr(expr)
+                            .unwrap_or(PolarsDType::Unknown)
+                    })
+                    .collect(),
             ),
             None => CsvDtypeOverrides::Unchanged,
         })
