@@ -565,7 +565,7 @@ See all subclasses and superclasses of a selected class.
 
 ## Planned features
 
-See [planned features and request your own](https://github.com/facebook/pyrefly/issues/2207) on GitHub.
+See [planned features and request your own](https://github.com/pyrefly-org/pyrefly/issues/2207) on GitHub.
 
 
 ---
@@ -1055,7 +1055,7 @@ current file. Clients should debounce: a single rebuild sends at least a
 
 ## Issues?
 
-If you experience issues with the Pyrefly extension, please create an [issue](https://github.com/facebook/pyrefly/issues) on github.
+If you experience issues with the Pyrefly extension, please create an [issue](https://github.com/pyrefly-org/pyrefly/issues) on github.
 
 ## Other Editors
 Support for other editors is community-driven. If you would like to set this up, please contribute.
@@ -1914,7 +1914,7 @@ the target's own sources (from `PyInfo`) with its dependencies available for
 import resolution. Implementation details, including target selection, check roots,
 search-path facts, path overlays for generated files, output groups, and the
 JSON contract, live in [`rules_pyrefly` docs/integration.md](https://github.com/facebook/rules_pyrefly/blob/main/docs/integration.md) and the
-Pyrefly-side parser in [`pyrefly/lib/commands/bazel_check.rs`](https://github.com/facebook/pyrefly/blob/main/pyrefly/lib/commands/bazel_check.rs).
+Pyrefly-side parser in [`pyrefly/lib/commands/bazel_check.rs`](https://github.com/pyrefly-org/pyrefly/blob/main/pyrefly/lib/commands/bazel_check.rs).
 
 For design tradeoffs and rationales, see
 [`rules_pyrefly` docs/design.md](https://github.com/facebook/rules_pyrefly/blob/main/docs/design.md) and
@@ -2045,7 +2045,7 @@ walkthrough.
 
 If a specific feature, diagnostic, plugin, or configuration option is what stops
 you from adopting Pyrefly, please
-[open an issue on GitHub](https://github.com/facebook/pyrefly/issues). Gaps that
+[open an issue on GitHub](https://github.com/pyrefly-org/pyrefly/issues). Gaps that
 block real migrations are the ones we prioritize.
 
 ## Next steps
@@ -3705,7 +3705,7 @@ not `foo`.
 :::warning
 This is a debugging option for investigating stack overflow issues. You should only use
 this if Pyrefly is crashing with a stack overflow. If you encounter such a crash, please
-[open an issue](https://github.com/facebook/pyrefly/issues).
+[open an issue](https://github.com/pyrefly-org/pyrefly/issues).
 :::
 
 Maximum recursion depth before triggering overflow protection. When set to a non-zero value,
@@ -3888,7 +3888,7 @@ settings in the top-level config, including its `errors`, still take precedence 
 Any configs that change the list of files we're type checking, Python environment, or where we look
 for imports cannot be included in SubConfigs. Some other configs we also do not include because
 we think they make it difficult to reason about your project type checks, but you can
-[open an issue](https://github.com/facebook/pyrefly/issues) or make a pull request if you disagree
+[open an issue](https://github.com/pyrefly-org/pyrefly/issues) or make a pull request if you disagree
 and would like to see the option supported.
 
 #### **SubConfig Table Structure**
@@ -3987,8 +3987,8 @@ replace-imports-with-any = ["pytest.*"]
 
 ### Conda and Venv Support
 
-We plan on adding extra automatic support for [Conda](https://github.com/facebook/pyrefly/issues/2)
-and [Venv](https://github.com/facebook/pyrefly/issues/1) at some point soon, but we haven't made
+We plan on adding extra automatic support for [Conda](https://github.com/pyrefly-org/pyrefly/issues/2)
+and [Venv](https://github.com/pyrefly-org/pyrefly/issues/1) at some point soon, but we haven't made
 it around to doing this yet. If you would like to import packages from these in the meantime,
 you can follow the following steps.
 
@@ -4834,7 +4834,7 @@ configuration.
 
 Pyrefly's DataFrame support continues to evolve. If you encounter a missing
 operation or an incorrect result, please
-[open a GitHub issue](https://github.com/facebook/pyrefly/issues) so we can
+[open a GitHub issue](https://github.com/pyrefly-org/pyrefly/issues) so we can
 prioritize it.
 
 
@@ -4860,7 +4860,7 @@ Pyrefly includes **built-in support** for [Django](https://www.djangoproject.com
 
 ### Feedback
 
-We welcome your feedback and suggestions. Please share your thoughts and ideas by opening an issue on [GitHub](https://github.com/facebook/pyrefly/issues).
+We welcome your feedback and suggestions. Please share your thoughts and ideas by opening an issue on [GitHub](https://github.com/pyrefly-org/pyrefly/issues).
 
 ---
 
@@ -6226,7 +6226,7 @@ assigned via the class.
 
 ## internal-error
 
-Ideally you'll never see this one. If you do, please consider [filing a bug](https://github.com/facebook/pyrefly/issues).
+Ideally you'll never see this one. If you do, please consider [filing a bug](https://github.com/pyrefly-org/pyrefly/issues).
 
 ## invalid-abstract-method
 
@@ -8698,7 +8698,7 @@ After your project passes type checks without errors, you can prevent new bugs f
 The simplest way to add Pyrefly to GitHub Actions is with the official composite action. It handles Python setup, installation, and running the type checker with inline PR annotations enabled by default.
 
 ```yaml
-- uses: facebook/pyrefly@main
+- uses: pyrefly-org/pyrefly@main
 ```
 
 Here is a complete workflow example:
@@ -8715,13 +8715,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: facebook/pyrefly@main
+      - uses: pyrefly-org/pyrefly@main
 ```
 
 You can pin a specific Pyrefly version, set the Python version, or pass extra arguments:
 
 ```yaml
-      - uses: facebook/pyrefly@main
+      - uses: pyrefly-org/pyrefly@main
         with:
           version: "0.60.0"
           python-version: "3.12"
@@ -8816,7 +8816,7 @@ The GitHub Action enables this by default. For manual setups, add the flag to yo
 
 Pyrefly provides a [pre-commit hook](https://pre-commit.com/) so you can automatically type check files before they are committed.
 
-We maintain a dedicated repository for this integration here: [facebook/pyrefly-pre-commit](https://github.com/facebook/pyrefly-pre-commit)
+We maintain a dedicated repository for this integration here: [pyrefly-org/pyrefly-pre-commit](https://github.com/pyrefly-org/pyrefly-pre-commit)
 
 That repository contains:
 
@@ -8824,7 +8824,7 @@ That repository contains:
 - Installation instructions
 - Example configuration snippets for your project and CI
 
-To get started, follow the setup steps in the repo’s [README](https://github.com/facebook/pyrefly-pre-commit#readme).
+To get started, follow the setup steps in the repo’s [README](https://github.com/pyrefly-org/pyrefly-pre-commit#readme).
 
 
 ---
@@ -8929,7 +8929,7 @@ If you use Pylint's typecheck messages, see
 kinds.
 
 If config migration goes wrong for your project, please
-[let us know](https://github.com/facebook/pyrefly/issues).
+[let us know](https://github.com/pyrefly-org/pyrefly/issues).
 
 
 ---
@@ -9651,7 +9651,7 @@ with `pyrefly suppress --remove-unused`.
 
 If a specific plugin, error code, or configuration option is what stops you from
 adopting Pyrefly, please
-[open an issue](https://github.com/facebook/pyrefly/issues).
+[open an issue](https://github.com/pyrefly-org/pyrefly/issues).
 
 
 ---
@@ -10623,7 +10623,7 @@ the baseline as you go with `pyrefly suppress --remove-unused`.
 
 If a specific diagnostic, execution-environment setup, or configuration option
 is what stops you from adopting Pyrefly, please
-[open an issue](https://github.com/facebook/pyrefly/issues).
+[open an issue](https://github.com/pyrefly-org/pyrefly/issues).
 
 
 ---
@@ -11335,7 +11335,7 @@ File Pants-integration issues — plugin behavior, goals, search paths, version
 pinning — in
 [tague/pants-pyrefly/issues](https://github.com/tague/pants-pyrefly/issues), and
 Pyrefly type-checking issues in
-[facebook/pyrefly/issues](https://github.com/facebook/pyrefly/issues).
+[pyrefly-org/pyrefly/issues](https://github.com/pyrefly-org/pyrefly/issues).
 
 
 ---
@@ -11429,7 +11429,7 @@ Pyrefly includes **built-in support** for [Pydantic](https://pydantic.dev/), a p
 
 ### Feedback
 
-We welcome your feedback and suggestions. Please share your thoughts and ideas [here](https://github.com/facebook/pyrefly/issues/1078).
+We welcome your feedback and suggestions. Please share your thoughts and ideas [here](https://github.com/pyrefly-org/pyrefly/issues/1078).
 
 ---
 
@@ -11705,11 +11705,11 @@ We would have preferred to write Pyrefly in Python, but we didn't think we could
 
 ## Where do I report bugs?
 
-Please open an [issue on our GitHub](https://github.com/facebook/pyrefly/issues) page. You can leave feature requests there as well :) Our current goal is to get through our first major milestone, and after that we can look at bugs and features beyond the current roadmap.
+Please open an [issue on our GitHub](https://github.com/pyrefly-org/pyrefly/issues) page. You can leave feature requests there as well :) Our current goal is to get through our first major milestone, and after that we can look at bugs and features beyond the current roadmap.
 
 ## Can I contribute to Pyrefly?
 
-Please see the: [contributing guidelines](https://github.com/facebook/pyrefly/blob/main/CONTRIBUTING.md).
+Please see the: [contributing guidelines](https://github.com/pyrefly-org/pyrefly/blob/main/CONTRIBUTING.md).
 
 ## How do I know this project won't go unmaintained after a year?
 
@@ -11717,7 +11717,7 @@ Great question. We have made a substantial investment in Pyrefly, use it interna
 
 ## This is cool, I want to learn more about the technical details.
 
-See our [README.md](https://github.com/facebook/pyrefly/blob/main/README.md) for the high level design. We plan to add more detailed documentation along with announcements on [https://engineering.fb.com](https://engineering.fb.com/)
+See our [README.md](https://github.com/pyrefly-org/pyrefly/blob/main/README.md) for the high level design. We plan to add more detailed documentation along with announcements on [https://engineering.fb.com](https://engineering.fb.com/)
 
 ## Can I run Pyrefly in the browser / WebAssembly?
 
@@ -11760,7 +11760,7 @@ workflows for navigating, annotating, and running tests.
 ### Feedback
 
 We welcome your feedback and suggestions. Please share your thoughts and ideas
-by opening an issue on [GitHub](https://github.com/facebook/pyrefly/issues).
+by opening an issue on [GitHub](https://github.com/pyrefly-org/pyrefly/issues).
 
 ---
 
@@ -12189,6 +12189,103 @@ Create a `pyrefly.toml` file to configure your project. Instructions [here](../c
 ---
 
 ---
+title: LSP Queries
+description: Query Python types, references, and calls from the command line.
+---
+
+{/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */}
+
+# LSP Queries
+
+:::warning Experimental
+
+The `query` command is experimental. Its arguments and JSON format can change.
+
+:::
+
+Use LSP queries to inspect Python code without an editor or an LSP client.
+Each successful command writes one JSON value to stdout. Logs and errors go to stderr.
+
+```shell
+pyrefly query hover src/payments/core.py 128 5
+pyrefly query find-references src/payments/core.py 128 5 --include-declaration
+pyrefly query call-hierarchy src/payments/core.py 128 5
+```
+
+`hover` returns LSP hover content, including a type or signature and available documentation.
+It returns `null` if the valid source position has no hover information.
+`find-references` returns an array of LSP locations, sorted by URI, line, and column.
+The `--include-declaration` flag adds the symbol's declaration.
+`call-hierarchy` returns an object with `item`, `incoming`, and `outgoing` fields.
+These fields contain LSP call hierarchy items and call edges in a deterministic order.
+
+## Source positions
+
+Input line and column numbers start at **1**. Columns count **UTF-16 code units**.
+For example, most characters occupy one column. A character such as `🐍` occupies two columns.
+Positions cannot point between the two UTF-16 code units of this character.
+
+JSON output follows LSP conventions. Output line and `character` numbers start at **0**.
+Range ends are exclusive. Locations use `file:` URIs, including percent encoding for characters such as spaces.
+
+To query an output location:
+
+1. Decode the file URI into a filesystem path with a URI library.
+2. Add 1 to `range.start.line`.
+3. Add 1 to `range.start.character`.
+
+For a call hierarchy item, use `selectionRange.start` instead of `range.start`.
+Incoming `fromRanges` belong to the caller's file. Outgoing `fromRanges` belong to the queried function's file.
+Bundled stub locations point to materialized `.pyi` files in Pyrefly's cache.
+
+## Project selection
+
+Pyrefly discovers configuration from the target file, independent of the current directory.
+References and call hierarchy queries index candidate files from that configuration's
+`project-includes` and `project-excludes`. Each candidate retains its own configuration.
+Hover loads the target and its imports without indexing the whole project.
+
+Use `--config` to select a configuration explicitly:
+
+```shell
+pyrefly query find-references src/payments/core.py 128 5 --config pyrefly.toml
+```
+
+An explicit configuration applies to all candidate files. Standard configuration overrides
+can appear before or after the query name, such as `pyrefly query hover ... --python-version 3.13`.
+Build-system configurations use their source database for import resolution.
+Configure project includes to cover potential callers. A source database alone does not enumerate all reverse dependencies.
+
+## Errors and coverage limits
+
+A missing or unreadable target, an invalid position, or an invalid configuration causes a nonzero exit status.
+The command writes an error to stderr and does not write a JSON result.
+An unresolved symbol causes a reference or call hierarchy query to fail.
+Ordinary type errors do not prevent useful LSP queries.
+
+Queries read files from disk. They do not include unsaved editor changes.
+Use Python source files or stub files as targets. Notebook cell positions are not supported.
+Results depend on configured imports, the Python environment, and the indexed candidate files.
+Files outside that candidate set can be absent from references and incoming calls.
+Dynamic calls that static analysis cannot resolve can also be absent.
+The command does not query an external reference provider.
+
+Call hierarchy uses the same resolution as the LSP. It can return multiple edges for repeated calls.
+For symbols with multiple possible definitions, the current adapter uses the first definition.
+A successful empty result does not prove that no caller exists outside the configured scope.
+
+Each invocation creates a new analysis state. Repeated invocations do not share a persistent index.
+References and call hierarchy index the selected project. Large projects can require substantial time and memory.
+
+
+---
+
+---
 title: Coverage
 
 description: Measure and enforce type coverage in your Python codebase with Pyrefly.
@@ -12301,7 +12398,7 @@ See `pyrefly coverage check --help` for all flags.
 
 To check coverage on every commit with [prek](https://prek.j178.dev/) or
 [pre-commit](https://pre-commit.com/), use the `pyrefly-coverage-check` hook from
-[meta/pyrefly-pre-commit](https://github.com/meta/pyrefly-pre-commit#enforcing-type-coverage).
+[pyrefly-org/pyrefly-pre-commit](https://github.com/pyrefly-org/pyrefly-pre-commit#enforcing-type-coverage).
 
 ## Generating a JSON report
 
@@ -12673,7 +12770,7 @@ three ways to contribute:
 
 For detailed instructions on writing stubs, DSL functions, and porting
 models, see the
-[Tensor Shapes Contributing Guide](https://github.com/facebook/pyrefly/blob/main/TENSOR_SHAPES_CONTRIBUTING.md)
+[Tensor Shapes Contributing Guide](https://github.com/pyrefly-org/pyrefly/blob/main/TENSOR_SHAPES_CONTRIBUTING.md)
 in the repository. The
 [stub library author reference](./tensor-shapes-library-authors.mdx) documents
 the annotation constructs and DSL used by shape-aware stubs.
@@ -13501,7 +13598,7 @@ The stub packages install `pyrefly-shape-extensions` and enable shape inference
 automatically.
 
 **Local stubs.** To use unreleased stubs, copy
-[`tensor-shapes/`](https://github.com/facebook/pyrefly/tree/main/tensor-shapes)
+[`tensor-shapes/`](https://github.com/pyrefly-org/pyrefly/tree/main/tensor-shapes)
 into your project, point `search-path` at the library and shape-extension
 packages, and exclude the source copy from checking. For PyTorch:
 
@@ -14549,7 +14646,7 @@ def expand_dims_shape(shape: IntTuple, axis: int) -> IntTuple:
     if axis < 0:
         norm_axis = axis + output_rank
     else:
-        norm_axis = axis + 0
+        norm_axis = axis
     return dsl.IntTuple(
         (
             1
@@ -14717,7 +14814,7 @@ See the [contributing guide](./tensor-shapes-contributing.mdx) to get started.
 Join the conversation:
 - [Pyrefly Discord](https://discord.gg/BVWQdkkEFJ)
 - [Python typing Discourse](https://discuss.python.org/c/typing/32)
-- [GitHub Issues](https://github.com/facebook/pyrefly/issues)
+- [GitHub Issues](https://github.com/pyrefly-org/pyrefly/issues)
 
 
 ---
@@ -15123,7 +15220,7 @@ source.
 ## Build from source
 
 The crate lives in
-[`pyrefly_wasm/`](https://github.com/facebook/pyrefly/tree/main/pyrefly_wasm).
+[`pyrefly_wasm/`](https://github.com/pyrefly-org/pyrefly/tree/main/pyrefly_wasm).
 The website wires it into the sandbox under `website/src/sandbox/`.
 
 ### Prerequisites
@@ -15157,7 +15254,7 @@ website README describes when you need a local rebuild.
 
 ### Test changes in the sandbox
 
-See [`website/README.md`](https://github.com/facebook/pyrefly/blob/main/website/README.md).
+See [`website/README.md`](https://github.com/pyrefly-org/pyrefly/blob/main/website/README.md).
 In short:
 
 ```bash
@@ -15176,7 +15273,7 @@ affected sandbox behavior after changing its implementation or API.
 class (`new State(version)`) wrapping the in-tree playground. `source` is a URL,
 a `Response`, the module bytes, or a compiled `WebAssembly.Module`; the default
 is `pyrefly_wasm_bg.wasm` next to `pyrefly_wasm.js`. The exports in
-[`pyrefly_wasm/lib.rs`](https://github.com/facebook/pyrefly/blob/main/pyrefly_wasm/lib.rs)
+[`pyrefly_wasm/lib.rs`](https://github.com/pyrefly-org/pyrefly/blob/main/pyrefly_wasm/lib.rs)
 are the authoritative API reference. The current JavaScript names are:
 
 | Method | Role |
@@ -15196,13 +15293,13 @@ are the authoritative API reference. The current JavaScript names are:
 Positions match the playground (`line` / `column` as `i32`). Each call passes a
 JSON request to the module and returns its JSON response; there is no
 TypeScript `.d.ts`. The sandbox keeps a local
-[`PyreflyState`](https://github.com/facebook/pyrefly/blob/main/website/src/sandbox/Sandbox.tsx)
+[`PyreflyState`](https://github.com/pyrefly-org/pyrefly/blob/main/website/src/sandbox/Sandbox.tsx)
 interface.
 
 Some native features are compiled out with
 `#[cfg(not(target_arch = "wasm32"))]`. If a WASM build fails with `could not
 find … in the crate root`, that crate is likely excluded from the WASM
-target. See [`pyrefly_wasm/README.md`](https://github.com/facebook/pyrefly/blob/main/pyrefly_wasm/README.md).
+target. See [`pyrefly_wasm/README.md`](https://github.com/pyrefly-org/pyrefly/blob/main/pyrefly_wasm/README.md).
 
 ## Configuration
 
@@ -15214,6 +15311,6 @@ when creating the instance (`version` is the Python version string passed to
 
 ## Related source
 
-- [`pyrefly_wasm/README.md`](https://github.com/facebook/pyrefly/blob/main/pyrefly_wasm/README.md) — crate build notes
-- [`website/README.md`](https://github.com/facebook/pyrefly/blob/main/website/README.md) — sandbox and docs site
+- [`pyrefly_wasm/README.md`](https://github.com/pyrefly-org/pyrefly/blob/main/pyrefly_wasm/README.md) — crate build notes
+- [`website/README.md`](https://github.com/pyrefly-org/pyrefly/blob/main/website/README.md) — sandbox and docs site
 - [Sandbox](/sandbox)

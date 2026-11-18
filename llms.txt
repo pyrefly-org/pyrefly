@@ -37,6 +37,7 @@
 - [Pytest Support](/en/docs/pytest/): Pyrefly support for pytest fixtures and test navigation.
 - [Typing Features and PEPS](/en/docs/python-features-and-peps/): Typing features and associated PEPs available in each Python version.
 - [Python Typing 101](/en/docs/python-typing-for-beginners/): A gentle, example‑driven introduction to static type hints in Python.
+- [LSP Queries](/en/docs/query/): Query Python types, references, and calls from the command line.
 - [Coverage](/en/docs/report/): Measure and enforce type coverage in your Python codebase with Pyrefly.
 - [SCIP Indexing](/en/docs/scip/): Generate a SCIP code-navigation index with Pyrefly.
 - [Shell completion](/en/docs/shell-completion/): How to enable shell completion for Pyrefly
