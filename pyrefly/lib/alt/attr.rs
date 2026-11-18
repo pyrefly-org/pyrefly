@@ -1217,7 +1217,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 Some((None, target_type))
             }
             AttrSetter::DescriptorSetter(setter, base) => {
-                let target_type = Some(self.get_descriptor_setter_value(&setter));
+                let target_type = Some(self.get_callable_positional_param(&setter, 2));
                 self.call_descriptor_setter(
                     setter,
                     base,
