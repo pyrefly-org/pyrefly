@@ -16,7 +16,7 @@ use pyrefly_types::callable::ParamList;
 use pyrefly_types::callable::Required;
 use pyrefly_types::class::Class;
 use pyrefly_types::class::ClassType;
-use pyrefly_types::class::DjangoClassMetadata;
+use pyrefly_types::class::DjangoSpecialization;
 use pyrefly_types::function::DescriptorSetterMetadata;
 use pyrefly_types::function::FuncMetadata;
 use pyrefly_types::function::Function;
@@ -208,7 +208,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if queryset.is(KnownClass::DjangoQuerySet) {
             queryset = base;
         } else {
-            queryset = queryset.with_django_metadata(DjangoClassMetadata::SpecializedBase { base });
+            queryset = queryset.with_django_base(base);
         }
         self.heap.mk_class_type(queryset)
     }
@@ -345,7 +345,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if let Type::ClassType(field) = member
                 && self.inherits_from_django_field(field.class_object())
             {
-                let Type::ClassType(field) = self.solver().force(member.clone()) else {
+                let Type::ClassType(field) = self.solver().force(member.clone(), self) else {
                     unreachable!("forcing a field instance preserves its class type")
                 };
                 let override_type = if !infer_arguments
@@ -364,11 +364,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     infer_arguments,
                 );
                 self.heap
-                    .mk_class_type(field.with_django_metadata(DjangoClassMetadata::Field {
-                        get_type,
-                        set_type,
-                        override_type,
-                    }))
+                    .mk_class_type(field.with_django_field(get_type, set_type, override_type))
             } else {
                 get_type
             }
@@ -379,8 +375,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// Resolve constructed fields to their instance read and assignment contracts.
     pub(crate) fn django_field_instance_types(&self, ty: &Type) -> Option<(Type, Type)> {
         match ty {
-            Type::ClassType(cls) => match cls.django_metadata()? {
-                DjangoClassMetadata::Field {
+            Type::ClassType(cls) => match cls.django_specialization()? {
+                DjangoSpecialization::Field {
                     get_type, set_type, ..
                 } => Some((get_type.clone(), set_type.clone())),
                 _ => None,
@@ -439,7 +435,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 )?;
                 // Explicit descriptor arguments take precedence over inferred defaults.
                 for (param, arg) in cls.targs().iter_paired() {
-                    let arg = self.solver().force(arg.clone());
+                    let arg = self.solver().force(arg.clone(), self);
                     if !matches!(arg, Type::Any(AnyStyle::Implicit)) {
                         match param.name().as_str() {
                             "_GT" => get_type = arg,
@@ -638,7 +634,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let queryset = if queryset.is(KnownClass::DjangoQuerySet) {
             base
         } else {
-            queryset.with_django_metadata(DjangoClassMetadata::SpecializedBase { base })
+            queryset.with_django_base(base)
         };
         let Type::ClassDef(manager) = self.try_get_from_export(
             ModuleName::from_str("django.db.models.manager"),
@@ -654,9 +650,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             &self.error_swallower(),
         );
         Some(
-            self.heap.mk_class_type(
-                manager.with_django_metadata(DjangoClassMetadata::Manager { queryset }),
-            ),
+            self.heap
+                .mk_class_type(manager.with_django_queryset(queryset)),
         )
     }
 
@@ -716,14 +711,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             manager
         } else {
             // Bare and concretely bound subclasses cannot express rebinding in their arguments.
-            manager.with_django_metadata(DjangoClassMetadata::SpecializedBase { base })
+            manager.with_django_base(base)
         };
         Some(self.heap.mk_class_type(manager))
     }
 
     /// Return the effective QuerySet base, including a construction-time specialization.
     fn django_queryset_base(&self, cls: &ClassType) -> Option<ClassType> {
-        if let Some(DjangoClassMetadata::SpecializedBase { base }) = cls.django_metadata() {
+        if let Some(DjangoSpecialization::EffectiveBase(base)) = cls.django_specialization() {
             Some(base.clone())
         } else if cls.is(KnownClass::DjangoQuerySet) {
             Some(cls.clone())
@@ -731,7 +726,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             self.get_mro_for_class(cls.class_object())
                 .ancestors(self.stdlib)
                 .find(|base| base.is(KnownClass::DjangoQuerySet))
-                .map(|base| base.substitute_with(&cls.substitution()))
+                .map(|base| base.substitute_with(&cls.substitution(), self))
         }
     }
 
@@ -760,8 +755,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         cls: &ClassType,
         name: &Name,
     ) -> Option<ClassAttribute> {
-        match cls.django_metadata()? {
-            DjangoClassMetadata::Field {
+        match cls.django_specialization()? {
+            DjangoSpecialization::Field {
                 get_type,
                 set_type,
                 override_type,
@@ -780,7 +775,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         }
                         return Some(attr);
                     }
-                    let metadata = FuncMetadata::method(cls.class_object(), dunder::GET);
+                    let metadata = FuncMetadata::method(self, cls.class_object(), dunder::GET);
                     let signatures = vec1![
                         (self.heap.mk_none(), self.heap.mk_class_type(cls.clone())),
                         (
@@ -817,7 +812,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if name != &dunder::SET {
                     return None;
                 }
-                let mut metadata = FuncMetadata::method(cls.class_object(), dunder::SET);
+                let mut metadata = FuncMetadata::method(self, cls.class_object(), dunder::SET);
                 metadata.flags.descriptor_setter = Some(Box::new(DescriptorSetterMetadata {
                     read_type: get_type.clone(),
                     override_type: override_type.clone(),
@@ -839,7 +834,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     &Instance::of_class(cls),
                 ))
             }
-            DjangoClassMetadata::Manager { queryset } => {
+            DjangoSpecialization::Queryset(queryset) => {
                 let manager_member =
                     self.get_class_member_with_defining_class(cls.class_object(), name);
                 if let Some(member) = &manager_member
@@ -883,7 +878,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 self.get_instance_attribute(queryset, name)
             }
-            DjangoClassMetadata::SpecializedBase { base } => {
+            DjangoSpecialization::EffectiveBase(base) => {
                 let member = self.get_class_member_with_defining_class(cls.class_object(), name)?;
                 if !self.has_superclass(base.class_object(), &member.defining_class) {
                     return None;
@@ -895,7 +890,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     &Instance::of_protocol(base, self.heap.mk_class_type(cls.clone())),
                 ))
             }
-            DjangoClassMetadata::ManyRelatedManager { pk_type } => {
+            DjangoSpecialization::TargetPkType(pk_type) => {
                 let [target, _] = cls.targs().as_slice() else {
                     return None;
                 };
@@ -948,9 +943,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             vec![target_model_type, model_instance_type],
         )?;
         match (manager, pk_type) {
-            (Type::ClassType(manager), Some(pk_type)) => Some(self.heap.mk_class_type(
-                manager.with_django_metadata(DjangoClassMetadata::ManyRelatedManager { pk_type }),
-            )),
+            (Type::ClassType(manager), Some(pk_type)) => Some(
+                self.heap
+                    .mk_class_type(manager.with_django_target_pk_type(pk_type)),
+            ),
             (manager, _) => Some(manager),
         }
     }
@@ -1118,7 +1114,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     fn property(&self, cls: &Class, name: Name, ty: Type) -> Type {
         let signature = Callable::list(ParamList::new(vec![self.class_self_param(cls, false)]), ty);
-        let mut metadata = FuncMetadata::method(cls, name);
+        let mut metadata = FuncMetadata::method(self, cls, name);
         metadata.flags.property_metadata = Some(PropertyMetadata {
             role: PropertyRole::Getter,
             getter: self.heap.mk_any_error(),
@@ -1224,7 +1220,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let ret = self.heap.mk_class_type(self.stdlib.str().clone());
         ClassSynthesizedField::new(self.heap.mk_function(Function {
             signature: Callable::list(ParamList::new(params), ret),
-            metadata: FuncMetadata::method(cls, method_name.clone()),
+            metadata: FuncMetadata::method(self, cls, method_name.clone()),
         }))
     }
 
@@ -1370,7 +1366,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 };
 
                 per_class
-                    .entry(target_class.clone())
+                    .entry(*target_class)
                     .or_insert_with(SmallMap::new)
                     .insert(related_name, ClassSynthesizedField::new(related_type));
             }
@@ -1438,7 +1434,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         source_class: &Class,
         relation_kind: DjangoRelationKind,
     ) -> Name {
-        let mut name = source_class.name().as_str().to_lowercase();
+        let mut name = source_class.name(self).as_str().to_lowercase();
         if matches!(
             relation_kind,
             DjangoRelationKind::ForeignKey | DjangoRelationKind::ManyToMany
@@ -1453,7 +1449,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return None;
         }
 
-        let class_name = source_class.name().as_str().to_lowercase();
+        let class_name = source_class.name(self).as_str().to_lowercase();
         let mut substituted = raw.replace("%(class)s", &class_name);
         if substituted.contains("%(app_label)s") {
             let module_name = source_class.module_name();

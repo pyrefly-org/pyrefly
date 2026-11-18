@@ -7,6 +7,8 @@
 
 use dupe::Dupe;
 use pyrefly_python::module_name::ModuleName;
+use ruff_python_ast::Expr;
+use ruff_python_ast::ExprAttribute;
 use ruff_python_ast::name::Name;
 
 /// These are names that are exported from the stdlib, but which take on
@@ -26,6 +28,8 @@ pub enum SpecialExport {
     ParamSpec,
     TypeVarTuple,
     Annotated,
+    /// `Doc` from annotated-doc, formerly PEP 727.
+    Doc,
     Literal,
     Enum,
     StrEnum,
@@ -117,6 +121,7 @@ impl SpecialExport {
             "ParamSpec" => Some(Self::ParamSpec),
             "TypeVarTuple" => Some(Self::TypeVarTuple),
             "Annotated" => Some(Self::Annotated),
+            "Doc" => Some(Self::Doc),
             "Shaped" => Some(Self::Shaped),
             "shape_vars" => Some(Self::ShapeVars),
             "Literal" => Some(Self::Literal),
@@ -197,6 +202,22 @@ impl SpecialExport {
         }
     }
 
+    /// The special export that `e` names without resolving imports: a bare name such as `Final`,
+    /// or an attribute of a module that defines it, such as `typing.Final`. For code that runs
+    /// before bindings exist, such as computing exports.
+    pub fn from_syntax(e: &Expr) -> Option<Self> {
+        match e {
+            Expr::Name(x) => Self::new(&x.id),
+            Expr::Attribute(ExprAttribute { value, attr, .. })
+                if let Expr::Name(base) = &**value =>
+            {
+                Self::new(&attr.id)
+                    .filter(|special| special.defined_in(ModuleName::from_name(&base.id)))
+            }
+            _ => None,
+        }
+    }
+
     pub fn defined_in(self, m: ModuleName) -> bool {
         match self {
             Self::IntVar | Self::Flag | Self::Index | Self::MapIntTuples | Self::NamedInts => {
@@ -237,6 +258,7 @@ impl SpecialExport {
             | Self::TypeForm => {
                 matches!(m.as_str(), "typing" | "typing_extensions")
             }
+            Self::Doc => matches!(m.as_str(), "typing_extensions" | "annotated_doc"),
             Self::CollectionsNamedTuple => matches!(m.as_str(), "collections"),
             Self::FunctoolsWraps | Self::FunctoolsUpdateWrapper => m == ModuleName::functools(),
             Self::Enum | Self::StrEnum | Self::IntEnum => matches!(m.as_str(), "enum"),

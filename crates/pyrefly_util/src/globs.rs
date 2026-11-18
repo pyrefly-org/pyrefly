@@ -1158,6 +1158,12 @@ impl FilteredGlobs {
         self.filter.excludes.append(excludes);
     }
 
+    /// Whether the excludes, hidden-directory filter, or ignore files of these globs exclude
+    /// `path`, whether or not the includes match it.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        self.filter.is_excluded(path)
+    }
+
     /// The files that these globs include, sorted. Unlike [`Includes::files_iter`], returns no
     /// files instead of an error when nothing matches.
     pub fn matched_files(&self) -> anyhow::Result<Vec<PathBuf>> {
@@ -1165,13 +1171,34 @@ impl FilteredGlobs {
         Ok(Globs::merged_files_iter(explicit_files, walked_files).collect())
     }
 
-    /// The files under `dirs` that these globs include, sorted. Only `dirs` are walked, so an
-    /// include outside of them is never walked. Returns no files when nothing matches.
-    pub fn matched_files_under(&self, dirs: &Globs) -> anyhow::Result<Vec<PathBuf>> {
-        let (explicit_files, walked_files) = dirs.matched_files(&self.filter, None)?;
+    /// The files under `dir` that these globs include, sorted. Only `dir` is walked, so an include
+    /// outside of it is never walked. Returns no files when nothing matches.
+    pub fn matched_files_under(&self, dir: &Glob) -> anyhow::Result<Vec<PathBuf>> {
+        let (explicit_files, walked_files) =
+            Globs(vec![dir.clone()]).matched_files(&self.filter, None)?;
         Ok(Globs::merged_files_iter(explicit_files, walked_files)
             .filter(|path| self.includes.covers(path))
             .collect())
+    }
+
+    /// These globs without the excludes that match `dir` or one of its parents. The other
+    /// excludes still apply to the files under `dir`.
+    pub fn without_excludes_of(&self, dir: &Path) -> Self {
+        let excludes = self
+            .filter
+            .excludes
+            .globs()
+            .iter()
+            .filter(|exclude| !exclude.matches(dir))
+            .cloned()
+            .collect();
+        Self {
+            includes: self.includes.clone(),
+            filter: GlobFilter {
+                excludes: Globs(excludes),
+                ..self.filter.for_walk()
+            },
+        }
     }
 }
 
@@ -1443,7 +1470,7 @@ mod tests {
     }
 
     // Pyright and gitignore treat a `**` that is not a whole path component as `*`.
-    // https://github.com/facebook/pyrefly/issues/1471
+    // https://github.com/pyrefly-org/pyrefly/issues/1471
     #[test]
     fn test_recursive_wildcard_within_component() {
         let normalized = |pattern: &str| Glob::new(pattern.to_owned()).unwrap().to_string();
@@ -2607,7 +2634,7 @@ mod tests {
     /// A lone non-existent concrete path now reports a clear "does not exist"
     /// error instead of the generic "no files matched". A non-existent path
     /// alongside a real one is still silently skipped, so tools that pass a mix
-    /// of paths keep working. https://github.com/facebook/pyrefly/issues/3647
+    /// of paths keep working. https://github.com/pyrefly-org/pyrefly/issues/3647
     #[test]
     fn test_explicit_nonexistent_path() {
         let tempdir = tempfile::tempdir().unwrap();

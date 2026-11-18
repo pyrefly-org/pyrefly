@@ -27,6 +27,7 @@ use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::literal::LitStyle;
 use pyrefly_types::quantified::AnchorIndex;
 use pyrefly_types::quantified::Quantified;
+use pyrefly_types::quantified::QuantifiedAnchor;
 use pyrefly_types::quantified::QuantifiedIdentity;
 use pyrefly_types::quantified::QuantifiedOrigin;
 use pyrefly_types::type_level_dsl::ParsedTypeShapeDslFunction;
@@ -37,6 +38,7 @@ use pyrefly_types::types::BoundMethod;
 use pyrefly_types::types::BoundMethodType;
 use pyrefly_types::types::TParams;
 use pyrefly_types::types::TParamsSource;
+use pyrefly_types::types::UnpackKind;
 use pyrefly_util::display::pluralize;
 use pyrefly_util::owner::Owner;
 use pyrefly_util::prelude::SliceExt;
@@ -87,6 +89,7 @@ use crate::types::callable::PrefixParam;
 use crate::types::callable::Required;
 use crate::types::callable::params_are_gradual_variadic;
 use crate::types::class::ClassKind;
+use crate::types::env::TypeEnv;
 use crate::types::function::FuncDefIndex;
 use crate::types::function::FuncFlags;
 use crate::types::function::FuncMetadata;
@@ -113,17 +116,17 @@ fn default_display_for_expr(expr: &Expr, source: &str) -> Option<String> {
     matches!(inner_expr, Expr::NumberLiteral(_)).then(|| source.to_owned())
 }
 
-fn is_class_property_decorator_class_object(cls: &Class) -> bool {
-    let cls_name = cls.name();
+fn is_class_property_decorator_class_object<E: TypeEnv + ?Sized>(env: &E, cls: &Class) -> bool {
+    let cls_name = cls.name(env);
     // Obviously this is just a very naive heuristic. But it's not a crazy convention
     // either and we have important customers that badly wants support of class properties.
     cls_name == "classproperty" || cls_name == "lazy_classproperty"
 }
 
-fn is_class_property_decorator_type(ty: &Type) -> bool {
+fn is_class_property_decorator_type<E: TypeEnv + ?Sized>(env: &E, ty: &Type) -> bool {
     match ty {
-        Type::ClassDef(cls) => is_class_property_decorator_class_object(cls),
-        Type::ClassType(cls) => is_class_property_decorator_class_object(cls.class_object()),
+        Type::ClassDef(cls) => is_class_property_decorator_class_object(env, cls),
+        Type::ClassType(cls) => is_class_property_decorator_class_object(env, cls.class_object()),
         _ => false,
     }
 }
@@ -305,7 +308,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn decorator_param_hints(&self, decorators: &[(Type, usize)]) -> Option<DecoratorParamHints> {
         decorators.iter().rev().find_map(|(decorator_ty, _)| {
             decorator_ty
-                .callable_first_param(self.heap)
+                .callable_first_param(self.heap, self)
                 .and_then(|param_ty| {
                     param_ty
                         .toplevel_callable_signatures()
@@ -597,7 +600,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         !self.set_flag_from_special_decorator(&mut flags, &special_decorator)
                     }
                     None => {
-                        if is_class_property_decorator_type(&decorator.ty) {
+                        if is_class_property_decorator_type(self, &decorator.ty) {
                             found_class_property = true;
                         }
                         if matches!(
@@ -676,7 +679,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     Name::new_static("Receiver"),
                     QuantifiedIdentity::new(
                         self.module().name(),
-                        AnchorIndex::first(def.name.range),
+                        AnchorIndex::first(QuantifiedAnchor::Function(def_index)),
                         QuantifiedOrigin::MethodReceiver,
                     ),
                     None,
@@ -701,7 +704,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // staticmethod that still takes `cls`). Skip `@no_type_check` for ordinary
         // instance methods, properties/staticmethods other than `__new__`, and
         // unresolved custom decorators that may reshape the signature.
-        // See https://github.com/facebook/pyrefly/issues/5295 and #5294.
+        // See https://github.com/pyrefly-org/pyrefly/issues/5295 and #5294.
         let missing_receiver_param = defining_cls.is_some()
             && decorators.is_empty()
             && def.parameters.posonlyargs.is_empty()
@@ -741,7 +744,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // classmethods including `__init_subclass__`/`__class_getitem__`, properties, and
         // `__new__`); it is `None` for staticmethods and top-level functions. A variadic-only
         // receiver lands in `vararg`, so `.first()` here correctly yields `None`.
-        // See https://github.com/facebook/pyrefly/issues/3729.
+        // See https://github.com/pyrefly-org/pyrefly/issues/3729.
         if self_type.is_some()
             && let Some(first) = def
                 .parameters
@@ -765,7 +768,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // and the assigned value, so any further required parameter is unreachable at
         // runtime. The decorator path attaches property metadata without checking the
         // signature against `property.__init__`, so validate it here.
-        // See https://github.com/facebook/pyrefly/issues/4918.
+        // See https://github.com/pyrefly-org/pyrefly/issues/4918.
         // Skip when custom (non-special) decorators remain between `@property` and
         // the function, since they may reshape the signature before `@property`
         // sees it (e.g. homeassistant Spotify's `@ensure_item` turns
@@ -836,7 +839,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let tparams = Arc::new(tparams);
         let func_id = Arc::new(FuncDefId {
             qname: QName::new(def.name.clone(), parent.dupe(), self.module().dupe()),
-            cls: defining_cls.clone(),
+            cls: defining_cls,
             def_index,
         });
 
@@ -915,7 +918,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::AbstractMethodWithImplementation,
                 format!(
                     "`{}` is decorated with `@abstractmethod` but has an implementation",
-                    def.metadata.kind.format(self.module().name())
+                    def.metadata.kind.format(self, self.module().name())
                 ),
             );
         }
@@ -1095,7 +1098,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
         let mut metadata = def.metadata.clone();
         metadata.flags.unresolved_imports =
-            Some(callable.contains_unresolved_imports(Some(tparams.as_ref())));
+            Some(callable.classify_unresolved_imports(Some(tparams.as_ref())));
         self.record_shape_flag_constructor_sources(
             stmt,
             &def.params,
@@ -1280,7 +1283,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         {
             return Some(SpecialDecorator::PropertyDeleter(&decorator.ty));
         }
-        match decorator.ty.callee_kind() {
+        match decorator.ty.callee_kind(self) {
             Some(CalleeKind::Function(FunctionKind::Overload)) => Some(SpecialDecorator::Overload),
             Some(CalleeKind::Class(ClassKind::StaticMethod(name))) => {
                 Some(SpecialDecorator::StaticMethod(name))
@@ -1402,7 +1405,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
             SpecialDecorator::DataclassTransformCall(kws) => {
                 flags.dataclass_transform_metadata =
-                    Some(DataclassTransformMetadata::from_type_map(kws));
+                    Some(DataclassTransformMetadata::from_type_map(kws, self));
                 true
             }
             SpecialDecorator::AbstractMethod => {
@@ -1448,7 +1451,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             let owner = Owner::new();
                             let upper_mp = qs
                                 .iter()
-                                .map(|q| (*q, owner.push(q.upper_bound(self.stdlib, self.heap))))
+                                .map(|q| (*q, owner.push(q.upper_bound(self, self.heap))))
                                 .collect();
                             let upper_ty = expected_ty.clone().subst(&upper_mp);
                             // Check if the default is compatible with the parameter type.
@@ -1749,8 +1752,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 paramspec_kwargs = Some(q.clone());
             }
 
-            if let Type::Unpack(unpack) = &ty
-                && let Type::TypedDict(typed_dict) = &**unpack
+            if let Type::Unpack(unpack, UnpackKind::Kwargs) = &ty
+                && let Type::ClassType(typed_dict) = &**unpack
             {
                 for (name, _) in self.typed_dict_fields(typed_dict) {
                     if params.iter().any(|param| {
@@ -2361,8 +2364,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::BadFunctionDefinition,
                 format!(
                     "Return type `{}` must be assignable to the first argument type `{}`",
-                    self.for_display(ty_narrow.clone()),
-                    self.for_display(ty_arg.as_type().clone())
+                    self.display(ty_narrow.clone()),
+                    self.display(ty_arg.as_type().clone())
                 ),
             );
         }
@@ -2448,7 +2451,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     format!(
                         "`{}` has type `{}` after decorator application, which is not callable",
                         func,
-                        self.for_display(t)
+                        self.display(t)
                     ),
                 );
                         OverloadType::Function(Function {
@@ -2502,7 +2505,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn subst_function(&self, tparams: &TParams, func: Function) -> Function {
         let mp = tparams
             .as_vec()
-            .map(|p| (p, p.upper_bound(self.stdlib, self.heap)));
+            .map(|p| (p, p.upper_bound(self, self.heap)));
         match self
             .heap
             .mk_function(func)
@@ -2625,11 +2628,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::InconsistentOverload,
                     format!(
                         "Overload signature `{}` is not consistent with implementation signature `{}`",
-                        self.for_display(
+                        self.display(
                             self.heap
                                 .mk_callable_from(original_overload_func.signature.clone())
                         ),
-                        self.for_display(self.heap.mk_callable_from(impl_sig.clone())),
+                        self.display(self.heap.mk_callable_from(impl_sig.clone())),
                     ),
                 );
                 for e in specialization_errors {
@@ -2886,7 +2889,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // Turn a `__init__` that could not be bound into a constructor callable by setting its return
             // type, without stripping the `self` parameter.
             let ret_type = t
-                .callable_first_param(self.heap)
+                .callable_first_param(self.heap, self)
                 .unwrap_or_else(|| self.heap.mk_class_type(cls.clone()));
             t.transform_toplevel_callable_signatures(|c: &mut Callable, _| {
                 c.ret = ret_type.clone()
@@ -3053,6 +3056,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             callable,
             self.uniques,
             is_subset,
+            self,
         )
     }
 
@@ -3074,7 +3078,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             && let Some(Param::PosOnly(_, self_ty, _) | Param::Pos(_, self_ty, _)) =
                 param_list.items().first()
         {
-            let cls_name = cls.name();
+            let cls_name = cls.name(self);
             match self_ty {
                 Type::ClassType(cls_ty) => {
                     // The self type must be the defining class itself or a superclass of it.
@@ -3091,7 +3095,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::InvalidAnnotation,
                                 format!(
                                     "`{method_name}` method self type `{}` is not a superclass of class `{cls_name}`",
-                                    self.for_display(self_ty.clone()),
+                                    self.display(self_ty.clone()),
                                 ),
                             )
                             .emit();
@@ -3143,8 +3147,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::InvalidAnnotation,
                                 format!(
                                     "`{method_name}` method self type `{}` refers to class `{}`, which is not a superclass of class `{cls_name}`",
-                                    self.for_display(self_ty.clone()),
-                                    self.for_display((**inner).clone()),
+                                    self.display(self_ty.clone()),
+                                    self.display((**inner).clone()),
                                 ),
                             )
                             .emit();
@@ -3171,12 +3175,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             && let Some(Param::PosOnly(_, cls_ty, _) | Param::Pos(_, cls_ty, _)) =
                 param_list.items().first()
         {
-            let cls_name = cls.name();
+            let cls_name = cls.name(self);
             match cls_ty {
                 Type::Type(f) if let Type::ClassType(inner_cls) = &**f => {
                     // Skipping validation for protocols is on par with Pyright's behavior.
                     // TODO: we could consider checking structural subtyping here.
-                    if inner_cls.name() != cls_name
+                    if inner_cls.name(self) != cls_name
                         && !self
                             .type_order()
                             .has_superclass(cls, inner_cls.class_object())
@@ -3192,8 +3196,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::InvalidAnnotation,
                                 format!(
                                     "`{method_name}` method cls type `{}` refers to class `{}`, which is not a superclass of class `{cls_name}`",
-                                    self.for_display(cls_ty.clone()),
-                                    self.for_display((**f).clone()),
+                                    self.display(cls_ty.clone()),
+                                    self.display((**f).clone()),
                                 ),
                             )
                             .emit();
@@ -3212,7 +3216,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::InvalidAnnotation,
                             format!(
                                 "`{method_name}` method cls type `{}` is not a valid `type[...]` annotation",
-                                self.for_display(cls_ty.clone()),
+                                self.display(cls_ty.clone()),
                             ),
                         )
                         .emit();

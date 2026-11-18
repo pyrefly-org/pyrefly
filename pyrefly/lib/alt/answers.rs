@@ -28,6 +28,7 @@ use std::time::Instant;
 use dupe::Dupe;
 use dupe::OptionDupedExt;
 use pyrefly_graph::index::Idx;
+use pyrefly_python::module_key::ModuleKey;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_util::display::DisplayWith;
@@ -81,8 +82,10 @@ use crate::table_mut_for_each;
 use crate::table_try_for_each;
 use crate::types::callable::Callable;
 use crate::types::class::Class;
+use crate::types::class::ClassDef;
 use crate::types::class::ClassDefIndex;
 use crate::types::class::ClassFields;
+use crate::types::env::TypeEnv;
 use crate::types::equality::TypeEq;
 use crate::types::equality::TypeEqCtx;
 use crate::types::heap::TypeHeap;
@@ -729,12 +732,13 @@ table!(
     pub struct AnswerTable(pub AnswerEntry)
 );
 
-impl fmt::Display for Answers {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for Answers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         fn go<K: Keyed>(
             answers: &Answers,
             _entry: &AnswerEntry<K>,
             f: &mut fmt::Formatter<'_>,
+            env: &dyn TypeEnv,
         ) -> fmt::Result
         where
             AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
@@ -751,7 +755,7 @@ impl fmt::Display for Answers {
                     bindings.module().display(key),
                     value.display_with(bindings),
                     match answers.get_idx(idx) {
-                        Some(v) => v.to_string(),
+                        Some(v) => v.display_with(env).to_string(),
                         None => "(unsolved)".to_owned(),
                     },
                 )?;
@@ -759,7 +763,7 @@ impl fmt::Display for Answers {
             Ok(())
         }
 
-        table_try_for_each!(self.table, |x| go(self, x, f));
+        table_try_for_each!(self.table, |x| go(self, x, f, env));
         Ok(())
     }
 }
@@ -828,9 +832,14 @@ impl SolutionsData {
                 // structurally mutated after this loop, so each `SmallMap`
                 // position remains identical to its binding `Idx`.
                 for idx in keys {
-                    items
-                        .0
-                        .insert(bindings.idx_to_key(idx).clone(), AnswerSlot::default());
+                    let key = bindings.idx_to_key(idx);
+                    // `changed_exports` reports a change to an exported key as its
+                    // `AnyExportedKey`, so every exported key must have one.
+                    debug_assert!(
+                        key.try_to_anykey().is_some(),
+                        "exported key `{key:?}` has no `AnyExportedKey`"
+                    );
+                    items.0.insert(key.clone(), AnswerSlot::default());
                 }
                 assert_eq!(items.len(), len, "exported solution keys must be unique");
             }
@@ -860,13 +869,14 @@ pub struct Solutions {
     cinderx_solutions: Option<Arc<CinderxSolutions>>,
 }
 
-impl Display for Solutions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for Solutions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         fn go<K: Keyed>(
             _entry: &SolutionsEntry<K>,
             solutions: &Solutions,
             f: &mut fmt::Formatter<'_>,
             ctx: &ModuleInfo,
+            env: &dyn TypeEnv,
         ) -> fmt::Result
         where
             BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
@@ -874,20 +884,20 @@ impl Display for Solutions {
         {
             for (key, slot) in solutions.solution_slots::<K>() {
                 let answer = slot.get();
-                writeln!(f, "{} = {}", ctx.display(key), answer)?;
+                writeln!(f, "{} = {}", ctx.display(key), answer.display_with(env))?;
             }
             Ok(())
         }
 
-        table_try_for_each!(&self.data.table, |x| go(x, self, f, &self.module_info));
+        table_try_for_each!(&self.data.table, |x| go(x, self, f, &self.module_info, env));
         Ok(())
     }
 }
 
 pub struct SolutionsDifference<'a> {
     key: (&'a dyn DisplayWith<ModuleInfo>, &'a dyn Debug),
-    lhs: Option<(&'a dyn Display, &'a dyn Debug)>,
-    rhs: Option<(&'a dyn Display, &'a dyn Debug)>,
+    lhs: Option<(&'a dyn for<'e> DisplayWith<dyn TypeEnv + 'e>, &'a dyn Debug)>,
+    rhs: Option<(&'a dyn for<'e> DisplayWith<dyn TypeEnv + 'e>, &'a dyn Debug)>,
 }
 
 impl Debug for SolutionsDifference<'_> {
@@ -900,12 +910,16 @@ impl Debug for SolutionsDifference<'_> {
     }
 }
 
-impl Display for SolutionsDifference<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let missing = |f: &mut fmt::Formatter, x: Option<(&dyn Display, &dyn Debug)>| match x {
-            None => write!(f, "missing"),
-            Some(x) => write!(f, "`{}`", x.0),
-        };
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for SolutionsDifference<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
+        let missing =
+            |f: &mut fmt::Formatter,
+             x: Option<(&dyn for<'x> DisplayWith<dyn TypeEnv + 'x>, &dyn Debug)>| {
+                match x {
+                    None => write!(f, "missing"),
+                    Some(x) => write!(f, "`{}`", x.0.display_with(env)),
+                }
+            };
 
         // The key has type DisplayWith<ModuleInfo>.
         // We don't know if the key originates on the LHS or RHS, so we don't know which is the appropriate ModuleInfo.
@@ -1216,14 +1230,32 @@ impl Solutions {
     }
 }
 
+/// The module that a cross-module lookup reads from.
+#[derive(Debug, Clone, Copy, Dupe)]
+pub enum LookupModule {
+    /// The module that this name resolves to when imported from the current module.
+    Import(ModuleName),
+    /// The module loaded from exactly this name and path. Lookups compare the key with
+    /// `ModuleKey::exact`, so the in-memory and on-disk versions of a file stay separate.
+    Exact(ModuleKey),
+}
+
+impl LookupModule {
+    pub fn name(self) -> ModuleName {
+        match self {
+            Self::Import(name) => name,
+            Self::Exact(key) => key.name(),
+        }
+    }
+}
+
 pub trait LookupAnswer: Sized {
-    /// Look up the value. If present, the `path` is a hint which can optimize certain cases.
+    /// Look up the value of `k` in `module`.
     ///
     /// Return None if the file is undergoing concurrent modification.
     fn get<'answer, K: Solve<Self> + Exported>(
         &self,
-        module: ModuleName,
-        path: Option<&ModulePath>,
+        module: LookupModule,
         k: &K,
         stack: &'answer ThreadState,
         answer_scope: &'answer AnswerScope,
@@ -1279,6 +1311,14 @@ pub trait LookupAnswer: Sized {
     /// incremental rebuilds properly invalidate dependents when class
     /// fields change.
     fn get_class_fields(&self, cls: &Class) -> Option<&ClassFields>;
+
+    /// Look up the definition data of a class of another module: its row in the module's
+    /// binding metadata, or the module's placeholder row if the `ClassDefIndex` is stale.
+    ///
+    /// Implementations must register a dependency on the class's definition facts
+    /// (`ModuleDep::ClassDef`), and must return the same row for a class every time, so that an
+    /// order computed from rows stays consistent while one solver uses it.
+    fn get_class_def(&self, cls: &Class) -> &ClassDef;
 }
 
 impl Answers {
@@ -1521,7 +1561,7 @@ impl Answers {
         if let Some(trace_store) = &self.trace {
             trace_store
                 .lock()
-                .visit_mut(&mut |ty| self.solver.force_mut(ty));
+                .visit_mut(&mut |ty| self.solver.force_mut(ty, &answers_solver));
         }
         // `pre_solve` has published every exported slot. From this point on,
         // the preallocated solutions table represents a complete result set.
@@ -1571,7 +1611,8 @@ impl Answers {
             }
         }
 
-        let pysa_solutions = pysa_context.map(PysaSolutions::build);
+        let pysa_solutions =
+            pysa_context.map(|context| PysaSolutions::build(context, &answers_solver));
         let cinderx_solutions =
             enable_cinderx_solutions.then(|| CinderxSolutions::build(&answers_solver));
 
@@ -1908,7 +1949,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     AttrDefinition::FullyResolved {
                         cls,
                         range: _,
-                        docstring_range: _,
+                        doc_ranges: _,
                     } => match reference_kind {
                         AttributeReferenceKind::ConstructorCall => index
                             .lock()

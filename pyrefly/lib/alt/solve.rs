@@ -26,8 +26,10 @@ use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_types::type_alias::TypeAliasIndex;
 use pyrefly_types::type_alias::TypeAliasRef;
 use pyrefly_types::type_info::JoinStyle;
+use pyrefly_types::typed_dict::ANONYMOUS_TYPED_DICT;
 use pyrefly_types::typed_dict::ExtraItems;
-use pyrefly_types::typed_dict::TypedDict;
+use pyrefly_types::types::UnpackKind;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::display::pluralize;
 use pyrefly_util::prelude::SliceExt;
 use pyrefly_util::prelude::VecExt;
@@ -58,13 +60,13 @@ use vec1::Vec1;
 use crate::alt::answers::AttributeReferenceKind;
 use crate::alt::answers::IndexedAttribute;
 use crate::alt::answers::LookupAnswer;
+use crate::alt::answers::LookupModule;
 use crate::alt::answers_solver::AnswersSolver;
 use crate::alt::answers_solver::TypeCheckOptions;
 use crate::alt::call::CallTargetLookup;
 use crate::alt::callable::CallArg;
 use crate::alt::class::attrs::is_attrs_nothing;
 use crate::alt::class::class_field::ClassField;
-use crate::alt::class::typed_dict::TypedDictErrorKind;
 use crate::alt::class::variance_inference::VarianceMap;
 use crate::alt::expr::ExprOptions;
 use crate::alt::traits::SolveResult;
@@ -128,6 +130,7 @@ use crate::binding::binding::KeyUndecoratedFunction;
 use crate::binding::binding::Keyed;
 use crate::binding::binding::LastPath;
 use crate::binding::binding::LastStmt;
+use crate::binding::binding::LegacyTypeParamSource;
 use crate::binding::binding::LinkedKey;
 use crate::binding::binding::ModuleDiagnostic;
 use crate::binding::binding::MultiTargetReceiver;
@@ -180,6 +183,7 @@ use crate::types::module::ModuleType;
 use crate::types::param_spec::ParamSpec;
 use crate::types::quantified::AnchorIndex;
 use crate::types::quantified::Quantified;
+use crate::types::quantified::QuantifiedAnchor;
 use crate::types::quantified::QuantifiedIdentity;
 use crate::types::quantified::QuantifiedKind;
 use crate::types::quantified::QuantifiedOrigin;
@@ -205,17 +209,19 @@ use crate::types::types::Type;
 
 /// Collects each legacy type parameter once, retaining its declaration range for ordering.
 /// The alias anchor keeps quantifications of the same variable in different aliases distinct.
-/// Within an alias, a parameter's index is the order in which the collector first meets it. The
-/// declaration's offset would not do: variables declared in different modules can share it.
+/// Within an alias, a parameter's index is the order in which the collector first meets it.
 struct LegacyTypeParamCollector {
     module: ModuleName,
-    alias_anchor: TextRange,
+    alias_anchor: QuantifiedAnchor,
     seen: SmallMap<Type, Quantified>,
     tparams: Vec<(TextRange, Quantified)>,
 }
 
 impl LegacyTypeParamCollector {
-    fn new(module: ModuleName, alias_anchor: TextRange) -> Self {
+    /// `alias_anchor` is the alias, or `QuantifiedAnchor::None` for an assignment that solving
+    /// recognizes as an implicit alias. Such an alias's parameters are closed in its `Forall`, so
+    /// they cannot meet the parameters of another alias that share their identities.
+    fn new(module: ModuleName, alias_anchor: QuantifiedAnchor) -> Self {
         Self {
             module,
             alias_anchor,
@@ -232,7 +238,7 @@ impl LegacyTypeParamCollector {
                 let identity = QuantifiedIdentity::new(
                     self.module,
                     AnchorIndex::new(self.alias_anchor, self.tparams.len() as u32),
-                    QuantifiedOrigin::ScopedLegacy,
+                    QuantifiedOrigin::InferredLegacy,
                 );
                 let q = Quantified::from_type_var_like(x, identity);
                 e.insert(q.clone());
@@ -447,9 +453,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Resolve the original value before a possible legacy type parameter is quantified.
     pub(crate) fn legacy_tparam_value(&self, binding: &BindingLegacyTypeParam) -> TypeInfo {
-        match binding {
-            BindingLegacyTypeParam::ParamKeyed(k) => self.get_idx(*k).clone(),
-            BindingLegacyTypeParam::ModuleKeyed(module) => {
+        match &binding.source {
+            LegacyTypeParamSource::ParamKeyed(k) => self.get_idx(*k).clone(),
+            LegacyTypeParamSource::ModuleKeyed(module) => {
                 // Errors in attribute lookup are reported elsewhere.
                 module
                     .attrs
@@ -470,30 +476,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// Solve a `BindingLegacyTypeParam`, producing a `LegacyTypeParameterLookup` that tells the
     /// caller whether the name is a type parameter and, if so, which `Quantified` to use.
     ///
-    /// The `scope_anchor` is the range of the `KeyLegacyTypeParam` key itself — the first
-    /// occurrence of the TypeVar name in this scope. It is unique per (scope, TypeVar) pair:
-    /// two functions that both use an imported `T` will have different first-occurrence ranges,
-    /// so their `Quantified`s will have different identities even though they share the same
-    /// module-level `TypeVar` declaration.
+    /// The binding's anchor names the definition and the name's position among the names that
+    /// the definition uses, so it is unique per (definition, TypeVar) pair: two functions that
+    /// both use an imported `T` get `Quantified`s with different identities even though they
+    /// share the same module-level `TypeVar` declaration.
     pub fn solve_legacy_tparam(
         &self,
         binding: &BindingLegacyTypeParam,
-        scope_anchor: TextRange,
     ) -> LegacyTypeParameterLookup {
         let maybe_parameter = self.legacy_tparam_value(binding);
-        // Use the scope_anchor (the KeyLegacyTypeParam's own range, i.e. the first occurrence
-        // of this TypeVar name in the enclosing function/class/alias scope) as the identity
-        // anchor. This gives each (scope, TypeVar) pair a distinct Quantified even when multiple
-        // scopes import and reuse the same module-level TypeVar declaration.
         let module = self.module().name();
         let ty = maybe_parameter.ty();
         match ty.as_type_var_like() {
             Some(x) => {
-                let identity = QuantifiedIdentity::new(
-                    module,
-                    AnchorIndex::first(scope_anchor),
-                    QuantifiedOrigin::ScopedLegacy,
-                );
+                let identity =
+                    QuantifiedIdentity::new(module, binding.anchor, QuantifiedOrigin::ScopedLegacy);
                 LegacyTypeParameterLookup::Parameter(Quantified::from_type_var_like(x, identity))
             }
             None => LegacyTypeParameterLookup::NotParameter(ty.clone()),
@@ -567,11 +564,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if !metadata.is_protocol() && metadata.is_final() {
                 self.error(
                     errors,
-                    cls.range(),
+                    cls.range(self),
                     ErrorKind::BadClassDefinition,
                     format!(
                         "Final class `{}` cannot have unimplemented abstract members: {}",
-                        cls.name(),
+                        cls.name(self),
                         members
                     ),
                 );
@@ -581,11 +578,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 self.error(
                     errors,
-                    cls.range(),
+                    cls.range(self),
                     ErrorKind::ImplicitAbstractClass,
                     format!(
                         "Class `{}` has unimplemented abstract members: {}",
-                        cls.name(),
+                        cls.name(self),
                         members
                     ),
                 );
@@ -747,7 +744,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         vs: QuantifiedHandle,
         infer_with_first_use: bool,
     ) -> Result<(), Vec1<TypeVarSpecializationError>> {
-        self.solver().finish_quantified(vs, infer_with_first_use)
+        self.solver()
+            .finish_quantified(vs, infer_with_first_use, self)
     }
 
     pub fn expr_class_keyword(&self, x: &Expr, errors: &ErrorCollector) -> Annotation {
@@ -783,7 +781,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) -> Option<Qualifier> {
         let ty = match x {
-            Expr::Name(_) | Expr::Attribute(_) => Some(self.expr_infer(x, errors)),
+            Expr::Name(_) | Expr::Attribute(_) => Some(
+                self.expr_infer_without_shape_comment(x, None, errors, Some(type_form_context))
+                    .into_ty(),
+            ),
             _ => None,
         };
         if let Some(Type::Type(ref f)) = ty
@@ -900,7 +901,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                     Type::None => Some("`None`".to_owned()),
                     Type::Module(_) => Some("`types.ModuleType`".to_owned()),
-                    Type::ClassDef(cls) => Some(format!("`type[{}]`", cls.name())),
+                    Type::ClassDef(cls) => Some(format!("`type[{}]`", cls.name(self))),
                     _ => None,
                 }
             } else {
@@ -1107,7 +1108,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    fn has_named_tuple_iter_override(&self, cls: &ClassType) -> bool {
+    pub(crate) fn has_named_tuple_iter_override(&self, cls: &ClassType) -> bool {
         if self
             .get_metadata_for_class(cls.class_object())
             .named_tuple_metadata()
@@ -1162,7 +1163,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     )
                     .and_then(|iter_ty| self.unwrap_iterable(&iter_ty))
                     .unwrap_or_else(|| {
-                        self.error(errors, range, ErrorKind::NotIterable, context().format())
+                        self.error(
+                            errors,
+                            range,
+                            ErrorKind::NotIterable,
+                            context().format(self),
+                        )
                     });
                 vec![Iterable::OfType(ty)]
             }
@@ -1218,19 +1224,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     suffix: suffix.to_vec(),
                 }]
             }
-            Type::Var(v) if let Some(_guard) = self.recurse(*v) => {
-                self.iterate(&self.solver().force_var(*v), range, errors, orig_context)
-            }
+            Type::Var(v) if let Some(_guard) = self.recurse(*v) => self.iterate(
+                &self.solver().force_var(*v, self),
+                range,
+                errors,
+                orig_context,
+            ),
             Type::Quantified(q) if q.is_type_var() => {
                 // A TypeVar iterates like its upper bound: `Z: tuple[str, int]` must
                 // unpack positionally rather than collapse to the element join via the
                 // iterable protocol. Mirrors attribute access on a bounded TypeVar.
-                self.iterate(
-                    &q.upper_bound(self.stdlib, self.heap),
-                    range,
-                    errors,
-                    orig_context,
-                )
+                self.iterate(&q.upper_bound(self, self.heap), range, errors, orig_context)
             }
             Type::Union(f) => f
                 .members
@@ -1260,7 +1264,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         )
                     })
                     .unwrap_or_else(|| {
-                        self.error(errors, range, ErrorKind::NotIterable, context().format())
+                        self.error(
+                            errors,
+                            range,
+                            ErrorKind::NotIterable,
+                            context().format(self),
+                        )
                     });
                 vec![Iterable::OfType(ty)]
             }
@@ -1298,7 +1307,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         };
 
         let combine = |types: Vec1<Type>| {
-            Type::combine_overload_results(types.into_vec(), self.heap)
+            Type::combine_overload_results(types.into_vec(), self.heap, self)
                 .expect("a nonempty collection of results can always be combined")
         };
         let combine_positions = |positions_by_branch: Vec1<&Vec<Type>>| {
@@ -1388,12 +1397,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) -> Vec<Iterable> {
         match iterable {
             Type::Var(v) if let Some(_guard) = self.recurse(*v) => {
-                self.async_iterate(&self.solver().force_var(*v), range, errors)
+                self.async_iterate(&self.solver().force_var(*v, self), range, errors)
             }
             _ => {
                 let context = || ErrorContext::AsyncIteration(self.for_display(iterable.clone()));
                 let ty = self.unwrap_async_iterable(iterable).unwrap_or_else(|| {
-                    self.error(errors, range, ErrorKind::NotIterable, context().format())
+                    self.error(
+                        errors,
+                        range,
+                        ErrorKind::NotIterable,
+                        context().format(self),
+                    )
                 });
                 vec![Iterable::OfType(ty)]
             }
@@ -1454,7 +1468,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 format!(
                     "Expression `{}` has type `{}`, expected {}",
                     self.module().display(x),
-                    self.for_display(actual_type),
+                    self.display(actual_type),
                     expected,
                 ),
             );
@@ -1465,10 +1479,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         &self,
         exprs: &Vec<Expr>,
         legacy_params: &[Idx<KeyLegacyTypeParam>],
+        anchor: QuantifiedAnchor,
         range: TextRange,
         errors: &ErrorCollector,
     ) -> Vec<Quantified> {
-        let mut collector = LegacyTypeParamCollector::new(self.module().name(), range);
+        let mut collector = LegacyTypeParamCollector::new(self.module().name(), anchor);
         for expr in exprs {
             let inferred_ty = self.expr_infer(expr, errors);
             let ty = self
@@ -1485,7 +1500,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ErrorKind::NotAType,
                         format!(
                             "Expected a type form, got instance of `{}`",
-                            self.for_display(inferred_ty),
+                            self.display(inferred_ty),
                         ),
                     )
                 });
@@ -1508,7 +1523,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         expr.range(),
                         ErrorKind::InvalidTypeAlias,
-                        format!("Expected a type variable, got `{}`", self.for_display(ty)),
+                        format!("Expected a type variable, got `{}`", self.display(ty)),
                     );
                 }
             }
@@ -1518,10 +1533,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .into_iter()
             .map(|param| (param.name().clone(), param))
             .collect::<SmallMap<_, _>>();
-        // `legacy_params` contains the tparams (built via solve_legacy_tparam, anchored to the
-        // KeyLegacyTypeParam's scope range) actually used in the alias. If we find a tparam in
-        // `tparams` but not in `legacy_tparams`, that means it's declared and not used, which is
-        // pointless but legal.
+        // `legacy_params` contains the tparams (built via solve_legacy_tparam) actually used in
+        // the alias. If we find a tparam in `tparams` but not in `legacy_tparams`, that means it's
+        // declared and not used, which is pointless but legal.
         let tparams = collector
             .tparams
             .into_map(|(_, param)| legacy_params.shift_remove(param.name()).unwrap_or(param));
@@ -1582,7 +1596,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let mut visit = |t: &mut Type| self.tvars_to_tparams_for_type_alias(t, collector);
                 tuple.recurse_mut(&mut visit);
             }
-            Type::Unpack(t) => self.tvars_to_tparams_for_type_alias(t, collector),
+            Type::Unpack(t, ..) => self.tvars_to_tparams_for_type_alias(t, collector),
             Type::Type(t) | Type::Annotated(t, _) => {
                 self.tvars_to_tparams_for_type_alias(t, collector)
             }
@@ -1633,7 +1647,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors,
                 range,
                 ErrorKind::InvalidTypeAlias,
-                format!("Expected `{name}` to be a type alias, got `{ty}`"),
+                format!(
+                    "Expected `{name}` to be a type alias, got `{}`",
+                    ty.display_with(self)
+                ),
             );
             return TypeAlias::error(name.clone(), style);
         };
@@ -1787,8 +1804,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
 
         // Step 3: Extract type parameters from the (now expanded) body.
+        let anchor = current_index.map_or(QuantifiedAnchor::None, QuantifiedAnchor::TypeAlias);
         let tvars_to_tparams_for_type_alias = |ty| {
-            let mut collector = LegacyTypeParamCollector::new(self.module().name(), range);
+            let mut collector = LegacyTypeParamCollector::new(self.module().name(), anchor);
             self.tvars_to_tparams_for_type_alias(ty, &mut collector);
             // Sort by source location to restore the user's intended type parameter order.
             // This is needed because union members get sorted alphabetically during
@@ -1803,7 +1821,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 legacy_params,
             } => {
                 // Handle type params from `TypeAliasType(type_params=...)`.
-                self.tvars_to_tparams_for_type_alias_type(type_params, legacy_params, range, errors)
+                self.tvars_to_tparams_for_type_alias_type(
+                    type_params,
+                    legacy_params,
+                    anchor,
+                    range,
+                    errors,
+                )
             }
             TypeAliasParams::Legacy(Some(legacy_tparams)) => {
                 // Collect type params that appear in a legacy type alias that we were able to detect
@@ -1864,25 +1888,33 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     pub fn create_type_alias_params_recursive(
         &self,
         tparams: &TypeAliasParams,
-        anchor: TextRange,
+        index: TypeAliasIndex,
+        range: TextRange,
     ) -> Arc<TParams> {
         let errors = self.error_swallower();
         let params = match tparams {
             TypeAliasParams::TypeAliasType {
                 declared_params: tparams,
                 legacy_params,
-            } => self.tvars_to_tparams_for_type_alias_type(tparams, legacy_params, anchor, &errors),
+            } => self.tvars_to_tparams_for_type_alias_type(
+                tparams,
+                legacy_params,
+                QuantifiedAnchor::TypeAlias(index),
+                range,
+                &errors,
+            ),
             TypeAliasParams::Legacy(Some(tparams)) => self.create_legacy_type_params(tparams),
             TypeAliasParams::Legacy(None) => Vec::new(),
             TypeAliasParams::Scoped(tparams) => self.scoped_type_params(tparams.as_ref(), &errors),
         };
-        Arc::new(self.validated_tparams(anchor, params, TParamsSource::TypeAlias, &errors))
+        Arc::new(self.validated_tparams(range, params, TParamsSource::TypeAlias, &errors))
     }
 
     fn create_legacy_type_params(&self, keys: &[Idx<KeyLegacyTypeParam>]) -> Vec<Quantified> {
         keys.iter()
             .filter_map(|key| {
-                if let BindingLegacyTypeParam::ParamKeyed(def_key) = self.bindings().get(*key)
+                if let LegacyTypeParamSource::ParamKeyed(def_key) =
+                    &self.bindings().get(*key).source
                     && matches!(
                         self.bindings().get(*def_key),
                         Binding::TypeAlias(..) | Binding::TypeAliasRef(..)
@@ -2181,7 +2213,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors.error_builder(
                                 range,
                                 ErrorKind::BadContextManager,
-                                context().format(),
+                                context().format(self),
                             )
                         })
                         .with_error_details(error),
@@ -2623,7 +2655,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         match ty {
             Type::Var(v) => {
                 if let Some(_guard) = self.recurse(*v) {
-                    let forced = self.solver().force_var(*v);
+                    let forced = self.solver().force_var(*v, self);
                     self.force_for_narrowing(&forced, range, errors)
                 } else {
                     // Cycle detected - report as internal error
@@ -2640,7 +2672,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     pub fn expand_mut(&self, ty: &mut Type) {
         // Replace any solved recursive variables with their answers.
-        self.solver().expand_mut(ty);
+        self.solver().expand_mut(ty, self);
     }
 
     fn check_del_typed_dict_field(
@@ -2669,7 +2701,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     fn check_del_typed_dict_literal_key(
         &self,
-        typed_dict: &TypedDict,
+        typed_dict: &ClassType,
         field_name: &Name,
         range: TextRange,
         errors: &ErrorCollector,
@@ -2683,13 +2715,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 self.error(
                     errors,
                     range,
-                    typed_dict.key_error_kind(),
-                    format!("{} does not have key `{field_name}`", typed_dict.label()),
+                    ErrorKind::BadTypedDictKey,
+                    format!(
+                        "TypedDict `{}` does not have key `{field_name}`",
+                        typed_dict.name(self)
+                    ),
                 );
                 return;
             };
         self.check_del_typed_dict_field(
-            typed_dict.name(),
+            typed_dict.name(self),
             Some(field_name),
             read_only,
             required,
@@ -2714,11 +2749,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) -> Option<bool> {
         let range = x.range();
         let contains_class_object = self.uses_class_object_attribute_lookup(ty);
-        let intrinsic_value = if let Type::TypedDict(td) = ty
+        let intrinsic_value = if let Type::ClassType(td) = ty
+            && self.is_typed_dict_class(td.class_object())
             && self
                 .typed_dict_fields(td)
                 .values()
                 .any(|field| field.required)
+        {
+            Some(true)
+        } else if let Type::AnonymousTypedDict(td) = ty
+            && td.fields.iter().any(|(_, field)| field.required)
         {
             Some(true)
         } else if let Type::ClassType(cls) = ty {
@@ -3068,7 +3108,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     ErrorKind::BadUnpacking,
                                     format!(
                                         "Cannot unpack {} (of size {}+) into {}",
-                                        iterable_ty,
+                                        iterable_ty.display_with(self),
                                         min_len,
                                         expect.message(),
                                     ),
@@ -3082,7 +3122,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::BadUnpacking,
                                 format!(
                                     "Cannot unpack {} (of unknown size) into {}",
-                                    iterable_ty,
+                                    iterable_ty.display_with(self),
                                     expect.message(),
                                 ),
                             );
@@ -3104,7 +3144,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                         ErrorKind::BadUnpacking,
                                         format!(
                                             "Cannot unpack {} (of size {}) into {}",
-                                            iterable_ty,
+                                            iterable_ty.display_with(self),
                                             ts.len(),
                                             expectation,
                                         ),
@@ -3142,7 +3182,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 {
                     let t_new = self.for_display(t_new.clone());
                     let t_existing = self.for_display(t_existing.clone());
-                    let ctx = TypeDisplayContext::new(&[&t_new, &t_existing]);
+                    let ctx = TypeDisplayContext::new(self, &[&t_new, &t_existing]);
                     self.error(
                         errors,
                         self.bindings().idx_to_key(*new).range(),
@@ -3187,7 +3227,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ErrorKind::UnexpectedNever,
                         format!(
                             "Function declared to return `{}` but can never return",
-                            self.for_display(annotation.clone())
+                            self.display(annotation.clone())
                         ),
                     );
                 }
@@ -3618,7 +3658,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let Some(owners) = expect
             .class_idxs
             .iter()
-            .map(|class_idx| self.get_idx(*class_idx).0.clone())
+            .map(|class_idx| self.get_idx(*class_idx).0)
             .collect::<Option<Vec<_>>>()
         else {
             return;
@@ -3675,7 +3715,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         cls: &Class,
         class_field_map: &SmallMap<Name, &ClassField>,
     ) {
-        if !cls.module().path().is_first_party_for_indexing() {
+        if !cls.module_path().is_first_party_for_indexing() {
             return;
         }
 
@@ -3824,14 +3864,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::OrderedDataclassInheritance,
                     format!(
                         "Cannot safely extend dataclass `{}` with `order=True`",
-                        generator.name()
+                        generator.name(self)
                     ),
                 )
                 .with_detail(format!(
                     "Comparisons between instances of `{}` and its subclasses raise `TypeError`. \
                      Define `__lt__`, `__le__`, `__gt__`, and `__ge__` on the subclass to allow \
                      them.",
-                    generator.name()
+                    generator.name(self)
                 ))
                 .emit();
         }
@@ -3896,9 +3936,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::InvalidAbstractMethod,
                     format!(
                         "`{}.{}` is decorated with `@abstractmethod` but `{}` is not an abstract class",
-                        cls.name(),
+                        cls.name(self),
                         name,
-                        cls.name()
+                        cls.name(self)
                     ),
                 );
             }
@@ -3926,32 +3966,36 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    pub fn solve_class(
-        &self,
-        cls: &BindingClass,
-        errors: &ErrorCollector,
-    ) -> NoneIfRecursive<Class> {
-        let cls = match cls {
-            BindingClass::ClassDef(x) => self.class_definition(x, errors),
-            BindingClass::FunctionalClassDef(def_index, x, parent) => {
-                self.functional_class_definition(*def_index, x, parent)
-            }
+    pub fn solve_class(&self, cls: &BindingClass) -> NoneIfRecursive<Class> {
+        let def_index = match cls {
+            BindingClass::ClassDef(x) => x.def_index,
+            BindingClass::FunctionalClassDef(def_index, _) => *def_index,
         };
-        NoneIfRecursive(Some(cls))
+        NoneIfRecursive(Some(self.class_definition(def_index)))
     }
 
     pub fn solve_tparams(&self, binding: &BindingTParams, errors: &ErrorCollector) -> TParams {
-        let result = self.calculate_class_tparams(
-            &binding.name,
-            binding.scoped_type_params.as_deref(),
-            &binding.generic_bases,
-            &binding.legacy_tparams,
-            errors,
-        );
-        // Truncate recursive TArgs nesting in restrictions. This prevents unbounded
-        // growth during fixpoint iteration when mutually-recursive classes reference
-        // each other in type parameter bounds.
-        result.truncate_recursive_targs()
+        let tparams = if binding.legacy_tparams.is_empty() {
+            self.calculate_class_tparams_no_legacy(
+                &binding.name,
+                binding.scoped_type_params.as_deref(),
+                errors,
+            )
+        } else {
+            self.calculate_class_tparams(
+                &binding.name,
+                binding.scoped_type_params.as_deref(),
+                &binding.generic_bases,
+                &binding.legacy_tparams,
+                errors,
+            )
+        };
+        let class = self.get_idx(binding.class_idx);
+        let owner = class
+            .0
+            .as_ref()
+            .expect("solving a class reads no other answer, so it is not recursive");
+        tparams.truncate_recursive_targs(owner)
     }
 
     pub fn solve_class_base_type(
@@ -3972,7 +4016,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) -> ClassField {
         let functional_class_def = matches!(
             self.bindings().get(field.class_idx),
-            BindingClass::FunctionalClassDef(_, _, _)
+            BindingClass::FunctionalClassDef(_, _)
         );
 
         match &self.get_idx(field.class_idx).0 {
@@ -4112,12 +4156,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         // TODO: ideally this would point to where the TypeVar
                         // is bound in the class header rather than the class name.
-                        class.range(),
+                        class.range(self),
                         ErrorKind::VarianceMismatch,
                         format!(
                             "Type variable `{}` in class `{}` is declared as invariant, but could be {} based on its usage",
                             tparam.name(),
-                            class.name(),
+                            class.name(self),
                             effective_v,
                         ),
                     );
@@ -4169,7 +4213,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::InvalidArgument,
                             format!(
                                 "Expected first argument to `super` to be a class object, got `{}`",
-                                self.for_display(t.clone())
+                                self.display(t.clone())
                             ),
                         );
                     }
@@ -4179,7 +4223,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     let lookup_cls = self.get_super_lookup_class(cls, obj_cls);
                     lookup_cls.map_or_else (
                                 || {
-                                    let cls_type = self.for_display(cls_type.clone());
+                                    let cls_type = self.display(cls_type.clone());
+                                    let obj_cls = obj_cls.display_with(self);
                                     self.error(
                                         errors,
                                         range,
@@ -4218,7 +4263,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     errors,
                                     range,
                                     ErrorKind::InvalidArgument,
-                                    format!("Expected second argument to `super` to be a class object or instance, got `{}`", self.for_display(t.clone())),
+                                    format!("Expected second argument to `super` to be a class object or instance, got `{}`", self.display(t.clone())),
                                 )
                             }
                 }
@@ -4251,7 +4296,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         // A zero-arg `super()` in a method of a class that directly subclasses
                         // `NamedTuple` makes the class fail to define at runtime: the `__class__`
                         // cell the compiler creates for `super()` is not propagated by the
-                        // NamedTuple machinery. See https://github.com/facebook/pyrefly/issues/3763.
+                        // NamedTuple machinery. See https://github.com/pyrefly-org/pyrefly/issues/3763.
                         if self
                             .get_metadata_for_class(obj_cls)
                             .named_tuple_metadata()
@@ -4383,7 +4428,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::BadMatch,
                             format!(
                                 "Expected literal string in `__match_args__`, got `{}`",
-                                ts[idx]
+                                ts[idx].display_with(self)
                             ),
                             Some(&context),
                         )
@@ -4403,7 +4448,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors,
                 range,
                 ErrorKind::BadMatch,
-                format!("Expected concrete tuple for `__match_args__`, got `{match_args}`",),
+                format!(
+                    "Expected concrete tuple for `__match_args__`, got `{}`",
+                    match_args.display_with(self)
+                ),
                 Some(&context),
             ),
         }
@@ -4508,7 +4556,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             if let Some(ret) = callable
                                 .as_ref()
                                 .unwrap_or(&factory_ty)
-                                .callable_return_type(self.heap)
+                                .callable_return_type(self.heap, self)
                             {
                                 self.check_type(&ret, annot_ty, factory.value.range(), errors, tcc);
                             }
@@ -4571,7 +4619,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // both must use the same hint to report the same errors. Only the class field
                 // checks the value against the inherited annotation.
                 let inherited_ty = class_key.and_then(|k| {
-                    let cls = self.get_idx(k).0.clone()?;
+                    let cls = self.get_idx(k).0?;
                     self.get_inherited_type_and_annotation(&cls, name)
                         .1
                         .map(|annot| annot.get_type().clone())
@@ -4667,7 +4715,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // `bool`. A class attribute that merely shares the name is not the sentinel, so restrict to
         // module scope. Stub files have no runtime and conventionally initialize typing constants to
         // placeholder values (e.g. `TYPE_CHECKING = 1`), so skip them.
-        // See https://github.com/facebook/pyrefly/issues/3756.
+        // See https://github.com/pyrefly-org/pyrefly/issues/3756.
         if !is_in_function_scope
             && class_key.is_none()
             && SysInfo::is_type_checking_constant_name(name.as_str())
@@ -4680,7 +4728,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::InvalidTypeCheckingConstant,
                 format!(
                     "`{name}` must have type `bool` (e.g. `{name} = False`), got `{}`",
-                    self.for_display(ty.clone())
+                    self.display(ty.clone())
                 ),
             );
         }
@@ -5004,7 +5052,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::NoAnyReturnExplicit,
                     format!(
                         "Returning Any from function declared to return \"{}\"",
-                        self.for_display(declared_ty.clone())
+                        self.display(declared_ty.clone())
                     ),
                 );
             }
@@ -5015,7 +5063,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::NoAnyReturnImplicit,
                     format!(
                         "Returning implicit Any from function declared to return \"{}\"",
-                        self.for_display(declared_ty.clone())
+                        self.display(declared_ty.clone())
                     ),
                 );
             }
@@ -5364,7 +5412,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::UnreachableExceptClause,
                     format!(
                         "`{}` is already caught earlier in this `try` statement, so it never matches here",
-                        self.for_display(ty)
+                        self.display(ty)
                     ),
                 );
             }
@@ -5381,7 +5429,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let message = match culprit {
             Some(ty) => format!(
                 "This `{keyword}` clause is unreachable, because an earlier clause already catches `{}`",
-                self.for_display(ty)
+                self.display(ty)
             ),
             None => format!(
                 "This `{keyword}` clause is unreachable, because earlier clauses already catch every exception it matches"
@@ -5899,7 +5947,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // If the attribute lookup fails here, we'll emit an `unknown-name` error, since this
             // is a deferred lookup that can't be calculated at the bindings step
             let error_swallower = self.error_swallower();
-            let cls_def = self.heap.mk_class_def(cls.clone());
+            let cls_def = self.heap.mk_class_def(*cls);
             let attr_ty =
                 self.attr_infer_for_type(&cls_def, &name.id, name.range(), &error_swallower, None);
             if attr_ty.is_error() {
@@ -6109,7 +6157,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 format!(
                     "Result of call expression is of type `{}` and is not used; \
                      assign to `_` if this is intentional",
-                    self.for_display(result.clone())
+                    self.display(result.clone())
                 ),
             );
         }
@@ -6152,7 +6200,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 error_builder.emit();
             }
-            self.get_from_export(m, None, &KeyExport(name.clone()))
+            self.get_from_export(LookupModule::Import(m), &KeyExport(name.clone()))
                 .clone()
         };
         let Some(fallback) = &x.fallback else {
@@ -6201,7 +6249,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if let Some(getattr_ty) = self.try_get_from_export(m, dunder::GETATTR) {
             return getattr_ty
                 .clone()
-                .callable_return_type(self.heap)
+                .callable_return_type(self.heap, self)
                 .unwrap_or_else(|| self.heap.mk_any_implicit());
         }
         self.solve_import_missing(name, m, fallback, submodule_error, errors)
@@ -6288,7 +6336,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             errors
                 .error_builder(diagnostic.range, kind, header)
                 .with_details(details)
-                .with_context(ctx.as_deref())
+                .with_context(self, ctx.as_deref())
                 .emit();
         }
     }
@@ -6535,6 +6583,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn subscript_assign_arm_allows_narrowing(&self, arm: &Type) -> bool {
         match arm {
             Type::Any(_) => false,
+            // A TypedDict's `__setitem__` writes exactly the field type its `__getitem__`
+            // reads, so an assignment always narrows.
+            Type::ClassType(cls) if self.is_typed_dict_class(cls.class_object()) => true,
             Type::ClassType(cls) => self.get_subscript_symmetry_for_class(cls.class_object()),
             _ => true,
         }
@@ -6626,9 +6677,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
             LegacyTypeParameterLookup::NotParameter(ty) => ty.clone(),
         };
-        match self.bindings().get(key) {
-            BindingLegacyTypeParam::ParamKeyed(_) => TypeInfo::of_ty(resolve(key)),
-            BindingLegacyTypeParam::ModuleKeyed(binding) => {
+        match &self.bindings().get(key).source {
+            LegacyTypeParamSource::ParamKeyed(_) => TypeInfo::of_ty(resolve(key)),
+            LegacyTypeParamSource::ModuleKeyed(binding) => {
                 // `base` points at a module whose attr chain may end in a legacy type
                 // variable that needs to be replaced with a QuantifiedValue. Since the
                 // binding is for the module itself, we use the mechanism for attribute
@@ -6841,7 +6892,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     fn check_assign_to_typed_dict_literal_subscript(
         &self,
-        typed_dict: &TypedDict,
+        typed_dict: &ClassType,
         field_name: &Name,
         value: &ExprOrBinding,
         key_range: TextRange,
@@ -6858,16 +6909,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 return self.error(
                     errors,
                     key_range,
-                    typed_dict.key_error_kind(),
-                    format!("{} does not have key `{field_name}`", typed_dict.label()),
+                    ErrorKind::BadTypedDictKey,
+                    format!(
+                        "TypedDict `{}` does not have key `{field_name}`",
+                        typed_dict.name(self)
+                    ),
                 );
             };
         self.check_assign_to_typed_dict_field(
-            typed_dict.name(),
+            typed_dict.name(self),
             Some(field_name),
             &field_ty,
             read_only,
-            typed_dict.is_anonymous(),
+            false,
             value,
             key_range,
             assign_range,
@@ -6886,8 +6940,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let assigned_ty = self.distribute_over_union(&base, |base| {
             self.distribute_over_union(&slice_ty, |key| {
                 match (base, key) {
-                    (Type::TypedDict(typed_dict), key)
-                        if let Some(field_name) = self.literal_typed_dict_key_name(key) =>
+                    (Type::ClassType(typed_dict), key)
+                        if self.is_typed_dict_class(typed_dict.class_object())
+                            && let Some(field_name) = self.literal_typed_dict_key_name(key) =>
                     {
                         self.check_assign_to_typed_dict_literal_subscript(
                             typed_dict,
@@ -6898,19 +6953,62 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors,
                         )
                     }
-                    (Type::TypedDict(typed_dict), key)
-                        if self.is_subset_eq(
-                            key,
-                            &self.heap.mk_class_type(self.stdlib.str().clone()),
-                        ) && let Some(field_ty) =
-                            self.get_typed_dict_value_type_as_builtins_dict(typed_dict) =>
+                    (Type::ClassType(typed_dict), key)
+                        if self.is_typed_dict_class(typed_dict.class_object())
+                            && self.is_subset_eq(
+                                key,
+                                &self.heap.mk_class_type(self.stdlib.str().clone()),
+                            )
+                            && let Some(field_ty) =
+                                self.get_typed_dict_value_type_as_builtins_dict(typed_dict) =>
                     {
                         self.check_assign_to_typed_dict_field(
-                            typed_dict.name(),
+                            typed_dict.name(self),
                             None,
                             &field_ty,
                             false,
-                            typed_dict.is_anonymous(),
+                            false,
+                            value,
+                            subscript.slice.range(),
+                            subscript.range(),
+                            errors,
+                        )
+                    }
+                    // An anonymous TypedDict has no required or read-only keys, and its extra
+                    // items type is the union of its field types, so any string key can be
+                    // assigned; only the value needs checking.
+                    (Type::AnonymousTypedDict(typed_dict), key)
+                        if let Some(field_name) = self.literal_typed_dict_key_name(key) =>
+                    {
+                        let field_ty = typed_dict.field(&field_name).map_or_else(
+                            || typed_dict.compute_value_type(self.heap, self),
+                            |field| field.ty.clone(),
+                        );
+                        self.check_assign_to_typed_dict_field(
+                            &ANONYMOUS_TYPED_DICT,
+                            Some(&field_name),
+                            &field_ty,
+                            false,
+                            true,
+                            value,
+                            subscript.slice.range(),
+                            subscript.range(),
+                            errors,
+                        )
+                    }
+                    (Type::AnonymousTypedDict(typed_dict), key)
+                        if self.is_subset_eq(
+                            key,
+                            &self.heap.mk_class_type(self.stdlib.str().clone()),
+                        ) && let Some(value_ty) = self
+                            .get_anonymous_typed_dict_value_type_as_builtins_dict(typed_dict) =>
+                    {
+                        self.check_assign_to_typed_dict_field(
+                            &ANONYMOUS_TYPED_DICT,
+                            None,
+                            &value_ty,
+                            false,
+                            true,
                             value,
                             subscript.slice.range(),
                             subscript.range(),
@@ -6957,9 +7055,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     fn wrap_callable_legacy_typevars(&self, ty: Type) -> Type {
+        // The callables share one numbering, so that a callable nested in another one never
+        // binds a parameter with the identity of the outer callable's parameter.
+        let mut next_index = 0;
         ty.transform(&mut |ty| match ty {
             Type::Callable(callable) => {
-                let tparams = self.promote_callable_legacy_typevars(callable);
+                let tparams = self.promote_callable_legacy_typevars(callable, &mut next_index);
                 if !tparams.is_empty() {
                     *ty = Forallable::Callable((**callable).clone())
                         .forall(Arc::new(TParams::new(tparams)));
@@ -6969,7 +7070,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         })
     }
 
-    fn promote_callable_legacy_typevars(&self, callable: &mut Callable) -> Vec<Quantified> {
+    /// Bind the legacy type variables of `callable` in a closed `Forall`. Its parameters belong
+    /// to no definition, so they are numbered from `next_index` instead.
+    fn promote_callable_legacy_typevars(
+        &self,
+        callable: &mut Callable,
+        next_index: &mut u32,
+    ) -> Vec<Quantified> {
         let mut seen_type_vars = SmallMap::new();
         let mut tparams = Vec::new();
         let heap = self.heap;
@@ -6982,9 +7089,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         .or_insert_with(|| {
                             let identity = QuantifiedIdentity::new(
                                 module,
-                                AnchorIndex::first(tv.qname().range()),
-                                QuantifiedOrigin::ScopedLegacy,
+                                AnchorIndex::new(QuantifiedAnchor::None, *next_index),
+                                QuantifiedOrigin::InferredLegacy,
                             );
+                            *next_index += 1;
                             let q = Quantified::from_type_var_like(tv, identity);
                             tparams.push(q.clone());
                             q
@@ -7135,11 +7243,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) {
         // Expand the type, in case unexpanded `Vars` are hiding further `Var`s that
         // need to be pinned.
-        self.solver().expand_mut(ty);
+        self.solver().expand_mut(ty, self);
         let vars = ty.collect_all_vars();
         // Pin all relevant vars and collect ranges of PartialContained vars
         for var in vars {
-            if let Some(error) = self.solver().pin_placeholder_type(var, pin_partial_types) {
+            if let Some(error) = self
+                .solver()
+                .pin_placeholder_type(var, pin_partial_types, self)
+            {
                 self.report_pin_error(error, ty_range, errors);
             }
         }
@@ -7243,12 +7354,24 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // TODO: check against duplicate keys (optional)
                 let key_ty = self.expr_infer(mapping_key, errors);
                 let binding = self.get_idx(*binding_key);
-                if let Type::TypedDict(typed_dict) = binding.ty()
-                    && let Type::Literal(lit) = &key_ty
+                if let Type::Literal(lit) = &key_ty
                     && let Lit::Str(key) = &lit.value
-                    && let Some(field) = self.typed_dict_field(typed_dict, &Name::new(key))
                 {
-                    return field.ty;
+                    let key = Name::new(key);
+                    match binding.ty() {
+                        Type::ClassType(typed_dict)
+                            if self.is_typed_dict_class(typed_dict.class_object())
+                                && let Some(field) = self.typed_dict_field(typed_dict, &key) =>
+                        {
+                            return field.ty;
+                        }
+                        Type::AnonymousTypedDict(typed_dict)
+                            if let Some(field) = typed_dict.field(&key) =>
+                        {
+                            return field.ty.clone();
+                        }
+                        _ => {}
+                    }
                 }
                 let arg = CallArg::ty(&key_ty, mapping_key.range());
                 self.call_method_or_error(
@@ -7420,7 +7543,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::UntypedClassDecorator,
                                 format!(
                                     "Untyped class decorator may modify `{}` in unexpected ways",
-                                    cls.name()
+                                    cls.name(self)
                                 ),
                             );
                         }
@@ -7513,14 +7636,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     module_path: self.module().path().clone(),
                     index,
                 };
-                let anchor = KeyTypeAlias::range_with(x.key_type_alias, self.bindings());
-                let tparams = self.create_type_alias_params_recursive(&x.tparams, anchor);
+                let range = KeyTypeAlias::range_with(x.key_type_alias, self.bindings());
+                let tparams = self.create_type_alias_params_recursive(&x.tparams, index, range);
                 Forallable::TypeAlias(TypeAliasData::Ref(r)).forall(tparams)
             }
             Binding::LambdaParameter(id, owner) => self.resolve_lambda_param_type(*id, *owner),
             Binding::StaticLambdaParameter(_) => self.heap.mk_any_implicit(),
             Binding::TypeLevelLambdaParameter(parameter) => {
-                self.resolve_map_int_tuples_mapper_parameter(&parameter.identifier)
+                self.resolve_map_int_tuples_mapper_parameter(parameter)
             }
             Binding::FunctionParameter(param) => self.binding_to_type_function_parameter(param),
             Binding::SuperInstance(x) => self.solve_super_binding(&x.0, x.1, errors),
@@ -7728,7 +7851,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::InvalidYield,
                             format!(
                                 "yield from value must be iterable, got `{}`",
-                                self.for_display(ty)
+                                self.display(ty)
                             ),
                         )
                     };
@@ -7797,7 +7920,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::NotAType,
                 format!(
                     "Expected a type form, got instance of `{}`",
-                    self.for_display(ty),
+                    self.display(ty),
                 ),
             )
         }
@@ -7897,9 +8020,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 Some(self.unions(ts))
             }
-            Type::Var(v) if let Some(_guard) = self.recurse(v) => {
-                self.untype_opt_with_context(self.solver().force_var(v), range, errors, context)
-            }
+            Type::Var(v) if let Some(_guard) = self.recurse(v) => self.untype_opt_with_context(
+                self.solver().force_var(v, self),
+                range,
+                errors,
+                context,
+            ),
             // These are all legal type forms, so we accept them (return `Some`).
             // Only the quantified kinds get a kind check from the validator;
             // `Args`/`Kwargs` pass through unchanged but must be listed
@@ -7962,20 +8088,20 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Type::TypeAlias(ta) if matches!(&*ta, TypeAliasData::Ref(_)) => {
                 Some(Type::UntypedAlias(ta))
             }
-            t @ Type::Unpack(_)
+            t @ Type::Unpack(..)
                 if matches!(
                     &t,
-                    Type::Unpack(inner) if matches!(&**inner, Type::Tuple(_) | Type::TypeVarTuple(_) | Type::Quantified(_) | Type::UntypedAlias(_))
+                    Type::Unpack(inner, ..) if matches!(&**inner, Type::Tuple(_) | Type::TypeVarTuple(_) | Type::Quantified(_) | Type::UntypedAlias(_))
                 ) =>
             {
                 Some(t)
             }
-            Type::Unpack(ref inner)
+            Type::Unpack(ref inner, kind)
                 if let Type::Var(v) = &**inner
                     && let Some(_guard) = self.recurse(*v) =>
             {
                 self.untype_opt_with_context(
-                    self.heap.mk_unpack(self.solver().force_var(*v)),
+                    self.heap.mk_unpack(self.solver().force_var(*v, self), kind),
                     range,
                     errors,
                     context,
@@ -8067,22 +8193,20 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     // Approximate the result of calling `type()` on something of type T.
     pub fn type_of(&self, ty: Type) -> Type {
         match ty {
+            Type::ClassType(ref cls) if self.is_typed_dict_class(cls.class_object()) => {
+                self.heap.mk_class_def(*self.stdlib.dict_object())
+            }
             Type::ClassType(_) | Type::SelfType(_) => self.heap.mk_type_of(ty),
-            Type::Literal(lit) => self.heap.mk_class_def(
-                lit.value
-                    .general_class_type(self.stdlib)
-                    .class_object()
-                    .clone(),
-            ),
-            Type::LiteralString(_) => self
+            Type::Literal(lit) => self
                 .heap
-                .mk_class_def(self.stdlib.str().class_object().clone()),
+                .mk_class_def(*lit.value.general_class_type(self.stdlib).class_object()),
+            Type::LiteralString(_) => self.heap.mk_class_def(*self.stdlib.str().class_object()),
             Type::None => self
                 .heap
-                .mk_class_def(self.stdlib.none_type().class_object().clone()),
-            Type::Tuple(_) => self.heap.mk_class_def(self.stdlib.tuple_object().clone()),
-            Type::TypedDict(_) | Type::PartialTypedDict(_) => {
-                self.heap.mk_class_def(self.stdlib.dict_object().clone())
+                .mk_class_def(*self.stdlib.none_type().class_object()),
+            Type::Tuple(_) => self.heap.mk_class_def(*self.stdlib.tuple_object()),
+            Type::AnonymousTypedDict(_) | Type::PartialTypedDict(_) => {
+                self.heap.mk_class_def(*self.stdlib.dict_object())
             }
             Type::Union(f) if !f.members.is_empty() => {
                 let mut ts = Vec::new();
@@ -8113,7 +8237,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) -> Type {
         if type_form_context != TypeFormContext::ParameterKwargsAnnotation
-            && matches!(ty, Type::Unpack(ref inner) if matches!(&**inner, Type::TypedDict(_)))
+            && matches!(&ty, Type::Unpack(inner, _) if self.is_typed_dict(inner))
         {
             return self.error(
                 errors,
@@ -8123,7 +8247,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             );
         }
         if type_form_context == TypeFormContext::ParameterKwargsAnnotation
-            && matches!(ty, Type::Unpack(ref inner) if !matches!(**inner, Type::TypedDict(_)))
+            && matches!(&ty, Type::Unpack(inner, _) if !self.is_typed_dict(inner))
         {
             return self.error(
                 errors,
@@ -8162,7 +8286,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 | TypeFormContext::TupleOrCallableParam(_)
                 | TypeFormContext::GenericBase
                 | TypeFormContext::TypeVarTupleDefault
-        ) && matches!(ty, Type::Unpack(_))
+        ) && matches!(ty, Type::Unpack(..))
         {
             return self.error(
                 errors,
@@ -8183,7 +8307,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors,
                 range,
                 ErrorKind::InvalidAnnotation,
-                format!("`{ty}` is not allowed in this context"),
+                format!("`{}` is not allowed in this context", ty.display_with(self)),
             );
         }
         // We check tuple/callable/generic type arguments separately, so exclude those
@@ -8199,7 +8323,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // Determine whether we're simply missing an `Unpack[...]` or the TypeVarTuple isn't allowed at all in this context.
             let tmp_collector = self.error_collector();
             self.validate_type_form(
-                self.heap.mk_unpack(ty),
+                self.heap.mk_unpack(ty, UnpackKind::Args),
                 range,
                 type_form_context,
                 &tmp_collector,
@@ -8265,8 +8389,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         if matches!(type_form_context, TypeFormContext::TypeArgumentForType(_))
             && let Some(cls) = match &ty {
-                Type::ClassType(cls) | Type::SelfType(cls) => Some(cls.class_object().clone()),
-                Type::ClassDef(cls) => Some(cls.clone()),
+                Type::ClassType(cls) | Type::SelfType(cls) => Some(*cls.class_object()),
+                Type::ClassDef(cls) => Some(*cls),
                 _ => None,
             }
             && self.get_metadata_for_class(&cls).is_new_type()
@@ -8277,7 +8401,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::InvalidAnnotation,
                 format!(
                     "NewType `{}` is not a class and cannot be used with `type` or `Type`",
-                    cls.name()
+                    cls.name(self)
                 ),
             );
         }
@@ -8313,8 +8437,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let slice_ty = self.expr_infer(&x.slice, errors);
                 self.map_over_union(&base, |base| {
                     self.map_over_union(&slice_ty, |key| match (base, key) {
-                        (Type::TypedDict(typed_dict), key)
-                            if let Some(field_name) = self.literal_typed_dict_key_name(key) =>
+                        (Type::ClassType(typed_dict), key)
+                            if self.is_typed_dict_class(typed_dict.class_object())
+                                && let Some(field_name) = self.literal_typed_dict_key_name(key) =>
                         {
                             self.check_del_typed_dict_literal_key(
                                 typed_dict,
@@ -8323,16 +8448,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 errors,
                             );
                         }
-                        (Type::TypedDict(typed_dict), key)
-                            if self.is_subset_eq(
-                                key,
-                                &self.heap.mk_class_type(self.stdlib.str().clone()),
-                            ) && self
-                                .get_typed_dict_value_type_as_builtins_dict(typed_dict)
-                                .is_some() =>
+                        (Type::ClassType(typed_dict), key)
+                            if self.is_typed_dict_class(typed_dict.class_object())
+                                && self.is_subset_eq(
+                                    key,
+                                    &self.heap.mk_class_type(self.stdlib.str().clone()),
+                                )
+                                && self
+                                    .get_typed_dict_value_type_as_builtins_dict(typed_dict)
+                                    .is_some() =>
                         {
                             self.check_del_typed_dict_field(
-                                typed_dict.name(),
+                                typed_dict.name(self),
                                 None,
                                 false,
                                 false,
@@ -8340,6 +8467,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 errors,
                             )
                         }
+                        // An anonymous TypedDict has no required or read-only keys, so deleting
+                        // any key it can be indexed by is allowed.
+                        (Type::AnonymousTypedDict(typed_dict), key)
+                            if self.literal_typed_dict_key_name(key).is_some()
+                                || (self.is_subset_eq(
+                                    key,
+                                    &self.heap.mk_class_type(self.stdlib.str().clone()),
+                                ) && self
+                                    .get_anonymous_typed_dict_value_type_as_builtins_dict(
+                                        typed_dict,
+                                    )
+                                    .is_some()) => {}
                         (_, _) => {
                             self.call_method_or_error(
                                 base,
@@ -8449,7 +8588,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     "Cannot use scoped type alias `{}` as a base class. Use a legacy type alias instead: `{}: TypeAlias = {}`",
                     ta.name,
                     ta.name,
-                    self.for_display(ta.as_type())
+                    self.display(ta.as_type())
                 ),
             );
         }
@@ -8466,7 +8605,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::NotAType,
                 format!(
                     "Expected a type form, got instance of `{}`",
-                    self.for_display(inferred_ty),
+                    self.display(inferred_ty),
                 ),
             )
         })
@@ -8491,15 +8630,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return None;
         }
         let name = Name::new(value);
-        let module = self.module().name();
-        let (resolve_module, resolve_path) = if self.exports.export_exists(module, &name) {
-            (module, Some(self.module().path()))
+        let module = if self.exports.export_exists(self.module().name(), &name) {
+            LookupModule::Exact(self.module().key())
         } else if self.exports.export_exists(ModuleName::builtins(), &name) {
-            (ModuleName::builtins(), None)
+            LookupModule::Import(ModuleName::builtins())
         } else {
             return None;
         };
-        let export_ty = self.get_from_export(resolve_module, resolve_path, &KeyExport(name));
+        let export_ty = self.get_from_export(module, &KeyExport(name));
         let silent = ErrorCollector::new(errors.module().dupe(), ErrorStyle::Never);
         let ty = self.untype_opt((*export_ty).clone(), x.range(), &silent)?;
         let typeform_ty = self.heap.mk_typeform(ty);

@@ -260,16 +260,20 @@ pub enum OutputFormat {
 }
 
 impl ConfigSource {
-    /// The config root marked by a config or marker file
-    pub fn root_from_file(&self) -> Option<&Path> {
+    /// The config or marker file that this config comes from, if any.
+    pub fn file(&self) -> Option<&Path> {
         match self {
             Self::File(path)
             | Self::PythonToolMarker(path)
             | Self::Marker(path)
-            | Self::FailedParse(path) => path.parent(),
-            // Synthetic roots are deliberately excluded
+            | Self::FailedParse(path) => Some(path),
             Self::Synthetic(_) => None,
         }
+    }
+
+    /// The config root marked by a config or marker file
+    pub fn root_from_file(&self) -> Option<&Path> {
+        self.file()?.parent()
     }
 }
 
@@ -5558,7 +5562,7 @@ output-format = "omit-errors"
         );
     }
 
-    /// Regression test for facebook/pyrefly#3607. With
+    /// Regression test for pyrefly-org/pyrefly#3607. With
     /// `enable-fallback-search-path = true` in the config, `configure()` must
     /// populate `fallback_search_path` with a `DirectoryRelative` walk bounded
     /// by the config root, matching what build-system configs already do.
@@ -5590,7 +5594,7 @@ output-format = "omit-errors"
         }
     }
 
-    /// Regression test for facebook/pyrefly#3005. Mirrors the polars repro:
+    /// Regression test for pyrefly-org/pyrefly#3005. Mirrors the polars repro:
     /// a src-layout project where the import root is `src/` but a test file
     /// imports from `tests.conftest`. With `enable-fallback-search-path =
     /// true`, the file's parent directory walks up to the config root, which

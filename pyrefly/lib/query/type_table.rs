@@ -13,6 +13,7 @@ use pyrefly_types::callable::Param;
 use pyrefly_types::callable::ParamList;
 use pyrefly_types::callable::Params;
 use pyrefly_types::callable::PrefixParam;
+use pyrefly_types::class::ClassType;
 use pyrefly_types::heap::TypeHeap;
 use pyrefly_types::quantified::Quantified;
 use pyrefly_types::quantified::QuantifiedKind;
@@ -21,7 +22,7 @@ use pyrefly_types::tuple::Tuple;
 use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_types::type_var::Restriction;
 use pyrefly_types::type_var::ShapeExtensionRestriction;
-use pyrefly_types::typed_dict::TypedDict;
+use pyrefly_types::typed_dict::AnonymousTypedDictInner;
 use pyrefly_types::types::NeverStyle;
 use pyrefly_types::types::SuperObj;
 use pyrefly_types::types::Type;
@@ -271,7 +272,7 @@ pub(super) fn type_to_indexed_shape(
 ) -> usize {
     match ty {
         Type::ClassDef(cls) => {
-            let name = qname_to_string(cls.qname());
+            let name = qname_to_string(cls.qname(&context.type_env));
             let class_index = insert_indexed_named(
                 table,
                 name,
@@ -286,6 +287,9 @@ pub(super) fn type_to_indexed_shape(
             insert_indexed_named(table, "typing.Type", vec![inner], None, Vec::new())
         }
         Type::ClassType(class_type) => {
+            if context.is_typed_dict_class(class_type.class_object()) {
+                return typed_dict_to_indexed_shape(context, class_type, false, table);
+            }
             let args = class_type
                 .targs()
                 .as_slice()
@@ -294,17 +298,17 @@ pub(super) fn type_to_indexed_shape(
                 .collect::<Vec<_>>();
             insert_indexed_named(
                 table,
-                qname_to_string(class_type.qname()),
+                qname_to_string(class_type.qname(&context.type_env)),
                 args,
                 None,
                 Vec::new(),
             )
         }
-        Type::TypedDict(typed_dict) => {
-            typed_dict_to_indexed_shape(context, typed_dict, false, table)
+        Type::AnonymousTypedDict(typed_dict) => {
+            anonymous_typed_dict_to_indexed_shape(context, typed_dict, table)
         }
-        Type::PartialTypedDict(typed_dict) => {
-            typed_dict_to_indexed_shape(context, typed_dict, true, table)
+        Type::PartialTypedDict(class_type) => {
+            typed_dict_to_indexed_shape(context, class_type, true, table)
         }
         Type::Type(inner) => {
             let inner = type_to_indexed_shape(context, inner, table);
@@ -361,7 +365,10 @@ pub(super) fn type_to_indexed_shape(
             )
         }
         Type::Literal(literal) => {
-            let value = indexed_named_leaf(table, literal_value_shape_name(&literal.value));
+            let value = indexed_named_leaf(
+                table,
+                literal_value_shape_name(&context.type_env, &literal.value),
+            );
             insert_indexed_named(table, "typing.Literal", vec![value], None, Vec::new())
         }
         Type::Sentinel(sentinel) => {
@@ -402,7 +409,7 @@ pub(super) fn type_to_indexed_shape(
             );
             insert_indexed_named(table, "typing.Annotated", args, None, Vec::new())
         }
-        Type::Unpack(inner) => {
+        Type::Unpack(inner, _) => {
             let inner = type_to_indexed_shape(context, inner, table);
             insert_indexed_named(table, "typing.Unpack", vec![inner], None, Vec::new())
         }
@@ -455,7 +462,7 @@ pub(super) fn type_to_indexed_shape(
                 .collect::<Vec<_>>();
             insert_indexed_named(
                 table,
-                qname_to_string(class_type.qname()),
+                qname_to_string(class_type.qname(&context.type_env)),
                 args,
                 None,
                 Vec::new(),
@@ -499,45 +506,45 @@ pub(super) fn type_to_indexed_shape(
 
 fn typed_dict_to_indexed_shape(
     context: &TypeShapeContext,
-    typed_dict: &TypedDict,
+    typed_dict: &ClassType,
     is_partial: bool,
     table: &mut TypeTableBuilder,
 ) -> usize {
-    match typed_dict {
-        TypedDict::TypedDict(inner) => {
-            let args = inner
-                .targs()
-                .as_slice()
-                .iter()
-                .map(|ty| type_to_indexed_shape(context, ty, table))
-                .collect::<Vec<_>>();
-            insert_indexed_named(
-                table,
-                qname_to_string(inner.qname()),
-                args,
-                None,
-                typed_dict_traits(is_partial),
-            )
-        }
-        // An anonymous TypedDict has no class identity; structurally it is a
-        // `dict[str, <union of field value types>]` (all keys are string
-        // literals). Emit it as that dict -- matching the display string and a
-        // real dict -- so the structured shape keeps the field value types
-        // instead of collapsing to an opaque `TypedDictionary` marker.
-        TypedDict::Anonymous(inner) => {
-            let heap = TypeHeap::new();
-            let value_type = inner.compute_value_type(&heap);
-            let str_index = indexed_named_leaf(table, "builtins.str");
-            let value_index = type_to_indexed_shape(context, &value_type, table);
-            insert_indexed_named(
-                table,
-                "builtins.dict",
-                vec![str_index, value_index],
-                None,
-                Vec::new(),
-            )
-        }
-    }
+    let args = typed_dict
+        .targs()
+        .as_slice()
+        .iter()
+        .map(|ty| type_to_indexed_shape(context, ty, table))
+        .collect::<Vec<_>>();
+    insert_indexed_named(
+        table,
+        qname_to_string(typed_dict.qname(&context.type_env)),
+        args,
+        None,
+        typed_dict_traits(is_partial),
+    )
+}
+
+/// An anonymous TypedDict has no class identity; structurally it is a
+/// `dict[str, <union of field value types>]` (all keys are string literals). Emit it as
+/// that dict -- matching the display string and a real dict -- so the structured shape
+/// keeps the field value types instead of collapsing to an opaque `TypedDictionary` marker.
+fn anonymous_typed_dict_to_indexed_shape(
+    context: &TypeShapeContext,
+    typed_dict: &AnonymousTypedDictInner,
+    table: &mut TypeTableBuilder,
+) -> usize {
+    let heap = TypeHeap::new();
+    let value_type = typed_dict.compute_value_type(&heap, &context.type_env);
+    let str_index = indexed_named_leaf(table, "builtins.str");
+    let value_index = type_to_indexed_shape(context, &value_type, table);
+    insert_indexed_named(
+        table,
+        "builtins.dict",
+        vec![str_index, value_index],
+        None,
+        Vec::new(),
+    )
 }
 
 fn callable_to_indexed_shape(

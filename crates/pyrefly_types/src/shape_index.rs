@@ -11,6 +11,7 @@
 
 use crate::dimension::Int;
 use crate::dimension::ShapeError;
+use crate::dimension::ShapeMessage;
 use crate::known_class::KnownClass;
 use crate::quantified::QuantifiedKind;
 use crate::quantified::TypeVarLike;
@@ -271,7 +272,7 @@ fn lower_slice(ty: &Type) -> IndexTypeLowering {
 fn is_unresolved_tuple_middle(ty: &Type) -> bool {
     match ty {
         Type::Var(_) | Type::TypeVarTuple(_) => true,
-        Type::Unpack(inner) => is_unresolved_tuple_middle(inner),
+        Type::Unpack(inner, _) => is_unresolved_tuple_middle(inner),
         Type::Quantified(q) => q.kind() == QuantifiedKind::TypeVarTuple,
         _ => false,
     }
@@ -280,7 +281,7 @@ fn is_unresolved_tuple_middle(ty: &Type) -> bool {
 fn lower_integer_tuple(ty: &Type) -> IntegerTypeLowering {
     match ty {
         Type::Var(_) | Type::TypeVarTuple(_) => IntegerTypeLowering::Gradual,
-        Type::Unpack(inner) => lower_integer_tuple(inner),
+        Type::Unpack(inner, _) => lower_integer_tuple(inner),
         Type::Quantified(q) if q.kind() == QuantifiedKind::TypeVarTuple => {
             IntegerTypeLowering::Gradual
         }
@@ -550,7 +551,7 @@ pub fn lower_index_type(ty: &Type) -> IndexTypeLowering {
 /// produces a gradual shape, while algebra failures retain their indexing-specific diagnostic.
 pub fn index_shape_from_type(shape: &IntTuple, index: &Type) -> Result<IntTuple, ShapeError> {
     let bad_index = |error: ShapeError| ShapeError::BadIndex {
-        message: error.to_string(),
+        message: ShapeMessage::default().error(error),
     };
     let components = match lower_index_type(index) {
         IndexTypeLowering::Precise(components) => components,
@@ -560,13 +561,18 @@ pub fn index_shape_from_type(shape: &IntTuple, index: &Type) -> Result<IntTuple,
             // This branch only protects malformed internal calls, where solver display context
             // is unavailable.
             return Err(ShapeError::BadIndex {
-                message: format!("`{index}` is not a valid index value"),
+                message: ShapeMessage::default()
+                    .text("`")
+                    .ty(index.clone())
+                    .text("` is not a valid index value"),
             });
         }
     };
     if ellipsis_count(&components) > 1 {
         return Err(ShapeError::BadIndex {
-            message: "an index may contain at most one ellipsis".to_owned(),
+            message: "an index may contain at most one ellipsis"
+                .to_owned()
+                .into(),
         });
     }
     match components.as_slice() {
@@ -1051,24 +1057,22 @@ mod tests {
     use pyrefly_python::module::Module;
     use pyrefly_python::module_name::ModuleName;
     use pyrefly_python::module_path::ModulePath;
-    use pyrefly_python::nesting_context::NestingContext;
     use ruff_python_ast::Identifier;
     use ruff_python_ast::name::Name;
     use ruff_text_size::TextRange;
     use ruff_text_size::TextSize;
 
     use super::*;
-    use crate::class::Class;
-    use crate::class::ClassDefIndex;
     use crate::class::ClassType;
-    use crate::class::PrecomputedTParams;
     use crate::identity::IdentityIgnored;
     use crate::lit_int::LitInt;
     use crate::quantified::AnchorIndex;
     use crate::quantified::Quantified;
+    use crate::quantified::QuantifiedAnchor;
     use crate::quantified::QuantifiedIdentity;
     use crate::quantified::QuantifiedKind;
     use crate::quantified::QuantifiedOrigin;
+    use crate::test_type_env::TestTypeEnv;
     use crate::type_var::PreInferenceVariance;
     use crate::type_var::Restriction;
     use crate::type_var::TypeVar;
@@ -1122,9 +1126,10 @@ mod tests {
 
     #[test]
     fn known_unpacked_root_members_must_be_valid_indices() {
+        let env = TestTypeEnv::new();
         let index = Type::Tuple(Tuple::unpacked(
             vec![Type::Int(Int::Int)],
-            Type::unbounded_tuple(bare_builtin("str")),
+            Type::unbounded_tuple(bare_builtin(&env, "str")),
             Vec::new(),
         ));
         assert_eq!(lower_index_type(&index), IndexTypeLowering::Invalid);
@@ -1203,25 +1208,18 @@ mod tests {
         )
     }
 
-    fn bare_builtin(name: &str) -> Type {
+    fn bare_builtin(env: &TestTypeEnv, name: &str) -> Type {
         Type::ClassType(ClassType::new(
-            Class::new(
-                ClassDefIndex(0),
-                Identifier::new(Name::new(name), TextRange::empty(TextSize::new(0))),
-                NestingContext::toplevel(),
-                fake_module("builtins"),
-                PrecomputedTParams::NotGeneric,
-                false,
-                None,
-            ),
+            env.class("builtins", name),
             TArgs::default(),
         ))
     }
 
     #[test]
     fn bare_slice_is_valid_but_gradual() {
+        let env = TestTypeEnv::new();
         assert_eq!(
-            lower_index_type(&bare_builtin("slice")),
+            lower_index_type(&bare_builtin(&env, "slice")),
             IndexTypeLowering::Gradual
         );
     }
@@ -1246,7 +1244,7 @@ mod tests {
         Quantified::new(
             QuantifiedIdentity::new(
                 ModuleName::from_str("__test__"),
-                AnchorIndex::first(TextRange::default()),
+                AnchorIndex::first(QuantifiedAnchor::None),
                 QuantifiedOrigin::Pep695,
             ),
             Name::new(name),
@@ -1257,17 +1255,9 @@ mod tests {
         )
     }
 
-    fn generic_builtin(name: &str, argument: Type) -> Type {
+    fn generic_builtin(env: &TestTypeEnv, name: &str, argument: Type) -> Type {
         Type::ClassType(ClassType::new(
-            Class::new(
-                ClassDefIndex(0),
-                Identifier::new(Name::new(name), TextRange::empty(TextSize::new(0))),
-                NestingContext::toplevel(),
-                fake_module("builtins"),
-                PrecomputedTParams::NotGeneric,
-                false,
-                None,
-            ),
+            env.class("builtins", name),
             TArgs::new(
                 Arc::new(TParams::new(vec![fake_tparam(
                     "T",
@@ -1280,9 +1270,10 @@ mod tests {
 
     #[test]
     fn nested_unbounded_integer_sequences_preserve_other_operations() {
+        let env = TestTypeEnv::new();
         for sequence in [
-            Type::unbounded_tuple(bare_builtin("int")),
-            generic_builtin("list", bare_builtin("int")),
+            Type::unbounded_tuple(bare_builtin(&env, "int")),
+            generic_builtin(&env, "list", bare_builtin(&env, "int")),
         ] {
             let index = Type::Tuple(Tuple::Concrete(vec![Type::None, sequence, size(0)]));
             assert_eq!(

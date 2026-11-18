@@ -573,7 +573,10 @@ export default function Sandbox({
                     </button>
                 )}
             </div>
-            <label {...stylex.props(styles.parameterHintToggle)}>
+            <label
+                {...stylex.props(styles.parameterHintToggle)}
+                title="Show parameter names at call sites"
+            >
                 <input
                     id="parameter-hints-toggle"
                     type="checkbox"
@@ -587,7 +590,7 @@ export default function Sandbox({
             {pyreflyVersion && pyreflyCommit && (
                 <a
                     id="pyrefly-build"
-                    href={`https://github.com/facebook/pyrefly/commit/${pyreflyCommit}`}
+                    href={`https://github.com/pyrefly-org/pyrefly/commit/${pyreflyCommit}`}
                     title={`Pyrefly ${pyreflyVersion}, commit ${pyreflyCommit}`}
                     target="_blank"
                     rel="noopener noreferrer"
@@ -1401,7 +1404,7 @@ function getGitHubIssuesButton(
                 ].join('\n');
 
                 const baseIssueURL =
-                    'https://github.com/facebook/pyrefly/issues/new' +
+                    'https://github.com/pyrefly-org/pyrefly/issues/new' +
                     `?template=issue_template.yml` +
                     `&labels=bug` +
                     `&title=${encodeURIComponent(title)}` +

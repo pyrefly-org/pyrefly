@@ -35,8 +35,9 @@ use pyrefly_types::read_only::IsFinalVariableInitialized;
 use pyrefly_types::simplify::unions;
 use pyrefly_types::type_var::PreInferenceVariance;
 use pyrefly_types::type_var::Restriction;
-use pyrefly_types::typed_dict::TypedDictInner;
 use pyrefly_types::types::TParams;
+use pyrefly_util::display::DisplayWith;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::owner::Owner;
 use pyrefly_util::prelude::ResultExt;
 use pyrefly_util::visit::Visit;
@@ -91,6 +92,7 @@ use crate::types::class::ClassKind;
 use crate::types::class::ClassType;
 use crate::types::display::LspDisplayMode;
 use crate::types::display::TypeDisplayContext;
+use crate::types::env::TypeEnv;
 use crate::types::function::FuncMetadata;
 use crate::types::function::Function;
 use crate::types::function::PropertyMetadata;
@@ -100,6 +102,7 @@ use crate::types::keywords::TypeMap;
 use crate::types::literal::Lit;
 use crate::types::quantified::AnchorIndex;
 use crate::types::quantified::Quantified;
+use crate::types::quantified::QuantifiedAnchor;
 use crate::types::quantified::QuantifiedIdentity;
 use crate::types::quantified::QuantifiedOrigin;
 use crate::types::read_only::ReadOnlyReason;
@@ -462,19 +465,25 @@ enum IsInherited {
     Maybe,
 }
 
-impl Display for ClassField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for ClassField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         match &self.0 {
-            ClassFieldInner::Property { ty, .. } => write!(f, "{ty} (property)"),
-            ClassFieldInner::Descriptor { ty, .. } => write!(f, "{ty} (descriptor)"),
-            ClassFieldInner::Method { ty, .. } => write!(f, "{ty} (method)"),
+            ClassFieldInner::Property { ty, .. } => {
+                write!(f, "{} (property)", ty.display_with(env))
+            }
+            ClassFieldInner::Descriptor { ty, .. } => {
+                write!(f, "{} (descriptor)", ty.display_with(env))
+            }
+            ClassFieldInner::Method { ty, .. } => write!(f, "{} (method)", ty.display_with(env)),
             ClassFieldInner::ProxyMethod { target, .. } => write!(f, "ProxyMethod[{target}]"),
-            ClassFieldInner::NestedClass { ty, .. } => write!(f, "{ty} (nested class)"),
+            ClassFieldInner::NestedClass { ty, .. } => {
+                write!(f, "{} (nested class)", ty.display_with(env))
+            }
             ClassFieldInner::ClassAttribute {
                 ty, initialization, ..
-            } => write!(f, "{ty} ({initialization})"),
+            } => write!(f, "{} ({initialization})", ty.display_with(env)),
             ClassFieldInner::InstanceAttribute { ty, .. } => {
-                write!(f, "{ty} (instance attribute)")
+                write!(f, "{} (instance attribute)", ty.display_with(env))
             }
         }
     }
@@ -766,9 +775,9 @@ impl ClassField {
         }
     }
 
-    fn instantiate_for(&self, heap: &TypeHeap, instance: &Instance) -> Self {
+    fn instantiate_for(&self, heap: &TypeHeap, instance: &Instance, env: &dyn TypeEnv) -> Self {
         self.instantiate_helper(&mut |ty| {
-            ty.subst_self_type_mut(&instance.to_type(heap));
+            ty.subst_self_type_mut(&instance.to_type(heap, env));
             instance.instantiate_member(ty)
         })
     }
@@ -830,8 +839,13 @@ impl ClassField {
         })
     }
 
-    fn as_raw_special_method_type(&self, heap: &TypeHeap, instance: &Instance) -> Option<Type> {
-        match self.instantiate_for(heap, instance).0 {
+    fn as_raw_special_method_type(
+        &self,
+        heap: &TypeHeap,
+        instance: &Instance,
+        env: &dyn TypeEnv,
+    ) -> Option<Type> {
+        match self.instantiate_for(heap, instance, env).0 {
             ClassFieldInner::Descriptor { ty, .. } => Some(ty),
             ClassFieldInner::Method { ty, .. } => Some(ty),
             // `ProxyMethod` is currently only used by ordinary attribute lookup and `__call__`
@@ -855,7 +869,7 @@ impl ClassField {
         solver: &AnswersSolver<Ans>,
         instance: &Instance,
     ) -> Option<Type> {
-        self.as_raw_special_method_type(solver.heap, instance)
+        self.as_raw_special_method_type(solver.heap, instance, solver)
             .and_then(|ty| make_bound_method(solver, instance, ty).ok())
     }
 
@@ -959,7 +973,8 @@ impl ClassField {
         }
     }
 
-    pub fn as_typed_dict_field_info(&self, required_by_default: bool) -> Option<TypedDictField> {
+    /// The declared type and qualifiers of this field, if it is annotated like a TypedDict field.
+    fn typed_dict_annotation(&self) -> Option<(&Type, &[Qualifier])> {
         match &self.0 {
             ClassFieldInner::ClassAttribute {
                 annotation:
@@ -968,46 +983,41 @@ impl ClassField {
                         qualifiers,
                     }),
                 ..
-            } => Some(TypedDictField {
-                ty: ty.clone(),
-                read_only_reason: if qualifiers.contains(&Qualifier::ReadOnly) {
-                    Some(ReadOnlyReason::ReadOnlyQualifier)
-                } else {
-                    None
-                },
-                required: if qualifiers.contains(&Qualifier::Required) {
-                    true
-                } else if qualifiers.contains(&Qualifier::NotRequired) {
-                    false
-                } else {
-                    required_by_default
-                },
-            }),
-            ClassFieldInner::InstanceAttribute {
+            }
+            | ClassFieldInner::InstanceAttribute {
                 annotation:
                     Some(Annotation {
                         ty: Some(ty),
                         qualifiers,
                     }),
                 ..
-            } => Some(TypedDictField {
-                ty: ty.clone(),
-                read_only_reason: if qualifiers.contains(&Qualifier::ReadOnly) {
-                    Some(ReadOnlyReason::ReadOnlyQualifier)
-                } else {
-                    None
-                },
-                required: if qualifiers.contains(&Qualifier::Required) {
-                    true
-                } else if qualifiers.contains(&Qualifier::NotRequired) {
-                    false
-                } else {
-                    required_by_default
-                },
-            }),
-            ClassFieldInner::Property { .. } => None,
+            } => Some((ty, qualifiers.as_slice())),
             _ => None,
         }
+    }
+
+    /// Whether this TypedDict field is required, or `None` if this is not a TypedDict field.
+    /// Unlike `as_typed_dict_field_info`, this does not clone the field's type, which can be large.
+    pub fn is_required_typed_dict_field(&self, required_by_default: bool) -> Option<bool> {
+        let (_, qualifiers) = self.typed_dict_annotation()?;
+        Some(if qualifiers.contains(&Qualifier::Required) {
+            true
+        } else if qualifiers.contains(&Qualifier::NotRequired) {
+            false
+        } else {
+            required_by_default
+        })
+    }
+
+    pub fn as_typed_dict_field_info(&self, required_by_default: bool) -> Option<TypedDictField> {
+        let (ty, qualifiers) = self.typed_dict_annotation()?;
+        Some(TypedDictField {
+            ty: ty.clone(),
+            read_only_reason: qualifiers
+                .contains(&Qualifier::ReadOnly)
+                .then_some(ReadOnlyReason::ReadOnlyQualifier),
+            required: self.is_required_typed_dict_field(required_by_default)?,
+        })
     }
 
     fn is_dataclass_kwonly_marker(&self) -> bool {
@@ -1326,8 +1336,9 @@ fn bind_class_attribute(
     attr: Type,
     read_only_reason: Option<ReadOnlyReason>,
     is_instance_var: bool,
+    env: &dyn TypeEnv,
 ) -> ClassAttribute {
-    let ty = make_bound_classmethod(heap, cls, attr).into_inner();
+    let ty = make_bound_classmethod(heap, cls, attr, env).into_inner();
     if let Some(reason) = read_only_reason {
         ClassAttribute::read_only(ty, reason)
     } else if is_instance_var {
@@ -1343,6 +1354,7 @@ fn make_bound_method_helper(
     obj: Type,
     attr: Type,
     should_bind: &dyn Fn(&FuncMetadata) -> bool,
+    env: &dyn TypeEnv,
 ) -> Result<Type, Type> {
     // Don't bind functions originating from callback protocols, because the self param
     // has already been removed.
@@ -1381,21 +1393,26 @@ fn make_bound_method_helper(
                     bound_methods.push(t.clone());
                     continue;
                 }
-                match make_bound_method_helper(heap, obj.clone(), t.clone(), should_bind) {
+                match make_bound_method_helper(heap, obj.clone(), t.clone(), should_bind, env) {
                     Ok(x) => bound_methods.push(x),
                     Err(_) => return Err(attr),
                 }
             }
-            return Ok(unions(bound_methods, heap));
+            return Ok(unions(bound_methods, env, heap));
         }
         _ => return Err(attr),
     };
     Ok(heap.mk_bound_method(BoundMethod { obj, func }))
 }
 
-fn make_bound_classmethod(heap: &TypeHeap, cls: &ClassBase, attr: Type) -> Result<Type, Type> {
+fn make_bound_classmethod(
+    heap: &TypeHeap,
+    cls: &ClassBase,
+    attr: Type,
+    env: &dyn TypeEnv,
+) -> Result<Type, Type> {
     let should_bind = |meta: &FuncMetadata| meta.flags.is_classmethod;
-    make_bound_method_helper(heap, cls.clone().to_type(heap), attr, &should_bind)
+    make_bound_method_helper(heap, cls.clone().to_type(heap), attr, &should_bind, env)
 }
 
 fn make_bound_method<Ans: LookupAnswer>(
@@ -1406,7 +1423,7 @@ fn make_bound_method<Ans: LookupAnswer>(
     let heap = solver.heap;
     let should_bind =
         |meta: &FuncMetadata| !meta.flags.is_staticmethod && !meta.flags.is_classmethod;
-    make_bound_method_helper(heap, instance.to_type(heap), attr, &should_bind).map(|mut method| {
+    make_bound_method_helper(heap, instance.to_type(heap, solver), attr, &should_bind, solver).map(|mut method| {
         if let InstanceKind::TypeVar(q) = &instance.kind
             && let Restriction::Constraints(constraints) = q.restriction()
         {
@@ -1433,12 +1450,12 @@ fn make_bound_method<Ans: LookupAnswer>(
                         || matches!(ty, Type::Union(union) if union.members.iter().any(is_constraint))
                         || (solver.is_subset_eq(&class_type, ty) && *typevar_is_class)
                     {
-                        *ty = unions(vec![ty.clone(), q.clone().to_type(heap)], heap);
+                        *ty = unions(vec![ty.clone(), q.clone().to_type(heap)], solver, heap);
                     }
                 });
                 if is_constraint(&callable.ret) {
                     // A return type that matches the active constraint preserves the TypeVar.
-                    callable.ret = instance.to_type(heap);
+                    callable.ret = instance.to_type(heap, solver);
                 }
             });
         }
@@ -1610,7 +1627,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
         let callee_kind = self
             .expr_infer(&call.func, &self.error_swallower())
-            .callee_kind();
+            .callee_kind(self);
         if matches!(
             &callee_kind,
             Some(CalleeKind::Function(FunctionKind::DataclassField))
@@ -2181,6 +2198,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ClassFieldDefinition::MethodLike {
                 definition,
                 has_return_annotation,
+                may_be_abstract: _,
                 annotation: annot,
             } => {
                 let direct_annotation = annot.map(|a| self.get_idx(a).annotation.clone());
@@ -2406,10 +2424,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         ) {
             match &ty {
                 Type::ClassType(cls) => {
-                    let cls = cls.class_object();
-                    let has_getter = self.get_class_member(cls, &dunder::GET).is_some();
-                    let has_setter = self.get_class_member(cls, &dunder::SET).is_some();
-                    let has_deleter = self.get_class_member(cls, &dunder::DELETE).is_some();
+                    let has_getter = self.has_instance_special_method(cls, &dunder::GET);
+                    let has_setter = self.has_instance_special_method(cls, &dunder::SET);
+                    let has_deleter = self.has_instance_special_method(cls, &dunder::DELETE);
                     // A getter-only annotation that is initialized on the instance does not
                     // install a descriptor on the class. Keep data-descriptor behavior,
                     // however, for metaclass-powered fields such as SQLAlchemy's `Mapped[T]`.
@@ -2417,8 +2434,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         || has_deleter
                         || has_getter && !is_annotation_initialized_in_method
                     {
-                        descriptor_info =
-                            Some(((has_getter, has_setter, has_deleter), ty.clone()));
+                        descriptor_info = Some(((has_getter, has_setter, has_deleter), ty.clone()));
                     }
                 }
                 // Only members with `__get__` participate in descriptor reads. A member with only
@@ -2428,7 +2444,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     if !is_annotation_initialized_in_method
                         && union.members.iter().any(|member| {
                             matches!(member, Type::ClassType(cls)
-                                if self.get_class_member(cls.class_object(), &dunder::GET).is_some())
+                                if self.has_instance_special_method(cls, &dunder::GET))
                         }) =>
                 {
                     descriptor_union = true;
@@ -2449,9 +2465,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         ) {
             // Preserve descriptor behavior when specialization returns a descriptor instance.
             descriptor_info = if let Type::ClassType(cls) = &special_ty {
-                let getter = self.get_instance_attribute(cls, &dunder::GET).is_some();
-                let setter = self.get_instance_attribute(cls, &dunder::SET).is_some();
-                let deleter = self.get_instance_attribute(cls, &dunder::DELETE).is_some();
+                let getter = self
+                    .get_instance_special_method(cls, &dunder::GET)
+                    .is_some();
+                let setter = self
+                    .get_instance_special_method(cls, &dunder::SET)
+                    .is_some();
+                let deleter = self
+                    .get_instance_special_method(cls, &dunder::DELETE)
+                    .is_some();
                 (getter || setter || deleter)
                     .then(|| ((getter, setter, deleter), special_ty.clone()))
             } else {
@@ -2470,9 +2492,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         //
         // TODO(stroxler): Ideally we would implement some simple heuristics, similar to
         // first-use based inference we use with assignments, to get more useful types here.
-        let ty = self.solver().force(ty);
+        let ty = self.solver().force(ty, self);
         let descriptor = descriptor_info.map(|((getter, setter, deleter), descriptor_type)| {
-            let Type::ClassType(cls) = self.solver().force(descriptor_type) else {
+            let Type::ClassType(cls) = self.solver().force(descriptor_type, self) else {
                 unreachable!("a detected descriptor must have a class type")
             };
             Descriptor {
@@ -2765,7 +2787,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             && let Some(allowed_slots) = self.effective_slots_for_instance_write(class)
             && !allowed_slots.contains::<Name>(name)
         {
-            let class_name = class.name();
+            let class_name = class.name(self);
             self.error_with_context(
                 errors,
                 range,
@@ -2906,7 +2928,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let errors = self.error_swallower();
         let callee_ty = self.expr_infer(&call.func, &errors);
         if !matches!(
-            callee_ty.callee_kind(),
+            callee_ty.callee_kind(self),
             Some(CalleeKind::Class(ClassKind::Property(_)))
         ) {
             return None;
@@ -3145,7 +3167,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // Coerce the callable to a function so we can later attach property metadata.
                 Some(Type::Function(Box::new(Function {
                     signature: *callable,
-                    metadata: FuncMetadata::method(class, name.clone()),
+                    metadata: FuncMetadata::method(self, class, name.clone()),
                 })))
             }
             ty => Some(ty),
@@ -3416,7 +3438,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         {
             let field_ty = self.attribute_expr_infer(expr, None, name, &self.error_swallower());
             if matches!(&field_ty, Type::ClassType(cls)
-                if self.get_class_member(cls.class_object(), &dunder::GET).is_some())
+                if self.has_instance_special_method(cls, &dunder::GET))
             {
                 // The initializer installs a descriptor, whose instance contract is checked by the
                 // override check. The inherited value annotation cannot type its initializer.
@@ -3446,6 +3468,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 self.heap,
                                 &ClassBase::ClassDef(self.as_class_type_unchecked(class)),
                                 inherited_ty,
+                                self,
                             )
                             .into_inner()
                         } else {
@@ -3538,7 +3561,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // so we can ignore any errors encountered here.
         let ignore_errors = self.error_swallower();
         let func_ty = self.expr_infer(func, &ignore_errors);
-        let func_kind = func_ty.callee_kind();
+        let func_kind = func_ty.callee_kind(self);
         if let Some(func_kind) = func_kind
             && dm.kind.field_specifiers().contains(&func_kind)
         {
@@ -3727,7 +3750,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         "Attribute `{}` cannot depend on type variable `{}`, which is not in the scope of class `{}`",
                         name,
                         q.name(),
-                        class.name(),
+                        class.name(self),
                     ),
                 );
                 (qs_owner.push((*q).clone()), ts.push(q.as_gradual_type()))
@@ -3742,13 +3765,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// Creates a Quantified for a class's "self" type.
     fn get_self_quantified(&self, class: &Class, instance_type: Type) -> Quantified {
         let identity = QuantifiedIdentity::new(
-            self.module().name(),
-            AnchorIndex::first(class.range()),
+            class.module_name(),
+            AnchorIndex::first(QuantifiedAnchor::Class(class.index())),
             QuantifiedOrigin::Synthetic { is_self: true },
         );
         Quantified::new(
             identity,
-            Name::new(format!("Self@{}", class.name())),
+            Name::new(format!("Self@{}", class.name(self))),
             QuantifiedKind::TypeVar,
             None,
             Restriction::Bound(instance_type),
@@ -3859,7 +3882,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // special case because it's not legal to use `Self` in other static methods.
         let self_quantified =
             if field_name == &dunder::NEW && matches!(instance.kind, InstanceKind::ClassType(_)) {
-                Some(self.get_self_quantified(instance.class, instance.to_type(self.heap)))
+                Some(self.get_self_quantified(instance.class, instance.to_type(self.heap, self)))
             } else {
                 None
             };
@@ -3871,7 +3894,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             },
             None => instance,
         };
-        match field.instantiate_for(self.heap, instance).0 {
+        match field.instantiate_for(self.heap, instance, self).0 {
             ClassFieldInner::Property { ty, .. } => {
                 // Properties on instances bind to the getter/setter
                 if let Some(getter) = ty.is_property_setter_with_getter() {
@@ -3891,13 +3914,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
             }
             ClassFieldInner::Descriptor { descriptor, .. } => {
-                if let Some(base) = instance.to_descriptor_base() {
-                    ClassAttribute::descriptor(descriptor, base)
-                } else {
-                    // Unreachable because only TypedDicts can hit this, and we never
-                    // construct Descriptors for typed dicts.
-                    unreachable!("A descriptor attribute should always have a valid base")
-                }
+                ClassAttribute::descriptor(descriptor, instance.to_descriptor_base())
             }
             ClassFieldInner::Method {
                 mut ty,
@@ -3925,7 +3942,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ty = self.wrap_with_quantified(ty, quantified);
                 }
                 let ty = make_bound_method(self, instance, ty).unwrap_or_else(|ty| {
-                    make_bound_classmethod(self.heap, &instance.to_class_base(), ty).into_inner()
+                    make_bound_classmethod(self.heap, &instance.to_class_base(), ty, self)
+                        .into_inner()
                 });
                 if is_classvar {
                     ClassAttribute::read_only(ty, ReadOnlyReason::ClassVar)
@@ -3982,21 +4000,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     };
                 }
                 match (descriptor_union, ty) {
-                    (true, Type::Union(union)) => {
-                        let Some(base) = instance.to_descriptor_base() else {
-                            // Unreachable because only TypedDicts can hit this, and we never construct
-                            // descriptor reads for typed dicts.
-                            unreachable!(
-                                "descriptor reads cannot be constructed for TypedDict instances"
-                            )
-                        };
-                        ClassAttribute::DescriptorRead {
-                            union,
-                            base,
-                            read_only_reason,
-                            is_instance_var: false,
-                        }
-                    }
+                    (true, Type::Union(union)) => ClassAttribute::DescriptorRead {
+                        union,
+                        base: instance.to_descriptor_base(),
+                        read_only_reason,
+                        is_instance_var: false,
+                    },
                     (_, ty) => {
                         if let Some(reason) = read_only_reason {
                             ClassAttribute::read_only(ty, reason)
@@ -4060,7 +4069,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ClassFieldInner::Property { mut ty, .. } => {
                 // When accessing a property on a class (not instance), you get the property object itself
                 ty = self.normalize_attr_ty(ty);
-                bind_class_attribute(self.heap, cls, ty, None, false)
+                bind_class_attribute(self.heap, cls, ty, None, false, self)
             }
             ClassFieldInner::Descriptor { descriptor, .. } => {
                 ClassAttribute::descriptor(descriptor, DescriptorBase::ClassDef(cls.clone()))
@@ -4083,7 +4092,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ty = self.wrap_with_quantified(ty, quantified);
                 }
                 ClassAttribute::ReadWrite {
-                    read_type: make_bound_classmethod(self.heap, cls, ty).into_inner(),
+                    read_type: make_bound_classmethod(self.heap, cls, ty, self).into_inner(),
                     is_method: IsMethod::Yes,
                     is_instance_var: false,
                     write_type: None,
@@ -4101,6 +4110,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ty,
                     Some(ReadOnlyReason::ClassObjectInitializedOnBody),
                     false,
+                    self,
                 )
             }
             ClassFieldInner::ClassAttribute {
@@ -4137,6 +4147,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ty,
                             read_only_reason,
                             is_instance_var,
+                            self,
                         ),
                     }
                 }
@@ -4280,8 +4291,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadTypedDictKey,
                     format!(
                         "TypedDict field `{field_name}` in `{}` cannot be marked read-only; parent TypedDict `{}` defines it as mutable",
-                        child_cls.name(),
-                        parent_cls.name()
+                        child_cls.name(self),
+                        parent_cls.name(self)
                     ),
                 );
                 return false;
@@ -4293,8 +4304,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadTypedDictKey,
                     format!(
                         "TypedDict field `{field_name}` in `{}` must remain required because parent TypedDict `{}` defines it as required",
-                        child_cls.name(),
-                        parent_cls.name()
+                        child_cls.name(self),
+                        parent_cls.name(self)
                     ),
                 );
                 return false;
@@ -4306,8 +4317,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadTypedDictKey,
                     format!(
                         "TypedDict field `{field_name}` in `{}` cannot be made required; parent TypedDict `{}` defines it as non-required",
-                        child_cls.name(),
-                        parent_cls.name()
+                        child_cls.name(self),
+                        parent_cls.name(self)
                     ),
                 );
                 return false;
@@ -4319,8 +4330,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::BadTypedDictKey,
                 format!(
                     "TypedDict field `{field_name}` in `{}` cannot be made non-required; parent TypedDict `{}` defines it as required",
-                    child_cls.name(),
-                    parent_cls.name()
+                    child_cls.name(self),
+                    parent_cls.name(self)
                 ),
             );
             return false;
@@ -4457,7 +4468,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::MissingSuperCall,
                 format!(
                     "Method `{}.{}` does not call the method of the same name in a parent class",
-                    cls.name(),
+                    cls.name(self),
                     field_name,
                 ),
             );
@@ -4567,7 +4578,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // signature is written to be implemented rather than inherited.
             if field_name == &dunder::CALL
                 && !is_explicit_override
-                && !want_field.defining_class.is_protocol()
+                && !want_field.defining_class.is_protocol(self)
             {
                 continue;
             }
@@ -4586,7 +4597,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     format!(
                         "`{}` is declared as final in parent class `{}`",
                         field_name,
-                        parent.name()
+                        parent.name(self)
                     ),
                 );
                 continue;
@@ -4601,9 +4612,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::BadOverride,
                             format!(
                                 "Instance variable `{}.{}` overrides ClassVar of the same name in parent class `{}`",
-                                cls.name(),
+                                cls.name(self),
                                 field_name,
-                                parent.name()
+                                parent.name(self)
                             ),
                         );
                     continue;
@@ -4614,9 +4625,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::BadOverride,
                             format!(
                                 "ClassVar `{}.{}` overrides instance variable of the same name in parent class `{}`",
-                                cls.name(),
+                                cls.name(self),
                                 field_name,
-                                parent.name()
+                                parent.name(self)
                             ),
                         );
                     continue;
@@ -4655,10 +4666,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadOverride,
                     format!(
                         "Instance method `{}.{}` overrides {} method of the same name in parent class `{}`",
-                        cls.name(),
+                        cls.name(self),
                         field_name,
                         parent_method_kind,
-                        parent.name(),
+                        parent.name(self),
                     ),
                 );
                 continue;
@@ -4902,7 +4913,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         let got_sigs = got.toplevel_callable_signatures();
                         let want_sigs = want.toplevel_callable_signatures();
                         if got_sigs.exactly_one().is_ok() && want_sigs.exactly_one().is_ok() {
-                            let mut ctx = TypeDisplayContext::new(&[got, want]);
+                            let mut ctx = TypeDisplayContext::new(self, &[got, want]);
                             ctx.set_lsp_display_mode(LspDisplayMode::SignatureHelp);
                             let got_sig = ctx.display(got).to_string();
                             let want_sig = ctx.display(want).to_string();
@@ -4933,7 +4944,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         } else {
                             ErrorKind::BadOverride
                         },
-                        message: error.to_error_msg(cls.name(), parent.name(), field_name),
+                        message: error.to_error_msg(
+                            self,
+                            cls.name(self),
+                            parent.name(self),
+                            field_name,
+                        ),
                         diff_lines,
                     })
                 }
@@ -4951,9 +4967,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         kind,
                         format!(
                             "Class member `{}.{}` overrides parent class `{}` in an inconsistent manner",
-                            cls.name(),
+                            cls.name(self),
                             field_name,
-                            parent.name()
+                            parent.name(self)
                         ),
                     )
                     .with_detail(message);
@@ -4970,7 +4986,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadOverride,
                     format!(
                         "Class member `{}.{}` is marked as an override, but no parent class has a matching attribute",
-                        cls.name(),
+                        cls.name(self),
                         field_name,
                     ),
                 );
@@ -4993,7 +5009,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::MissingOverrideDecorator,
                 format!(
                     "Class member `{}.{}` overrides a member in a parent class but is missing an `@override` decorator",
-                    cls.name(),
+                    cls.name(self),
                     field_name,
                 ),
             );
@@ -5081,7 +5097,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if intersect.is_never() {
                     let mut builder = errors
                         .error_builder(
-                            cls.range(),
+                            cls.range(self),
                             ErrorKind::InconsistentInheritance,
                             format!(
                                 "Field `{field_name}` has inconsistent types inherited from multiple base classes"
@@ -5091,8 +5107,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     for info in inherited_field_infos_by_ancestor.iter() {
                         builder = builder.with_detail(format!(
                             "  `{}` from `{}`",
-                            self.for_display(info.ty.clone()),
-                            info.class.name()
+                            self.display(info.ty.clone()),
+                            info.class.name(self)
                         ));
                     }
                     builder.emit();
@@ -5107,13 +5123,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         {
                             self.error(
                                 errors,
-                                cls.range(),
+                                cls.range(self),
                                 ErrorKind::InconsistentInheritance,
                                 format!(
                                     "Field `{field_name}` is declared `{}` in ancestor `{}`, which is not assignable to the type `{}` implied by multiple inheritance",
-                                    info.ty,
-                                    info.class,
-                                    intersect,
+                                    info.ty.display_with(self),
+                                    info.class.def(self),
+                                    intersect.display_with(self),
                                 ),
                             );
                         }
@@ -5141,7 +5157,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 field_name,
                                 child_field.as_ref(),
                                 info.field.as_ref(),
-                                cls.range(),
+                                cls.range(self),
                                 errors,
                             )
                         {
@@ -5355,6 +5371,31 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .map(|field| self.as_instance_attribute(name, field.as_ref(), &Instance::of_class(cls)))
     }
 
+    /// Look up a special method, such as `__call__` or `__get__`, on instances of `cls`. A
+    /// TypedDict's keys are dictionary entries rather than attributes, so a key named like a
+    /// special method does not define one. The TypedDict check runs only once a member is found,
+    /// so a class without the method needs no `ClassMetadata`.
+    pub fn get_instance_special_method(
+        &self,
+        cls: &ClassType,
+        name: &Name,
+    ) -> Option<ClassAttribute> {
+        let attr = self.get_instance_attribute(cls, name)?;
+        if self.is_typed_dict_class(cls.class_object()) {
+            self.get_typed_dict_attribute(cls, name)
+        } else {
+            Some(attr)
+        }
+    }
+
+    /// Whether instances of `cls` have the special method `name`, as `get_instance_special_method`
+    /// decides it.
+    fn has_instance_special_method(&self, cls: &ClassType, name: &Name) -> bool {
+        self.get_class_member(cls.class_object(), name).is_some()
+            && (!self.is_typed_dict_class(cls.class_object())
+                || self.get_typed_dict_attribute(cls, name).is_some())
+    }
+
     pub fn get_self_attribute(&self, cls: &ClassType, name: &Name) -> Option<ClassAttribute> {
         let metadata = self.get_metadata_for_class(cls.class_object());
         self.special_case_enum_attr_lookup(cls, None, metadata, name)
@@ -5405,7 +5446,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 continue;
             };
             let instance = Instance::of_protocol(ancestor, derived_instance.clone());
-            let instantiated = field.instantiate_for(self.heap, &instance);
+            let instantiated = field.instantiate_for(self.heap, &instance, self);
             if let Some(mapped) = accept(instantiated.ty()) {
                 return Some(mapped);
             }
@@ -5538,11 +5579,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// Get a non-field attribute of a TypedDict instance. TypedDict fields are dict key
     /// declarations and are not accessible as attributes. However, if a field name shadows
     /// a dict method (e.g. `values`, `items`, `keys`), the method should still be accessible.
-    pub fn get_typed_dict_attribute(
-        &self,
-        td: &TypedDictInner,
-        name: &Name,
-    ) -> Option<ClassAttribute> {
+    pub fn get_typed_dict_attribute(&self, td: &ClassType, name: &Name) -> Option<ClassAttribute> {
         if let Some(meta) = self
             .get_metadata_for_class(td.class_object())
             .typed_dict_metadata()
@@ -5581,7 +5618,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// The returned type does not encode requiredness information (that is stored as qualifiers).
     pub(in crate::alt::class) fn instantiate_typed_dict_field_type(
         &self,
-        td: &TypedDictInner,
+        td: &ClassType,
         name: &Name,
         member: &ClassField,
     ) -> Option<Type> {
@@ -5745,7 +5782,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             };
             let new_ty = new_member
                 .value
-                .as_raw_special_method_type(self.heap, &instance)?;
+                .as_raw_special_method_type(self.heap, &instance, self)?;
             Some(new_ty)
         }
     }
@@ -5799,16 +5836,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return None;
         }
         field
-            .as_raw_special_method_type(self.heap, &Instance::of_class(cls))
+            .as_raw_special_method_type(self.heap, &Instance::of_class(cls), self)
             .map(|ty| {
-                match make_bound_classmethod(self.heap, &ClassBase::ClassType(cls.clone()), ty) {
+                match make_bound_classmethod(
+                    self.heap,
+                    &ClassBase::ClassType(cls.clone()),
+                    ty,
+                    self,
+                ) {
                     Ok(bound_classmethod) => bound_classmethod,
                     Err(ty) => ty,
                 }
             })
     }
 
-    pub fn get_typed_dict_dunder_init(&self, td: &TypedDictInner) -> Type {
+    pub fn get_typed_dict_dunder_init(&self, td: &ClassType) -> Type {
         // We synthesize `__init__`, so the lookup will never entirely fail.
         //
         // But if the user defined an `__init__` directly on the typed dict - which is always
@@ -5846,14 +5888,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         } else {
             let instance = Instance::of_metaclass(ClassBase::ClassType(cls.clone()), metaclass);
             attr.value
-                .as_raw_special_method_type(self.heap, &instance)
+                .as_raw_special_method_type(self.heap, &instance, self)
                 .and_then(|ty| make_bound_method(self, &instance, ty).ok())
         }
     }
 
     pub fn resolve_named_tuple_element(&self, cls: &ClassType, name: &Name) -> Option<Type> {
         let field = self.get_class_member(cls.class_object(), name)?;
-        match field.instantiate_for(self.heap, &Instance::of_class(cls)).0 {
+        match field
+            .instantiate_for(self.heap, &Instance::of_class(cls), self)
+            .0
+        {
             ClassFieldInner::ClassAttribute {
                 ty,
                 read_only_reason: Some(_),
@@ -5911,7 +5956,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     errors,
                     range,
                     ErrorKind::NoAccess,
-                    e.to_error_msg(attr_name),
+                    e.to_error_msg(self, attr_name),
                     context,
                 );
                 None
@@ -6032,7 +6077,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         range,
                         ErrorKind::ReadOnly,
-                        e.to_error_msg(attr_name),
+                        e.to_error_msg(self, attr_name),
                         context,
                     );
                     None
@@ -6074,7 +6119,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         errors,
                         range,
                         ErrorKind::ReadOnly,
-                        e.to_error_msg(attr_name),
+                        e.to_error_msg(self, attr_name),
                         context,
                     );
                     None
@@ -6116,7 +6161,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     errors,
                     range,
                     ErrorKind::NoAccess,
-                    reason.to_error_msg(attr_name),
+                    reason.to_error_msg(self, attr_name),
                     context,
                 );
             }
@@ -6854,7 +6899,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors,
                             range,
                             ErrorKind::NoAccess,
-                            e.to_error_msg(&dunder::GET),
+                            e.to_error_msg(self, &dunder::GET),
                             None,
                         )
                     }),
@@ -6883,7 +6928,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors,
                             range,
                             ErrorKind::NoAccess,
-                            e.to_error_msg(&dunder::SET),
+                            e.to_error_msg(self, &dunder::SET),
                             None,
                         )
                     }),
@@ -6909,7 +6954,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// Return `__call__` as a bound method if instances of `cls` have `__call__`.
     /// This is what the runtime automatically does when we try to call an instance.
     pub fn instance_as_dunder_call(&self, cls: &ClassType) -> Option<Type> {
-        if let Some(attr) = self.get_instance_attribute(cls, &dunder::CALL) {
+        if let Some(attr) = self.get_instance_special_method(cls, &dunder::CALL) {
             return self.resolve_dunder_call_attr(attr);
         }
         None
@@ -6931,12 +6976,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         quantified: Quantified,
         upper_bound: &ClassType,
     ) -> Option<Type> {
-        if let Some(attr) =
-            self.get_bounded_quantified_attribute(quantified.clone(), upper_bound, &dunder::CALL)
-        {
-            return self.resolve_dunder_call_attr(attr);
+        let attr =
+            self.get_bounded_quantified_attribute(quantified.clone(), upper_bound, &dunder::CALL)?;
+        if self.is_typed_dict_class(upper_bound.class_object()) {
+            // As in `get_instance_special_method`, a TypedDict key is not a special method.
+            return self
+                .get_typed_dict_attribute(upper_bound, &dunder::CALL)
+                .and_then(|attr| self.resolve_dunder_call_attr(attr));
         }
-        None
+        self.resolve_dunder_call_attr(attr)
     }
 
     fn callable_params_and_flags(ty: Type) -> Option<(ParamList, FuncFlags)> {

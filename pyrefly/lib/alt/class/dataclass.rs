@@ -8,8 +8,8 @@
 use pyrefly_python::dunder;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::typed_dict::AnonymousTypedDictInner;
-use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::typed_dict::TypedDictField;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::prelude::SliceExt;
 use ruff_python_ast::Arguments;
 use ruff_python_ast::Expr::EllipsisLiteral;
@@ -104,7 +104,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         }
                         all_fields.shift_remove(name);
                     }
-                    all_fields.insert(name.clone(), defining_class.clone());
+                    all_fields.insert(name.clone(), *defining_class);
                 }
             }
         }
@@ -126,7 +126,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     if relocate_redefined {
                         all_fields.shift_remove(name);
                     }
-                    all_fields.insert(name.clone(), cls.clone());
+                    all_fields.insert(name.clone(), *cls);
                 }
             }
         }
@@ -252,7 +252,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 self.error(
                     errors,
-                    cls.range(),
+                    cls.range(self),
                     ErrorKind::BadClassDefinition,
                     "Cannot specify both `slots=True` and `__slots__`".to_owned(),
                 );
@@ -399,7 +399,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             })
             .collect::<Vec<_>>();
         if instance_returns.is_empty() {
-            get_ty.callable_return_type(self.heap)
+            get_ty.callable_return_type(self.heap, self)
         } else {
             Some(self.unions(instance_returns))
         }
@@ -437,7 +437,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     _ => {}
                 }
 
-                let cls = descriptor_cls.name();
+                let cls = descriptor_cls.name(self);
                 errors
                     .error_builder(
                         range,
@@ -491,7 +491,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if let (Some(get_ty), Some(set_ty)) = (get_return_ty, set_value_ty) {
                     // Check if the __get__ return type is assignable to the __set__ value type.
                     if !self.is_subset_eq(&get_ty, &set_ty) {
-                        let cls = descriptor_cls.name();
+                        let cls = descriptor_cls.name(self);
                         errors
                             .error_builder(
                                 range,
@@ -499,7 +499,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 format!("Cannot set field `{name}` to data descriptor `{cls}` with inconsistent types"),
                             )
                             .with_detail(format!(
-                                "Return type `{get_ty}` of `{cls}.__get__` is not assignable to value type `{set_ty}` of `{cls}.__set__`"
+                                "Return type `{}` of `{cls}.__get__` is not assignable to value type `{}` of `{cls}.__set__`",
+                                get_ty.display_with(self),
+                                set_ty.display_with(self),
                             ))
                             .emit();
                     }
@@ -555,7 +557,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Type::ClassType(cls) if is_valid_target(cls) => dataclasses.push(ty.clone()),
             _ => {
                 has_non_attrs_class = has_non_attrs_class
-                    || (kind.requires_attrs() && matches!(ty, Type::ClassType(_)));
+                    || (kind.requires_attrs()
+                        && matches!(ty, Type::ClassType(cls) if !self.is_typed_dict_class(cls.class_object())));
                 non_dataclasses.push(ty.clone());
             }
         });
@@ -675,9 +678,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         )
                     })
                     .collect();
-                return self.heap.mk_typed_dict(TypedDict::Anonymous(Box::new(
-                    AnonymousTypedDictInner { fields },
-                )));
+                return self
+                    .heap
+                    .mk_anonymous_typed_dict(AnonymousTypedDictInner { fields });
             }
         }
         self.freeform_call_infer(
@@ -787,10 +790,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         "non-frozen"
                     };
 
-                    let ctx = ClassDisplayContext::new(&[cls, base]);
+                    let ctx = ClassDisplayContext::new(self, &[cls, base]);
                     self.error(
                         errors,
-                        cls.range(),
+                        cls.range(self),
                         ErrorKind::InvalidInheritance,
                         format!(
                             "Cannot inherit {} dataclass `{}` from {} dataclass `{}`",
@@ -1118,7 +1121,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .freshen_class_targs(class_type.targs_mut(), self.uniques);
         let matched = self.is_subset_eq(&self.heap.mk_class_type(class_type.clone()), hint);
         self.solver()
-            .generalize_class_targs(class_type.targs_mut(), &SmallSet::new());
+            .generalize_class_targs(class_type.targs_mut(), &SmallSet::new(), self);
         self.solver()
             .finish_class_targs(class_type.targs_mut(), self.uniques);
         // Finalizing the fresh vars is required; its specialization errors are dropped because this
@@ -1141,11 +1144,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             forall.body.clone().as_type(),
             self.uniques,
         );
-        if let Some(ret) = instantiated.callable_return_type(self.heap) {
+        if let Some(ret) = instantiated.callable_return_type(self.heap, self) {
             self.is_subset_eq(&ret, hint);
         }
         let _ = self.finish_quantified(vs, self.solver().config.infer_with_first_use);
-        Some(self.solver().expand(instantiated))
+        Some(self.solver().expand(instantiated, self))
     }
 
     fn get_default(&self, map: &TypeMap) -> Option<Type> {
@@ -1161,7 +1164,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             constructor_callable
                 .as_ref()
                 .unwrap_or(factory)
-                .callable_return_type(self.heap)
+                .callable_return_type(self.heap, self)
                 .unwrap_or_else(|| self.heap.mk_any_implicit()),
         )
     }
@@ -1195,14 +1198,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         };
 
         let mut result: SmallMap<Class, SmallSet<Name>> = SmallMap::new();
-        result.insert(cls.clone(), compute_for_class(cls));
+        result.insert(*cls, compute_for_class(cls));
 
         for ancestor in self.get_mro_for_class(cls).ancestors_no_object() {
             let ancestor_cls = ancestor.class_object();
             if ancestor_cls == cls {
                 continue;
             }
-            result.insert(ancestor_cls.clone(), compute_for_class(ancestor_cls));
+            result.insert(*ancestor_cls, compute_for_class(ancestor_cls));
         }
         result
     }
@@ -1360,7 +1363,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         if !reported_by_base {
                             self.error(
                                 errors,
-                                own_decl_range.unwrap_or_else(|| cls.range()),
+                                own_decl_range.unwrap_or_else(|| cls.range(self)),
                                 ErrorKind::BadClassDefinition,
                                 format!(
                                     "Dataclass field `{name}` without a default may not follow dataclass field with a default"
@@ -1509,7 +1512,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         } else {
                             callable.clone()
                         },
-                        metadata: FuncMetadata::method(cls, name.clone()),
+                        metadata: FuncMetadata::method(self, cls, name.clone()),
                     })),
                 )
             })

@@ -12,6 +12,45 @@ use pyrefly_util::thread_pool::ThreadCount;
 use crate::test::util::TestEnv;
 use crate::testcase;
 
+testcase!(
+    test_deferred_callbacks_keep_matched_keys_with_unpacking,
+    TestEnv::new().enable_implicit_any_lambda_error(),
+    r#"
+from typing import Callable, assert_type
+
+class Invoker:
+    def run[T](
+        self,
+        left: int,
+        right: str,
+        first: Callable[[T], T],
+        second: Callable[[T], T],
+        sample: T,
+        *rest: T,
+    ) -> T:
+        return second(first(sample))
+
+def check(rest: tuple[int, ...]) -> None:
+    invoker = Invoker()
+    plain = invoker.run(
+        1, "prefix",
+        lambda value: assert_type(value, int),
+        lambda value: assert_type(value, int),
+        0, *rest,
+    )
+    # One source argument supplies two parameters before the deferred callbacks.
+    prefix: tuple[int, str] = (1, "prefix")
+    expanded = invoker.run(
+        *prefix,
+        lambda value: assert_type(value, int),
+        lambda value: assert_type(value, int),
+        0, *rest,
+    )
+    assert_type(plain, int)
+    assert_type(expanded, int)
+"#,
+);
+
 // `CallArgPreEval::advance_after_match` is shared with shape-specific call matching. Keep this
 // regression in the general callable suite so the refactor cannot change ordinary variadic
 // type-variable consumption.
@@ -812,7 +851,7 @@ test2(1, *(2, 3), *(4, "5"))  # E: Unpacked argument `tuple[Literal[1], Literal[
 );
 
 // Splatting a tuple with a variadic middle preserves the positions of its fixed ends.
-// See https://github.com/facebook/pyrefly/issues/4482
+// See https://github.com/pyrefly-org/pyrefly/issues/4482
 testcase!(
     test_splat_unpacked_args_shape,
     r#"
@@ -2076,7 +2115,7 @@ class Pipeline:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1178
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1178
 testcase!(
     test_callable_as_base_class,
     r#"
@@ -2087,7 +2126,7 @@ class A(Callable):  # E: Invalid base class
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/769
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/769
 testcase!(
     test_callable_no_args_assignable_to_varargs,
     r#"
@@ -2101,7 +2140,7 @@ schedule(1000, after_func)
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3912
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3912
 testcase!(
     test_callable_ellipsis_return,
     r#"

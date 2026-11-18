@@ -7,11 +7,15 @@
 
 //! Type-checks `functools.partial(...)` bound arguments and synthesizes the remaining signature.
 
+use std::borrow::Cow;
+
 use itertools::Itertools;
+use pyrefly_python::ast::Ast;
 use pyrefly_types::quantified::Quantified;
 use pyrefly_types::quantified::QuantifiedKind;
 use pyrefly_types::typed_dict::ExtraItems;
 use pyrefly_types::types::Var;
+use ruff_python_ast::Expr;
 use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
@@ -24,6 +28,9 @@ use crate::alt::answers_solver::AnswersSolver;
 use crate::alt::call::CallTargetLookup;
 use crate::alt::callable::CallArg;
 use crate::alt::callable::CallKeyword;
+use crate::alt::callable::CallValue;
+use crate::alt::callable::CallWithTypes;
+use crate::alt::expr::TypeOrExpr;
 use crate::alt::unwrap::HintRef;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
@@ -55,13 +62,51 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let Type::ClassDef(partial_cls) = partial_ty else {
             unreachable!("call_functools_partial dispatched on a non-class callee");
         };
+        // Hoist hint-independent inference; contextual arguments remain expressions.
+        let call = CallWithTypes::new();
+        let supports_placeholders = self.bindings().sys_info().version().at_least(3, 14);
+        let mut prepared_args = Cow::Borrowed(args);
+        if supports_placeholders {
+            for (i, arg) in args.iter().enumerate().skip(1) {
+                if let CallArg::Arg(value) = arg
+                    && can_prepare_partial_arg(*value)
+                {
+                    prepared_args.to_mut()[i] = call.call_arg(arg, self, errors);
+                }
+            }
+        }
+        let args = prepared_args.as_ref();
+        let any_explicit = self.heap.mk_any_explicit();
+        let mut kws_for_check = Vec::with_capacity(kws.len());
+        for kw in kws {
+            let kw = if supports_placeholders && can_prepare_partial_arg(kw.value) {
+                call.call_keyword(kw, self, errors)
+            } else {
+                kw.clone()
+            };
+            if is_placeholder_arg(self, &kw.value) {
+                self.error(
+                    errors,
+                    kw.range(),
+                    ErrorKind::BadKeywordArgument,
+                    "cannot use functools.Placeholder as keyword argument".to_owned(),
+                );
+                kws_for_check.push(CallKeyword {
+                    range: kw.range,
+                    arg: kw.arg,
+                    value: CallValue::Plain(TypeOrExpr::Type(&any_explicit, kw.value.range())),
+                });
+            } else {
+                kws_for_check.push(kw);
+            }
+        }
         let Some(CallArg::Arg(target)) = args.first() else {
             // No inspectable callable target (e.g. a `*args` splat); defer to the stub.
             return self
                 .freeform_call_infer(
                     partial_ty.clone(),
                     args,
-                    kws,
+                    &kws_for_check,
                     callee_range,
                     arg_range,
                     hint,
@@ -94,7 +139,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ErrorKind::BadInstantiation,
                         format!(
                             "Cannot instantiate `{}` because it is a protocol",
-                            cls.name()
+                            cls.name(self)
                         ),
                     );
                 } else if !metadata.is_new_type() {
@@ -107,7 +152,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::BadInstantiation,
                             format!(
                                 "Cannot instantiate `{}` because the following members are abstract: {}",
-                                cls.name(),
+                                cls.name(self),
                                 unimplemented
                                     .iter()
                                     .map(|x| format!("`{x}`"))
@@ -122,7 +167,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::DirectAbstractBaseInstantiation,
                             format!(
                                 "Cannot instantiate `{}` because it directly extends `ABC` or uses `ABCMeta`",
-                                cls.name()
+                                cls.name(self)
                             ),
                         );
                     }
@@ -170,7 +215,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ErrorKind::NotCallable,
                         format!(
                             "Expected a callable, got `{}`",
-                            self.for_display(member.clone())
+                            self.display(member.clone())
                         ),
                     );
                 }
@@ -183,7 +228,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let result = me.freeform_call_infer(
                 partial_ty.clone(),
                 &args_with_ty,
-                kws,
+                &kws_for_check,
                 callee_range,
                 arg_range,
                 hint,
@@ -210,9 +255,27 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // The remaining parameters are keyed by the names the bound keywords consume. A `**` splat of an
         // `Unpack[TypedDict]` binds exactly the TypedDict's declared fields, so expand it to those
         // names; a splat of any other type can't be reduced structurally, so defer to the stub.
-        let Some(bound_kw_names) = self.partial_bound_kw_names(kws) else {
+        let Some(bound_kw_names) = self.partial_bound_kw_names(&kws_for_check) else {
             return fallback(self);
         };
+        let is_placeholder: Vec<bool> = args[1..]
+            .iter()
+            .map(|arg| match arg {
+                CallArg::Arg(x) => is_placeholder_arg(self, x),
+                CallArg::Star(..) => false,
+            })
+            .collect();
+        let args_for_check: Vec<CallArg> = args[1..]
+            .iter()
+            .zip(is_placeholder.iter())
+            .map(|(arg, &is_ph)| {
+                if is_ph {
+                    CallArg::ty(&any_explicit, arg.range())
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
         // Overloaded target with bound arguments: drop branches the bound arguments can't satisfy and
         // recombine the surviving partial callables into an overload, so per-call resolution still works.
         if let Type::Overload(overload) = &target_ty {
@@ -239,8 +302,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let trial = self.error_collector();
                 self.freeform_call_infer(
                     self.heap.mk_callable_from(probe),
-                    &args[1..],
-                    kws,
+                    &args_for_check,
+                    &kws_for_check,
                     target.range(),
                     arg_range,
                     None,
@@ -257,7 +320,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 let branch_sig = if generic {
                     let mut ty = self.heap.mk_callable_from(branch_sig);
-                    self.solver().expand_mut(&mut ty);
+                    self.solver().expand_mut(&mut ty, self);
                     let Type::Callable(callable) = ty else {
                         unreachable!("built by mk_callable_from");
                     };
@@ -267,7 +330,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 };
                 // Defer the whole overload rather than silently drop a matched branch we can't
                 // represent, which would break a call that only matched that branch.
-                match partial_callable(&branch_sig, &args[1..], &bound_kw_names) {
+                match partial_callable(&branch_sig, &args[1..], &is_placeholder, &bound_kw_names) {
                     Some(partial) => {
                         partials.push(partial);
                         accepted_trials.push(trial);
@@ -362,8 +425,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 });
                 self.freeform_call_infer(
                     callee,
-                    &args[1..],
-                    kws,
+                    &args_for_check,
+                    &kws_for_check,
                     target.range(),
                     arg_range,
                     None,
@@ -386,8 +449,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 });
                 let outcome = self.freeform_call_infer(
                     callee,
-                    &args[1..],
-                    kws,
+                    &args_for_check,
+                    &kws_for_check,
                     target.range(),
                     arg_range,
                     None,
@@ -396,7 +459,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // A typevar in a *required* remaining param stays symbolic so a later call arg can re-solve
                 // it (as a direct call would); one only in optional params keeps its solved value (GH #3546).
                 let mut regeneric_vars: SmallSet<Var> = SmallSet::new();
-                if let Some(remaining) = partial_params(&inst, &args[1..], &bound_kw_names) {
+                if let Some(remaining) =
+                    partial_params(&inst, &args[1..], &is_placeholder, &bound_kw_names)
+                {
                     for param in remaining.items() {
                         let (ty, required) = match param {
                             Param::PosOnly(_, t, r)
@@ -428,7 +493,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
         };
         let build = |sig: &Callable| {
-            let remaining = partial_params(sig, &args[1..], &bound_kw_names)?;
+            let remaining = partial_params(sig, &args[1..], &is_placeholder, &bound_kw_names)?;
             // A `TypeGuard`/`TypeIs` narrows only in a direct call; the partial just returns `bool`.
             let ret = match &sig.ret {
                 Type::TypeGuard(_) | Type::TypeIs(_) => self.stdlib.bool().clone().to_type(),
@@ -481,7 +546,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 *t = self.heap.mk_quantified(q.clone().with_needs_finalization());
             }
         });
-        self.solver().expand_with_bounds(&mut solved);
+        self.solver().expand_with_bounds(&mut solved, self);
         let solved = solved.transform(&mut |t: &mut Type| {
             if let Type::Var(v) = t
                 && let Some(q) = var_to_q.get(v)
@@ -508,14 +573,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     // The bound arguments are re-inferred and validated below; here we only want the
                     // splat's field names, so any inference error is reported there, not here.
                     let ty = kw.value.infer(self, &self.error_collector());
-                    let Type::TypedDict(td) = ty else {
-                        return None;
-                    };
-                    names.extend(
-                        self.typed_dict_fields(&td)
-                            .into_iter()
-                            .map(|(name, _)| name),
-                    );
+                    match &ty {
+                        Type::ClassType(ct) if self.is_typed_dict_class(ct.class_object()) => {
+                            names.extend(self.typed_dict_fields(ct).into_iter().map(|(n, _)| n))
+                        }
+                        Type::AnonymousTypedDict(td) => {
+                            names.extend(td.fields.iter().map(|(name, _)| name.clone()))
+                        }
+                        _ => return None,
+                    }
                 }
             }
         }
@@ -579,15 +645,19 @@ fn make_params_optional(callable: &mut Callable) {
 fn partial_callable(
     branch: &Callable,
     bound_args: &[CallArg],
+    is_placeholder: &[bool],
     keyword_names: &[Name],
 ) -> Option<Callable> {
     match &branch.params {
-        Params::List(_) => partial_params(branch, bound_args, keyword_names)
+        Params::List(_) => partial_params(branch, bound_args, is_placeholder, keyword_names)
             .map(|params| Callable::partial(params, branch.ret.clone())),
         // `(...)` still accepts anything after binding a prefix.
         Params::Ellipsis => Some(Callable::ellipsis(branch.ret.clone())),
         // `Concatenate[..., P]` binds its prefix first; the partial keeps the unbound prefix and `P`.
         Params::ParamSpec(prefix, tail) => {
+            if is_placeholder.iter().any(|&b| b) {
+                return None;
+            }
             partial_paramspec_prefix(prefix, bound_args, keyword_names).map(|prefix| Callable {
                 params: Params::ParamSpec(prefix, tail.clone()),
                 ret: branch.ret.clone(),
@@ -628,23 +698,37 @@ fn partial_paramspec_prefix(
 fn partial_params(
     callable: &Callable,
     bound_args: &[CallArg],
+    is_placeholder: &[bool],
     keyword_names: &[Name],
 ) -> Option<ParamList> {
     let Params::List(params) = &callable.params else {
         return None;
     };
     let mut remaining = params.items().to_vec();
-    for arg in bound_args {
+    let mut placeholder_params: Vec<Param> = Vec::new();
+    for (arg, &is_ph) in bound_args.iter().zip(is_placeholder) {
         let CallArg::Arg(_) = arg else {
             return None;
         };
         let idx = remaining
             .iter()
             .position(|p| matches!(p, Param::PosOnly(..) | Param::Pos(..) | Param::Varargs(..)))?;
-        if !matches!(remaining[idx], Param::Varargs(..)) {
-            remaining.remove(idx);
+        let param = if matches!(remaining[idx], Param::Varargs(..)) {
+            remaining[idx].clone()
+        } else {
+            remaining.remove(idx)
+        };
+        if is_ph {
+            placeholder_params.push(match param {
+                Param::PosOnly(n, t, _) => Param::PosOnly(n, t, Required::Required),
+                Param::Pos(n, t, _) => Param::PosOnly(Some(n), t, Required::Required),
+                Param::Varargs(n, t) => Param::PosOnly(n, t, Required::Required),
+                _ => unreachable!("position() only selects positional parameters"),
+            });
         }
     }
+    placeholder_params.extend(remaining);
+    let mut remaining = placeholder_params;
     for name in keyword_names {
         let idx = remaining.iter().position(|p| {
             matches!(p, Param::Pos(n, ..) | Param::KwOnly(n, ..) if n == name)
@@ -668,4 +752,30 @@ fn partial_params(
         remaining[idx] = Param::KwOnly(n, t, Required::Optional(None));
     }
     Some(ParamList::new(remaining))
+}
+
+fn can_prepare_partial_arg(value: CallValue) -> bool {
+    match value.as_type_or_expr() {
+        TypeOrExpr::Expr(Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_)) => true,
+        TypeOrExpr::Expr(Expr::Named(named)) => {
+            matches!(&*named.target, Expr::Name(name) if !Ast::is_synthesized_empty_name(name))
+        }
+        _ => false,
+    }
+}
+
+fn is_placeholder_arg<Ans: LookupAnswer>(solver: &AnswersSolver<Ans>, x: &CallValue) -> bool {
+    let TypeOrExpr::Type(ty, _) = x.as_type_or_expr() else {
+        return false;
+    };
+    let ty = solver.solver().expand(ty.clone(), solver);
+    matches!(
+        ty,
+        Type::ClassType(cls)
+            if {
+                let qname = cls.qname(solver);
+                qname.module_name().as_str() == "functools"
+                    && qname.id().as_str() == "_PlaceholderType"
+            }
+    )
 }

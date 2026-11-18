@@ -92,6 +92,8 @@ use crate::binding::scope::YieldsAndReturns;
 use crate::config::base::InferReturnTypes;
 use crate::config::error_kind::ErrorKind;
 use crate::export::special::SpecialExport;
+use crate::types::function::FuncDefIndex;
+use crate::types::quantified::QuantifiedAnchor;
 use crate::types::types::AnyStyle;
 
 struct Decorators {
@@ -494,16 +496,18 @@ impl<'a> BindingsBuilder<'a> {
         override_func: Option<Idx<KeyUndecoratedFunction>>,
         usage: &mut Usage,
         parent: &NestingContext,
+        def_index: FuncDefIndex,
     ) -> (
         Option<(TextRange, Idx<KeyAnnotation>)>,
         Vec<Idx<KeyLegacyTypeParam>>,
     ) {
         let tparams = x.type_params.as_mut().map(|tparams| {
             let owner = parent.owner_path(&self.module_info, func_name.id.as_str());
-            self.type_params_with_owner(tparams, owner)
+            self.type_params(tparams, QuantifiedAnchor::Function(def_index), owner)
         });
 
-        let mut legacy = LegacyTParamCollector::new(tparams.is_some());
+        let mut legacy =
+            LegacyTParamCollector::new(tparams.is_some(), QuantifiedAnchor::Function(def_index));
 
         // We need to bind all the parameters expressions _after_ the type params, but before the parameter names,
         // which might shadow some types.
@@ -1096,12 +1100,18 @@ impl<'a> BindingsBuilder<'a> {
             &x,
             class_key.is_none() && !parent.has_function_ancestor(),
             enclosing_class,
+            func_def_index,
         );
 
         self.maybe_record_pytest_fixture_definition(&x, class_key);
 
         let receiver_uses = self.classmethod_receiver_uses(&x);
         let decorators = self.decorators(mem::take(&mut x.decorator_list), def_idx.usage());
+        // A function can only be an abstract method if a decorator makes it one, if it continues
+        // an overload chain, or if it is a protocol member.
+        let may_be_abstract = !decorators.decorators.is_empty()
+            || pred_idx.is_some()
+            || self.scopes.is_in_protocol_class();
         // Method annotations of an `@override` method may be dictated by the base
         // signature; stamping the method lets the solver exempt them.
         let override_func =
@@ -1117,6 +1127,7 @@ impl<'a> BindingsBuilder<'a> {
             override_func,
             def_idx.usage(),
             parent,
+            func_def_index,
         );
 
         let docstring_range = Docstring::range_from_stmts(x.body.as_slice());
@@ -1183,6 +1194,7 @@ impl<'a> BindingsBuilder<'a> {
                 function_idx,
                 has_return_annotation: return_ann_with_range.is_some(),
                 is_overload: decorators.is_overload,
+                may_be_abstract,
             },
         );
 

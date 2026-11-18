@@ -168,7 +168,7 @@ def valid(x: int) -> Container[Any]:
  "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5269
+// https://github.com/pyrefly-org/pyrefly/issues/5269
 testcase!(
     test_bound_with_nested_optional_argument,
     r#"
@@ -689,7 +689,7 @@ class Foo[T: (A, B)]:
 testcase!(
     test_union_bounded_typevar_with_property_get,
     r#"
-# https://github.com/facebook/pyrefly/issues/869
+# https://github.com/pyrefly-org/pyrefly/issues/869
 from collections import defaultdict
 from typing import assert_type
 
@@ -835,7 +835,7 @@ def not_subscriptable[S: int](x: S) -> None:
 testcase!(
     test_constrained_typevar_method_arguments,
     r#"
-# https://github.com/facebook/pyrefly/issues/3621
+# https://github.com/pyrefly-org/pyrefly/issues/3621
 from typing import TypeVar, assert_type
 
 class DataFrame:
@@ -923,7 +923,7 @@ def merge[T: (A, B)](x: T, y: T) -> None:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5452
+// https://github.com/pyrefly-org/pyrefly/issues/5452
 // `f1` uses final classes, so its constraints are provably disjoint, and checks that a generic
 // method called with an argument of type `T` returns `T`. `h` shows the parameter types printed
 // when an argument is rejected.
@@ -1713,7 +1713,7 @@ f(0, "wrong")  # E: `Literal['wrong']` is not assignable to parameter `y` with t
 );
 
 testcase!(
-    bug = "TODO(https://github.com/facebook/pyrefly/issues/105): error message should also flag `Literal['oops']`",
+    bug = "TODO(https://github.com/pyrefly-org/pyrefly/issues/105): error message should also flag `Literal['oops']`",
     test_multiple_bad_specialization,
     r#"
 def f[T: int](x: T, y: T): ...
@@ -2092,4 +2092,50 @@ class Nested[T: list[str]]:
 def bad() -> None:
     x: Nested[list[Any]] = Nested([1])  # Should be an error
  "#,
+);
+
+// A bound keeps the type arguments of a class whose own type parameters are restricted, as long
+// as that class does not name the class being defined.
+testcase!(
+    test_bound_keeps_targs_of_restricted_class,
+    r#"
+class Base: ...
+class Sub(Base): ...
+class Bar[U: Base]:
+    value: U
+class Foo[T: Bar[Base]]: ...
+Foo[Bar[Sub]]()  # E: `Bar[Sub]` is not assignable to upper bound `Bar[Base]` of type variable `T`
+Foo[Bar[Base]]()
+"#,
+);
+
+// When the bounds of two classes name each other, the class type that closes the cycle loses its
+// type arguments: `T`'s bound is `Bar`, not `Bar[Base]`.
+testcase!(
+    bug = "A bound in a cycle loses the type arguments that close the cycle",
+    test_bound_cycle_loses_targs,
+    r#"
+from typing import Any
+class Base: ...
+class Sub(Base): ...
+class Foo[T: "Bar[Base]"]: ...
+class Bar[U: "Foo[Any] | Base"]:
+    value: U
+Foo[Bar[Sub]]()  # Should be an error: `Bar[Sub]` is not assignable to `Bar[Base]`
+Foo[int]()  # E: `int` is not assignable to upper bound `Bar` of type variable `T`
+"#,
+);
+
+testcase!(
+    test_recursive_defaults_converge,
+    r#"
+from typing import assert_type
+class Foo[T = "Foo"]: ...
+class Bar[A = "Baz"]: ...
+class Baz[B = "Bar"]: ...
+class Qux[S, D = "Qux[int]"]: ...
+x: Foo = Foo()
+y: Bar = Bar()
+z: Qux[str] = Qux()
+"#,
 );

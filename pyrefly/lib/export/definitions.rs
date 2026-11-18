@@ -6,7 +6,7 @@
  */
 
 use pyrefly_python::ast::Ast;
-use pyrefly_python::docstring::Docstring;
+use pyrefly_python::docstring::DocRanges;
 use pyrefly_python::dunder;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModuleStyle;
@@ -42,6 +42,8 @@ use crate::binding::stmt::is_special_import_function;
 use crate::binding::stmt::special_import_form;
 use crate::binding::stmt::special_import_module;
 use crate::export::deprecation::parse_deprecation;
+use crate::export::doc_ranges::class_doc_ranges;
+use crate::export::doc_ranges::function_doc_ranges;
 use crate::export::special::SpecialExport;
 use crate::types::globals::ImplicitGlobal;
 
@@ -107,9 +109,8 @@ pub struct Definition {
     /// Does this definition require an `Anywhere` binding at binding time? Typically yes if there
     /// are multiple definitions, but mutable captures and `del` both require special handling.
     pub needs_anywhere: bool,
-    /// If the first statement in a definition (class, function) is a string literal, PEP 257 convention
-    /// states that is the docstring.
-    pub docstring_range: Option<TextRange>,
+    /// The documentation of a class or function definition.
+    pub doc_ranges: DocRanges,
     /// The range of the textually last site that assigns or rebinds this name, including an
     /// `import foo.bar` that rebinds an alias bound by `import foo as <alias>`. When there is
     /// only one definition, this equals `range`. Used to determine if a variable is
@@ -396,17 +397,7 @@ fn is_final_annotation(annotation: &Expr) -> bool {
         Expr::Subscript(sub) => &*sub.value,
         other => other,
     };
-    let (base, value) = match target {
-        Expr::Name(x) => (None, &x.id),
-        Expr::Attribute(ExprAttribute { value, attr, .. }) if let Expr::Name(base) = &**value => {
-            (Some(&base.id), &attr.id)
-        }
-        _ => return false,
-    };
-    SpecialExport::new(value).is_some_and(|special| {
-        special == SpecialExport::Final
-            && base.is_none_or(|base| special.defined_in(ModuleName::from_name(base)))
-    })
+    SpecialExport::from_syntax(target) == Some(SpecialExport::Final)
 }
 
 fn is_overload_decorator(decorator: &Decorator) -> bool {
@@ -458,7 +449,7 @@ impl Definitions {
                     range: TextRange::default(),
                     style: DefinitionStyle::ImplicitGlobal,
                     needs_anywhere: false,
-                    docstring_range: None,
+                    doc_ranges: DocRanges::default(),
                     last_range: TextRange::default(),
                     main_guard_only: false,
                     sites: DefinitionSites::NoValue,
@@ -544,12 +535,12 @@ impl DefinitionsBuilder {
         }
     }
 
-    fn add_name_with_body(
+    fn add_name_with_docs(
         &mut self,
         x: &Name,
         range: TextRange,
         style: DefinitionStyle,
-        body: Option<&[Stmt]>,
+        doc_ranges: DocRanges,
         sites: DefinitionSites,
     ) {
         if x.is_empty() {
@@ -568,7 +559,7 @@ impl DefinitionsBuilder {
                     range,
                     style,
                     needs_anywhere: false,
-                    docstring_range: body.and_then(Docstring::range_from_stmts),
+                    doc_ranges,
                     last_range: range,
                     main_guard_only: in_main_guard,
                     sites,
@@ -597,21 +588,21 @@ impl DefinitionsBuilder {
         {
             self.inner.special_exports.insert(x.clone(), special_export);
         }
-        self.add_name_with_body(x, range, style, None, sites)
+        self.add_name_with_docs(x, range, style, DocRanges::default(), sites)
     }
 
     fn add_identifier(&mut self, x: &Identifier, style: DefinitionStyle) {
         self.add_name(&x.id, x.range, style);
     }
 
-    fn add_identifier_with_body(
+    fn add_identifier_with_docs(
         &mut self,
         x: &Identifier,
         style: DefinitionStyle,
-        body: Option<&[Stmt]>,
+        doc_ranges: DocRanges,
     ) {
         let sites = DefinitionSites::of_style(&style);
-        self.add_name_with_body(&x.id, x.range, style, body, sites);
+        self.add_name_with_docs(&x.id, x.range, style, doc_ranges, sites);
     }
 
     fn expr_lvalue(&mut self, x: &Expr) {
@@ -753,12 +744,13 @@ impl DefinitionsBuilder {
                     }
                 }
             }
-            Stmt::ClassDef(StmtClassDef {
-                name,
-                body,
-                decorator_list,
-                ..
-            }) => {
+            Stmt::ClassDef(
+                class_def @ StmtClassDef {
+                    name,
+                    decorator_list,
+                    ..
+                },
+            ) => {
                 self.inner.last_finally_or_class = Some(x.range());
                 let mut deprecated_decoration = None;
                 for d in decorator_list {
@@ -770,10 +762,10 @@ impl DefinitionsBuilder {
                 if let Some(decoration) = deprecated_decoration {
                     self.inner.deprecated.insert(name.id.clone(), decoration);
                 }
-                self.add_identifier_with_body(
+                self.add_identifier_with_docs(
                     name,
                     DefinitionStyle::Unannotated(SymbolKind::Class),
-                    Some(body),
+                    class_doc_ranges(class_def),
                 );
                 return; // These things are inside a scope
             }
@@ -1007,12 +999,13 @@ impl DefinitionsBuilder {
                     self.expr_lvalue(&x.name)
                 }
             }
-            Stmt::FunctionDef(StmtFunctionDef {
-                name,
-                body,
-                decorator_list,
-                ..
-            }) => {
+            Stmt::FunctionDef(
+                func_def @ StmtFunctionDef {
+                    name,
+                    decorator_list,
+                    ..
+                },
+            ) => {
                 let mut is_overload = false;
                 let mut deprecated_decoration = None;
                 for d in decorator_list {
@@ -1031,10 +1024,10 @@ impl DefinitionsBuilder {
                         .deprecated
                         .insert(name.id.clone(), deprecated_decoration);
                 }
-                self.add_identifier_with_body(
+                self.add_identifier_with_docs(
                     name,
                     DefinitionStyle::Unannotated(SymbolKind::Function),
-                    Some(body),
+                    function_doc_ranges(func_def),
                 );
                 return; // don't recurse because a separate scope
             }

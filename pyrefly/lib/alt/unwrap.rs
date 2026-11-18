@@ -137,7 +137,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         match ty {
             Type::Any(style) => self.heap.mk_any(*style),
             Type::Never(style) => self.heap.mk_never_style(*style),
-            _ => self.solver().expand_unwrap(var),
+            _ => self.solver().expand_unwrap(var, self),
         }
     }
 
@@ -162,7 +162,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Extract key and value types for dictionary unpacking, including structural mappings.
     pub fn unwrap_mapping_for_unpacking(&self, ty: &Type) -> Option<(Type, Type)> {
-        self.unwrap_mapping(ty).or_else(|| {
+        let ordinary = self.unwrap_mapping(ty).or_else(|| {
             let key = self.fresh_var();
             let value = self.fresh_var();
             let Type::ClassDef(mapping_class) = self.try_get_from_export(
@@ -183,7 +183,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             } else {
                 None
             }
-        })
+        });
+        if let Some(pair) = ordinary {
+            return Some(pair);
+        }
+        // Some unions of mappings are not recognized by the extraction above. Unpack those as
+        // the union of each member's key and value types, instead of reporting a non-mapping.
+        let Type::Union(union) = ty else {
+            return None;
+        };
+        let mut keys = Vec::with_capacity(union.members.len());
+        let mut values = Vec::with_capacity(union.members.len());
+        for member in &union.members {
+            let (key, value) = self.unwrap_mapping_for_unpacking(member)?;
+            keys.push(key);
+            values.push(value);
+        }
+        Some((self.unions(keys), self.unions(values)))
     }
 
     /// Warning: this returns `Some` if the type is `Any` or a class that extends `Any`
@@ -435,7 +451,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .chain([&mut vararg_hint, &mut kwarg_hint, &mut return_hint])
             .flatten()
         {
-            self.solver().expand_with_bounds(ty);
+            self.solver().expand_with_bounds(ty, self);
         }
         self.solver().restore_vars(snapshot);
         (param_hints, vararg_hint, kwarg_hint, return_hint)

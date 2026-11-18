@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 use dupe::Dupe;
 use pyrefly_build::handle::Handle;
 use pyrefly_config::finder::ConfigFinder;
+use pyrefly_python::docstring::DocRanges;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePathDetails;
 use pyrefly_python::short_identifier::ShortIdentifier;
@@ -35,6 +36,7 @@ use crate::binding::binding::Key;
 use crate::binding::bindings::Bindings;
 use crate::binding::narrow::identifier_and_chain_for_expr;
 use crate::binding::narrow::identifier_and_chain_prefix_for_expr;
+use crate::export::doc_ranges::doc_ranges_from_parts;
 use crate::export::exports::Export;
 use crate::state::lsp::ImportFormat;
 
@@ -200,7 +202,10 @@ fn create_intermediate_definition_from(
                 return Some(IntermediateDefinition::Local(Export {
                     location: undecorated.def.name.range,
                     symbol_kind: Some(symbol_kind),
-                    docstring_range: func.docstring_range,
+                    doc_ranges: doc_ranges_from_parts(
+                        func.docstring_range,
+                        &undecorated.def.parameters,
+                    ),
                     deprecation: None,
                     is_final: false,
                     special_export: None,
@@ -212,20 +217,18 @@ fn create_intermediate_definition_from(
                         Some(IntermediateDefinition::Local(Export {
                             location: def_key.range(),
                             symbol_kind: Some(SymbolKind::Class),
-                            docstring_range: None,
+                            doc_ranges: DocRanges::default(),
                             deprecation: None,
                             is_final: false,
                             special_export: None,
                         }))
                     }
                     BindingClass::ClassDef(ClassBinding {
-                        def,
-                        docstring_range,
-                        ..
+                        def, doc_ranges, ..
                     }) => Some(IntermediateDefinition::Local(Export {
                         location: def.name.range,
                         symbol_kind: Some(SymbolKind::Class),
-                        docstring_range: *docstring_range,
+                        doc_ranges: doc_ranges.clone(),
                         deprecation: None,
                         is_final: false,
                         special_export: None,
@@ -236,7 +239,7 @@ fn create_intermediate_definition_from(
                 return Some(IntermediateDefinition::Local(Export {
                     location: *target_range,
                     symbol_kind: Some(SymbolKind::Variable),
-                    docstring_range: None,
+                    doc_ranges: DocRanges::default(),
                     deprecation: None,
                     is_final: false,
                     special_export: None,
@@ -265,7 +268,7 @@ fn create_intermediate_definition_from(
                 return Some(IntermediateDefinition::Local(Export {
                     location: def_key.range(),
                     symbol_kind: current_binding.symbol_kind(),
-                    docstring_range: None,
+                    doc_ranges: DocRanges::default(),
                     deprecation: None,
                     is_final: false,
                     special_export: None,

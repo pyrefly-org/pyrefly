@@ -76,6 +76,7 @@ use crate::state::require::Require;
 use crate::state::state::State;
 use crate::state::state::Transaction;
 use crate::state::state::TransactionHandle;
+use crate::types::env::TypeEnv;
 
 /// All parameters with merge keys: positional-only → index, keyword-capable → name,
 /// variadic → singleton, implicit receiver → `None`.
@@ -461,6 +462,7 @@ const IMPLICIT_GENERIC_BUILTINS: &[KnownClass] = &[
 const IMPLICIT_STDLIB_CLASSES: &[KnownClass] = &[KnownClass::LoggingLogger, KnownClass::RePattern];
 
 fn parse_variables(
+    env: &dyn TypeEnv,
     module: &Module,
     answers: &Answers,
     exports: &SmallMap<Name, ExportLocation>,
@@ -475,7 +477,12 @@ fn parse_variables(
     /// `list()`, or an explicitly specialized class like `Spam[int]()`. Other generic classes are
     /// left out because their type arguments are inferred. Instances of `IMPLICIT_STDLIB_CLASSES`
     /// are exempt whatever the call.
-    fn untyped_if_call(answers: &Answers, idx: Idx<Key>, expr: &Expr) -> SlotCounts {
+    fn untyped_if_call(
+        env: &dyn TypeEnv,
+        answers: &Answers,
+        idx: Idx<Key>,
+        expr: &Expr,
+    ) -> SlotCounts {
         let Expr::Call(call) = expr else {
             return SlotCounts::default();
         };
@@ -502,7 +509,7 @@ fn parse_variables(
             // doesn't match. Nested modules like `a.b.Spam()` are left out too.
             Expr::Attribute(attr) => {
                 cls.targs().is_empty()
-                    && *cls.name() == attr.attr.id
+                    && *cls.name(env) == attr.attr.id
                     && attr
                         .value
                         .as_name_expr()
@@ -510,8 +517,8 @@ fn parse_variables(
                         .is_some_and(|t| matches!(t.ty(), Type::Module(_)))
             }
             Expr::Subscript(sub) => match sub.value.as_ref() {
-                Expr::Name(n) => *cls.name() == n.id,
-                Expr::Attribute(attr) => *cls.name() == attr.attr.id,
+                Expr::Name(n) => *cls.name(env) == n.id,
+                Expr::Attribute(attr) => *cls.name(env) == attr.attr.id,
                 _ => false,
             },
             _ => false,
@@ -638,10 +645,14 @@ fn parse_variables(
                     // flow (e.g. a later `while True: ... break`). Skip optional imports
                     // (`try: import x; except _: x = None`) like plain imports.
                     _ if involves_import_or_def(bindings, *idx, &mut SmallSet::new()) => continue,
-                    Binding::NameAssign(na) => untyped_if_call(answers, *idx, na.expr.as_ref()),
+                    Binding::NameAssign(na) => {
+                        untyped_if_call(env, answers, *idx, na.expr.as_ref())
+                    }
                     Binding::MultiTargetAssign(_, rhs_idx, _, _) => match bindings.get(*rhs_idx) {
                         Binding::Function { .. } | Binding::ClassDef(..) => continue,
-                        Binding::Expr(_, expr) => untyped_if_call(answers, *idx, expr.as_ref()),
+                        Binding::Expr(_, expr) => {
+                            untyped_if_call(env, answers, *idx, expr.as_ref())
+                        }
                         _ => {
                             unreachable!(
                                 "MultiTargetAssign RHS should be Expr, Function, or ClassDef"
@@ -765,7 +776,7 @@ fn inherited_annotation_slots(
     class_idx: Idx<KeyClass>,
     field_name: &Name,
 ) -> Option<SlotCounts> {
-    let class = answers.get_idx(class_idx).and_then(|r| r.0.clone())?;
+    let class = answers.get_idx(class_idx).and_then(|r| r.0)?;
     class_mro(answers, &class)
         .ancestors_no_object()
         .iter()
@@ -829,7 +840,7 @@ fn parse_instance_attrs(
         .iter()
         .map(|&class_idx| {
             let mut names = SmallSet::new();
-            if let Some(cls) = answers.get_idx(class_idx).and_then(|r| r.0.clone()) {
+            if let Some(cls) = answers.get_idx(class_idx).and_then(|r| r.0) {
                 let ancestors = class_mro(answers, &cls).ancestors_no_object();
                 let mro =
                     std::iter::once(&cls).chain(ancestors.iter().map(ClassType::class_object));
@@ -1543,7 +1554,7 @@ fn collect_class_members(
         if binding.parent.has_function_ancestor() {
             continue;
         }
-        let Some(cls) = answers.get_idx(idx).and_then(|r| r.0.clone()) else {
+        let Some(cls) = answers.get_idx(idx).and_then(|r| r.0) else {
             continue;
         };
 
@@ -1637,6 +1648,7 @@ impl ModuleSymbols {
         merge_overloads(&mut functions);
         let mut classes = parse_classes(&module, &answers, &hidden_classes);
         let mut variables = parse_variables(
+            &transaction.type_env(handle),
             &module,
             &answers,
             &exports,
@@ -2800,7 +2812,7 @@ mod tests {
 
     /// @overload merging with a fallback returning `Any`.
     /// Best-wins semantics mean the merged return is `Typed`, not `Any`.
-    /// Regression test for https://github.com/facebook/pyrefly/issues/3257.
+    /// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3257.
     #[test]
     fn test_report_overloads_any_fallback() {
         let report = build_module_report_for_test("overloads_any_fallback.py");
@@ -3328,7 +3340,7 @@ def g(x: int) -> int:
         assert!(!fqns.contains("pkg.baz"));
 
         // A re-export of a name its origin module doesn't define keeps the
-        // local FQN but traces to no origin (github.com/facebook/pyrefly/issues/4025)
+        // local FQN but traces to no origin (github.com/pyrefly-org/pyrefly/issues/4025)
         let (fqns, origins) = compute(
             &[
                 (

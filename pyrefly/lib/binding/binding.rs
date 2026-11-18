@@ -16,13 +16,13 @@ use pyrefly_derive::TypeEq;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
 use pyrefly_graph::index::Idx;
+use pyrefly_python::docstring::DocRanges;
 use pyrefly_python::dunder;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::nesting_context::NestingContext;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_python::symbol_kind::SymbolKind;
 use pyrefly_types::function::BodyKind;
-use pyrefly_types::function::Deprecation;
 use pyrefly_types::heap::TypeHeap;
 use pyrefly_types::special_form::SpecialForm;
 use pyrefly_types::type_alias::TypeAlias;
@@ -92,9 +92,11 @@ use crate::types::annotation::Annotation;
 use crate::types::class::AttrsFieldSpecifierKind;
 use crate::types::class::Class;
 use crate::types::class::ClassDefIndex;
+use crate::types::env::TypeEnv;
 use crate::types::equality::TypeEq;
 use crate::types::function::FuncDefIndex;
 use crate::types::globals::ImplicitGlobal;
+use crate::types::quantified::AnchorIndex;
 use crate::types::quantified::Quantified;
 use crate::types::quantified::QuantifiedIdentity;
 use crate::types::quantified::QuantifiedKind;
@@ -133,8 +135,8 @@ assert_words!(Binding, 4);
 assert_words!(BindingExpect, 8);
 assert_words!(BindingTypeAlias, 6);
 assert_words!(BindingAnnotation, 11);
-assert_words!(BindingClass, 11);
-assert_words!(BindingTParams, 9);
+assert_words!(BindingClass, 9);
+assert_words!(BindingTParams, 10);
 assert_words!(BindingClassBaseType, 3);
 assert_words!(BindingClassMetadata, 11);
 assert_words!(BindingDjangoRelations, 2);
@@ -145,7 +147,7 @@ assert_bytes!(BindingAbstractClassCheck, 4);
 assert_bytes!(BindingClassSubscriptSymmetry, 4);
 assert_words!(BindingClassField, 11);
 assert_words!(BindingClassSynthesizedFields, 2);
-assert_bytes!(BindingLegacyTypeParam, 16);
+assert_bytes!(BindingLegacyTypeParam, 32);
 assert_words!(BindingYield, 4);
 assert_words!(BindingYieldFrom, 4);
 assert_words!(BindingDecorator, 9);
@@ -406,7 +408,14 @@ pub enum AnyExportedKey {
 pub trait Keyed: Hash + Eq + Clone + DisplayWith<ModuleInfo> + Debug + 'static {
     const EXPORTED: bool = false;
     type Value: Debug + DisplayWith<Bindings>;
-    type Answer: Clone + Debug + Display + TypeEq + Visit<Type> + VisitMut<Type> + Send + Sync;
+    type Answer: Clone
+        + Debug
+        + for<'e> DisplayWith<dyn TypeEnv + 'e>
+        + TypeEq
+        + Visit<Type>
+        + VisitMut<Type>
+        + Send
+        + Sync;
     fn to_anyidx(idx: Idx<Self>) -> AnyIdx;
 
     /// Resolve the source range for this key, given access to the bindings.
@@ -471,6 +480,9 @@ impl Keyed for KeyTypeAlias {
             | BindingTypeAlias::Scoped { range, .. }
             | BindingTypeAlias::TypeAliasType { range, .. } => *range,
         }
+    }
+    fn try_to_anykey(&self) -> Option<AnyExportedKey> {
+        Some(AnyExportedKey::KeyTypeAlias(self.clone()))
     }
 }
 impl Exported for KeyTypeAlias {
@@ -735,6 +747,9 @@ impl Keyed for KeyDjangoRelations {
         BindingTable: TableKeyed<Self, Value = BindingEntry<Self>>,
     {
         TextRange::default()
+    }
+    fn try_to_anykey(&self) -> Option<AnyExportedKey> {
+        Some(AnyExportedKey::KeyDjangoRelations(self.clone()))
     }
 }
 impl Exported for KeyDjangoRelations {
@@ -1662,8 +1677,8 @@ impl DisplayWith<Bindings> for BindingTypeAlias {
 #[derive(Debug, Clone, TypeEq, Visit, VisitMut, PartialEq, Eq)]
 pub struct EmptyAnswer;
 
-impl Display for EmptyAnswer {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for EmptyAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, _env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         write!(f, "()")
     }
 }
@@ -1671,13 +1686,13 @@ impl Display for EmptyAnswer {
 #[derive(Debug, Clone, TypeEq, Visit, VisitMut, PartialEq, Eq)]
 pub struct NoneIfRecursive<T>(pub Option<T>);
 
-impl<T> Display for NoneIfRecursive<T>
+impl<'e, T> DisplayWith<dyn TypeEnv + 'e> for NoneIfRecursive<T>
 where
-    T: Display,
+    T: DisplayWith<dyn TypeEnv + 'e>,
 {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         match &self.0 {
-            Some(x) => x.fmt(f),
+            Some(x) => DisplayWith::fmt(x, f, env),
             None => write!(f, "recursive"),
         }
     }
@@ -2131,7 +2146,6 @@ impl FunctionDefData {
 #[derive(Clone, Debug)]
 pub struct ClassDefData {
     pub name: Identifier,
-    pub type_params: Option<Box<TypeParams>>,
     pub range: TextRange,
 }
 
@@ -2139,7 +2153,6 @@ impl ClassDefData {
     pub fn new(def: StmtClassDef) -> Self {
         Self {
             name: def.name,
-            type_params: def.type_params,
             range: def.range,
         }
     }
@@ -2149,6 +2162,8 @@ impl ClassDefData {
 pub struct BindingDecoratedFunction {
     pub undecorated_idx: Idx<KeyUndecoratedFunction>,
     pub successor: Option<Idx<KeyDecoratedFunction>>,
+    /// Only the docstring: the `Doc` ranges of the parameters are read from the undecorated
+    /// function's parameters when needed, which keeps this binding small.
     pub docstring_range: Option<TextRange>,
     /// Whether this function definition is contiguous with its predecessor.
     /// Used to enforce that `@overload` signatures are immediately followed by
@@ -2196,13 +2211,10 @@ pub struct ClassBinding {
     pub def: ClassDefData,
     pub def_index: ClassDefIndex,
     pub parent: NestingContext,
-    pub is_protocol: bool,
-    pub deprecation: Option<Box<Deprecation>>,
-    /// Were we able to determine, using only syntactic analysis at bindings time,
-    /// that there can be no legacy tparams? If no, we need a `BindingTParams`, if yes
-    /// we can directly compute the `TParams` from the class def.
-    pub tparams_require_binding: bool,
-    pub docstring_range: Option<TextRange>,
+    /// Whether the class declares any type parameters, decided from syntax alone. A class that
+    /// does has a `KeyTParams` / `BindingTParams` pair, which computes them.
+    pub has_tparams: bool,
+    pub doc_ranges: DocRanges,
 }
 
 #[derive(Clone, Debug)]
@@ -2403,6 +2415,8 @@ pub struct NameAssign {
     pub expr: Box<Expr>,
     pub legacy_tparams: Option<Box<[Idx<KeyLegacyTypeParam>]>>,
     pub is_in_function_scope: bool,
+    /// Known global/nonlocal writes outside module scope cannot take inline annotations.
+    pub is_mutable_capture: bool,
     /// The class whose body directly contains this assignment, if any.
     pub class_key: Option<Idx<KeyClass>>,
     pub first_use: FirstUse,
@@ -2563,8 +2577,8 @@ pub enum LambdaKind {
 #[derive(Clone, Debug)]
 pub struct TypeLevelLambdaParameter {
     /// Retained because the lambda expression can still pass through ordinary callable inference.
+    /// With `identifier`, it determines the synthetic type binder independently of solve order.
     pub id: LambdaParamId,
-    /// Determines the synthetic type binder independently of solve order.
     pub identifier: Identifier,
 }
 
@@ -3411,7 +3425,7 @@ impl AnnotationWithTarget {
         let annotation_ty = self.annotation.ty.as_ref()?;
         match self.target {
             AnnotationTarget::ArgsParam(_) => {
-                if let Type::Unpack(unpacked) = annotation_ty {
+                if let Type::Unpack(unpacked, ..) = annotation_ty {
                     Some(Type::unpacked_tuple(
                         Vec::new(),
                         (**unpacked).clone(),
@@ -3424,9 +3438,9 @@ impl AnnotationWithTarget {
                 }
             }
             AnnotationTarget::KwargsParam(_) => {
-                if let Type::Unpack(unpacked) = annotation_ty {
+                if let Type::Unpack(unpacked, ..) = annotation_ty {
                     Some((**unpacked).clone())
-                } else if matches!(annotation_ty, Type::Kwargs(_) | Type::Unpack(_)) {
+                } else if matches!(annotation_ty, Type::Kwargs(_) | Type::Unpack(..)) {
                     Some(annotation_ty.clone())
                 } else {
                     Some(heap.mk_class_type(stdlib.dict(
@@ -3440,9 +3454,9 @@ impl AnnotationWithTarget {
     }
 }
 
-impl Display for AnnotationWithTarget {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}: {}", self.target, self.annotation)
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for AnnotationWithTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
+        write!(f, "{}: {}", self.target, self.annotation.display_with(env))
     }
 }
 
@@ -3542,14 +3556,14 @@ impl DisplayWith<Bindings> for BindingAnnotation {
 #[derive(Clone, Debug)]
 pub enum BindingClass {
     ClassDef(ClassBinding),
-    FunctionalClassDef(ClassDefIndex, Identifier, NestingContext),
+    FunctionalClassDef(ClassDefIndex, Identifier),
 }
 
 impl DisplayWith<Bindings> for BindingClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, _ctx: &Bindings) -> fmt::Result {
         match self {
             Self::ClassDef(c) => write!(f, "ClassDef({})", c.def.name),
-            Self::FunctionalClassDef(_, id, _) => write!(f, "FunctionalClassDef({id})"),
+            Self::FunctionalClassDef(_, id) => write!(f, "FunctionalClassDef({id})"),
         }
     }
 }
@@ -3557,6 +3571,8 @@ impl DisplayWith<Bindings> for BindingClass {
 /// Binding for a class.
 #[derive(Clone, Debug)]
 pub struct BindingTParams {
+    /// The class whose type parameters these are.
+    pub class_idx: Idx<KeyClass>,
     pub name: Identifier,
     pub scoped_type_params: Option<Box<TypeParams>>,
     pub generic_bases: Box<[BaseClassGeneric]>,
@@ -3617,9 +3633,12 @@ pub enum ClassFieldDefinition {
     },
     /// Defined by a `def` form. Because of decorators it may not
     /// actually *be* a method, hence the name `MethodLike`.
+    /// `may_be_abstract` is false if the definition alone shows that the field is not an
+    /// abstract method.
     MethodLike {
         definition: Idx<Key>,
         has_return_annotation: bool,
+        may_be_abstract: bool,
         annotation: Option<Idx<KeyAnnotation>>,
     },
     /// A nested class definition within the class body.
@@ -3952,8 +3971,17 @@ impl DisplayWith<Bindings> for BindingClassSubscriptSymmetry {
 }
 
 #[derive(Clone, Debug)]
-/// A legacy type parameter (`T = typing.TypeVar("T")`).
-pub enum BindingLegacyTypeParam {
+/// A name in the signature or bases of a definition that may be a legacy type parameter
+/// (`T = typing.TypeVar("T")`) of that definition.
+pub struct BindingLegacyTypeParam {
+    /// The definition and the position of the name among the names that the definition's
+    /// collector met, which identify the `Quantified` if the name is a type variable.
+    pub anchor: AnchorIndex,
+    pub source: LegacyTypeParamSource,
+}
+
+#[derive(Clone, Debug)]
+pub enum LegacyTypeParamSource {
     /// The key points directly to an expression that may be a legacy type parameter.
     ParamKeyed(Idx<Key>),
     ModuleKeyed(Box<LegacyTypeParamModule>),
@@ -3975,9 +4003,9 @@ pub struct LegacyTypeParamModule {
 impl DisplayWith<Bindings> for BindingLegacyTypeParam {
     fn fmt(&self, f: &mut fmt::Formatter<'_>, ctx: &Bindings) -> fmt::Result {
         write!(f, "BindingLegacyTypeParam(")?;
-        match self {
-            Self::ParamKeyed(k) => write!(f, "{}", ctx.display(*k)),
-            Self::ModuleKeyed(module) => {
+        match &self.source {
+            LegacyTypeParamSource::ParamKeyed(k) => write!(f, "{}", ctx.display(*k)),
+            LegacyTypeParamSource::ModuleKeyed(module) => {
                 write!(f, "{}", ctx.display(module.base))?;
                 for attr in module.attrs.iter() {
                     write!(f, ".{}", attr)?;
@@ -3991,9 +4019,9 @@ impl DisplayWith<Bindings> for BindingLegacyTypeParam {
 
 impl BindingLegacyTypeParam {
     pub fn idx(&self) -> Idx<Key> {
-        match self {
-            Self::ParamKeyed(idx) => *idx,
-            Self::ModuleKeyed(module) => module.base,
+        match &self.source {
+            LegacyTypeParamSource::ParamKeyed(idx) => *idx,
+            LegacyTypeParamSource::ModuleKeyed(module) => module.base,
         }
     }
 }

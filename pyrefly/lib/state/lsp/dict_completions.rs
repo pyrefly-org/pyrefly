@@ -18,6 +18,7 @@ use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_types::data_frame::DataFrameKind;
 use pyrefly_types::facet::FacetKind;
 use pyrefly_types::known_class::KnownClass;
+use pyrefly_util::display::DisplayWithCtx;
 use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprCall;
@@ -41,6 +42,7 @@ use crate::binding::narrow::int_from_slice;
 use crate::lsp::wasm::completion::RankedCompletion;
 use crate::state::lsp::TransactionHandle;
 use crate::state::state::Transaction;
+use crate::types::env::TypeEnv;
 use crate::types::types::Type;
 
 const STRING_LITERAL_CURSOR_ALLOWANCE: TextSize = TextSize::new(4);
@@ -162,21 +164,23 @@ impl<'a> Transaction<'a> {
         self.get_type_trace(handle, range)
     }
 
-    fn type_contains_typed_dict(ty: &Type) -> bool {
-        match ty {
-            Type::TypedDict(_) | Type::PartialTypedDict(_) => true,
-            Type::Union(u) => u.members.iter().any(Self::type_contains_typed_dict),
-            _ => false,
-        }
+    /// A declared TypedDict instance is an ordinary `ClassType`, so recognizing one needs a solver.
+    fn type_contains_typed_dict(&self, handle: &Handle, ty: &Type) -> bool {
+        self.ad_hoc_solve(handle, "type_contains_typed_dict", |solver| {
+            !Self::typed_dict_members(&solver, ty.clone()).is_empty()
+        }) == Some(true)
     }
 
-    fn typed_dict_members(base_type: Type) -> Vec<Type> {
+    fn typed_dict_members<'b>(
+        solver: &AnswersSolver<TransactionHandle<'b>>,
+        base_type: Type,
+    ) -> Vec<Type> {
         let mut members = Vec::new();
         let mut stack = vec![base_type];
         while let Some(ty) = stack.pop() {
             match ty {
-                Type::TypedDict(_) | Type::PartialTypedDict(_) => members.push(ty),
                 Type::Union(u) => stack.extend(u.members),
+                ty if solver.is_typed_dict(&ty) => members.push(ty),
                 _ => {}
             }
         }
@@ -190,16 +194,16 @@ impl<'a> Transaction<'a> {
         members
             .into_iter()
             .filter_map(|member| {
-                let typed_dict = match &member {
-                    Type::TypedDict(td) | Type::PartialTypedDict(td) => td,
+                let fields = match &member {
+                    Type::ClassType(ct) | Type::PartialTypedDict(ct) => {
+                        solver.type_order().typed_dict_fields(ct)
+                    }
+                    Type::AnonymousTypedDict(td) => td.fields.iter().cloned().collect(),
                     _ => return None,
-                };
-                let fields = solver
-                    .type_order()
-                    .typed_dict_fields(typed_dict)
-                    .into_iter()
-                    .map(|(name, field)| (name.to_string(), field.ty))
-                    .collect();
+                }
+                .into_iter()
+                .map(|(name, field)| (name.to_string(), field.ty))
+                .collect();
                 Some((member, fields))
             })
             .collect()
@@ -215,7 +219,7 @@ impl<'a> Transaction<'a> {
     ) -> Option<Vec<Type>> {
         let base_type = self.construction_contextual_type(handle, module, dict.range())?;
         self.ad_hoc_solve(handle, "dict_literal_typed_dict_members", |solver| {
-            let members = Self::typed_dict_members(base_type);
+            let members = Self::typed_dict_members(&solver, base_type);
             if members.is_empty() {
                 return Vec::new();
             }
@@ -442,27 +446,14 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    fn expr_has_typed_dict_type(&self, handle: &Handle, expr: &Expr) -> bool {
-        self.get_type_trace(handle, expr.range())
-            .map(|ty| Self::type_contains_typed_dict(&ty))
-            .unwrap_or(false)
-    }
-
     /// Extracts typed dict access from `.get()` method calls.
     /// This handles both `d.get("key")` and `d["key"]` patterns - the subscript
     /// case is handled in `dict_key_string_literal_at`.
-    fn typed_dict_get_string_literal(
-        &self,
-        handle: &Handle,
-        call: &ExprCall,
-    ) -> Option<(Expr, ExprStringLiteral)> {
+    fn typed_dict_get_string_literal(call: &ExprCall) -> Option<(Expr, ExprStringLiteral)> {
         let Expr::Attribute(attr) = call.func.as_ref() else {
             return None;
         };
         if attr.attr.id.as_str() != "get" {
-            return None;
-        }
-        if !self.expr_has_typed_dict_type(handle, attr.value.as_ref()) {
             return None;
         }
         // If there's already a string literal, we want to provide completions
@@ -485,8 +476,6 @@ impl<'a> Transaction<'a> {
     }
 
     fn dict_key_string_literal_at(
-        &self,
-        handle: &Handle,
         module: &ModModule,
         position: TextSize,
     ) -> Option<(Expr, ExprStringLiteral)> {
@@ -508,7 +497,7 @@ impl<'a> Transaction<'a> {
                     };
                     literal.map(|lit| (sub.value.as_ref().clone(), lit.clone()))
                 }
-                AnyNodeRef::ExprCall(call) => self.typed_dict_get_string_literal(handle, call),
+                AnyNodeRef::ExprCall(call) => Self::typed_dict_get_string_literal(call),
                 _ => None,
             };
             let Some((base_expr, literal)) = candidate else {
@@ -546,9 +535,7 @@ impl<'a> Transaction<'a> {
         // Prefer direct key access (`d["k"]` / `d.get("k")`) so we can reuse the base
         // expression for facet-based completions, then dict literal keys, surrounding
         // calls, and finally an empty subscript slot (`d[|]`) with no key string typed yet.
-        if let Some((base_expr, literal)) =
-            self.dict_key_string_literal_at(handle, module, position)
-        {
+        if let Some((base_expr, literal)) = Self::dict_key_string_literal_at(module, position) {
             Some(DictKeyLiteralContext::KeyAccess { base_expr, literal })
         } else if let Some(context) = self.dict_literal_string_literal_at(handle, module, position)
         {
@@ -599,7 +586,9 @@ impl<'a> Transaction<'a> {
             };
             if let Some(treats_strings_as_columns) = self
                 .get_type_trace(handle, call.func.range())
-                .and_then(|ty| polars_function_treats_strings_as_columns(&ty))
+                .and_then(|ty| {
+                    polars_function_treats_strings_as_columns(&self.type_env(handle), &ty)
+                })
             {
                 if !treats_strings_as_columns && !inside_column_helper {
                     return None;
@@ -661,7 +650,7 @@ impl<'a> Transaction<'a> {
                     }
                     let Some(base_type) = self
                         .construction_contextual_type(handle, module, set.range())
-                        .filter(Self::type_contains_typed_dict)
+                        .filter(|ty| self.type_contains_typed_dict(handle, ty))
                     else {
                         continue;
                     };
@@ -834,15 +823,11 @@ impl<'a> Transaction<'a> {
         base_type: Type,
     ) -> Option<BTreeMap<String, Type>> {
         self.ad_hoc_solve(handle, "typed_dict_keys", |solver| {
+            let members = Self::typed_dict_members(&solver, base_type);
             let mut map = BTreeMap::new();
-            for member in Self::typed_dict_members(base_type) {
-                let typed_dict = match member {
-                    Type::TypedDict(td) | Type::PartialTypedDict(td) => td,
-                    _ => continue,
-                };
-                for (name, field) in solver.type_order().typed_dict_fields(&typed_dict) {
-                    map.entry(name.to_string())
-                        .or_insert_with(|| field.ty.clone());
+            for (_, fields) in Self::typed_dict_member_field_maps(&solver, members) {
+                for (name, ty) in fields {
+                    map.entry(name).or_insert(ty);
                 }
             }
             map
@@ -881,7 +866,12 @@ impl<'a> Transaction<'a> {
         else {
             return false;
         };
-        Self::add_literal_completions_from_type(&field_ty, completions, true);
+        Self::add_literal_completions_from_type(
+            &self.type_env(handle),
+            &field_ty,
+            completions,
+            true,
+        );
         true
     }
 
@@ -995,7 +985,12 @@ impl<'a> Transaction<'a> {
         if suggestions.is_empty() {
             return false;
         }
-        Self::push_dict_key_completions(suggestions, completions, context.needs_quotes());
+        Self::push_dict_key_completions(
+            &self.type_env(handle),
+            suggestions,
+            completions,
+            context.needs_quotes(),
+        );
         true
     }
 
@@ -1069,9 +1064,7 @@ impl<'a> Transaction<'a> {
                     suggestions.entry(column).or_insert(None);
                 }
             }
-            if Self::type_contains_typed_dict(&base_type)
-                && let Some(typed_keys) = self.collect_typed_dict_keys(handle, base_type)
-            {
+            if let Some(typed_keys) = self.collect_typed_dict_keys(handle, base_type) {
                 for (key, ty) in typed_keys {
                     let entry = suggestions.entry(key).or_insert(None);
                     if entry.is_none() {
@@ -1083,12 +1076,13 @@ impl<'a> Transaction<'a> {
     }
 
     fn push_dict_key_completions(
+        env: &dyn TypeEnv,
         suggestions: BTreeMap<String, Option<Type>>,
         completions: &mut Vec<RankedCompletion>,
         quote: bool,
     ) {
         for (label, ty_opt) in suggestions {
-            let detail = ty_opt.as_ref().map(|ty| ty.to_string());
+            let detail = ty_opt.as_ref().map(|ty| ty.display_with(env).to_string());
             let insert_text = quote.then(|| format!("\"{label}\""));
             completions.push(RankedCompletion::new(CompletionItem {
                 label,
@@ -1111,7 +1105,7 @@ impl<'a> Transaction<'a> {
         covering_nodes: &[AnyNodeRef],
         completions: &mut Vec<RankedCompletion>,
     ) {
-        if !Self::type_contains_typed_dict(base_type) {
+        if !self.type_contains_typed_dict(handle, base_type) {
             return;
         }
         let Some(module_info) = self.get_module_info(handle) else {
@@ -1150,6 +1144,7 @@ impl<'a> Transaction<'a> {
         };
         // Clients filter on the text from the start of the edit, which includes the dot.
         let accessor = module_info.code_at(TextRange::new(dot, attribute.start()));
+        let type_env = self.type_env(handle);
         for (key, ty) in keys {
             let quoted_key = if f_string_quotes.is_empty() {
                 to_string(&key).expect("Serializing a string cannot fail")
@@ -1161,7 +1156,7 @@ impl<'a> Transaction<'a> {
             completions.push(RankedCompletion::new(CompletionItem {
                 filter_text: Some(format!("{accessor}{key}")),
                 label: key,
-                detail: Some(ty.to_string()),
+                detail: Some(ty.display_with(&type_env).to_string()),
                 kind: Some(CompletionItemKind::Field),
                 text_edit: Some(CompletionItemTextEdit::TextEdit(TextEdit {
                     range: edit_range,
@@ -1211,7 +1206,7 @@ impl<'a> Transaction<'a> {
         }
         let base_type = self
             .construction_contextual_type(handle, module, call.range())
-            .filter(Self::type_contains_typed_dict)?;
+            .filter(|ty| self.type_contains_typed_dict(handle, ty))?;
         let mut fields = self.collect_typed_dict_keys(handle, base_type)?;
         let mut supplied = BTreeSet::new();
         for keyword in &call.arguments.keywords {

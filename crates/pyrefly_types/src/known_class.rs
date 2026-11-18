@@ -42,6 +42,13 @@ macro_rules! known_classes {
                     _ => None,
                 }
             }
+
+            /// The name the class is defined with.
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)*
+                }
+            }
         }
     };
 }
@@ -252,10 +259,7 @@ mod tests {
     use ruff_text_size::TextRange;
 
     use super::*;
-    use crate::class::Class;
-    use crate::class::ClassDefIndex;
     use crate::class::ClassType;
-    use crate::class::PrecomputedTParams;
     use crate::test_type_env::TestTypeEnv;
     use crate::types::TArgs;
 
@@ -314,20 +318,17 @@ mod tests {
 
     #[test]
     fn test_nested_class_is_not_known() {
+        let env = TestTypeEnv::new();
         let module = Module::new(
             ModuleName::builtins(),
             ModulePath::filesystem(PathBuf::from("builtins.py")),
             Arc::new(String::new()),
         );
         let outer = Identifier::new(Name::new("Foo"), TextRange::default());
-        let nested = Class::new(
-            ClassDefIndex(1),
+        let nested = env.define_class(
             Identifier::new(Name::new("int"), TextRange::default()),
             NestingContext::class(ShortIdentifier::new(&outer), NestingContext::toplevel()),
             module,
-            PrecomputedTParams::NotGeneric,
-            false,
-            None,
         );
         assert_eq!(
             nested.known(),

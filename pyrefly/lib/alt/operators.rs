@@ -20,6 +20,7 @@ use pyrefly_types::quantified::QuantifiedKind;
 use pyrefly_types::quantified::TypeVarLike;
 use pyrefly_types::simplify::intersect;
 use pyrefly_types::type_var::Restriction;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::prelude::VecExt;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::ExprBinOp;
@@ -519,7 +520,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         Some(self.heap.mk_concrete_tuple(repeated))
     }
 
-    fn as_hint_for_display(lhs: &Type) -> Option<HintRef> {
+    fn as_hint_for_display(lhs: &Type) -> Option<HintRef<'_, '_>> {
         // In an operation between `lhs` and a container display (e.g., `[3]`, `{"a": 0)]`), the
         // type of the display should be inferred using `lhs` as a hint when the latter is a
         // container type with a display syntax. Hinting is harmless when the types don't match.
@@ -623,6 +624,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     intersect(
                         vec![q.clone().to_type(self.heap), res.clone()],
                         res,
+                        self,
                         self.heap,
                     )
                 } else {
@@ -632,7 +634,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         } else if let Some(narrowed_type) = narrowed_type {
             f(narrowed_type)
         } else {
-            f(&q.upper_bound(self.stdlib, self.heap))
+            f(&q.upper_bound(self, self.heap))
         }
     }
 
@@ -1133,7 +1135,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 errors,
                                 x.range,
                                 ErrorKind::UnsupportedOperation,
-                                context().format(),
+                                context().format(self),
                             );
                             return self.heap.mk_class_type(self.stdlib.bool().clone());
                         }
@@ -1249,7 +1251,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     errors,
                     x.range,
                     ErrorKind::UnsupportedOperation,
-                    context().format(),
+                    context().format(self),
                 ),
             }
         };
@@ -1351,21 +1353,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // Explicit/implicit literal style is typing metadata, not runtime identity.
                 if l1.value != l2.value {
                     emit_literal_warning(
-                        &l1.value.to_string(),
-                        &l2.value.to_string(),
+                        &l1.value.display_with(self).to_string(),
+                        &l2.value.display_with(self).to_string(),
                         if is_op { "False" } else { "True" },
                     );
                 } else if is_bool_literal(&l1.value) {
                     emit_literal_warning(
-                        &l1.value.to_string(),
-                        &l2.value.to_string(),
+                        &l1.value.display_with(self).to_string(),
+                        &l2.value.display_with(self).to_string(),
                         if is_op { "True" } else { "False" },
                     );
                 }
             }
             (Type::Literal(l), Type::None) => {
                 emit_literal_warning(
-                    &l.value.to_string(),
+                    &l.value.display_with(self).to_string(),
                     "None",
                     if is_op { "False" } else { "True" },
                 );
@@ -1373,7 +1375,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             (Type::None, Type::Literal(l)) => {
                 emit_literal_warning(
                     "None",
-                    &l.value.to_string(),
+                    &l.value.display_with(self).to_string(),
                     if is_op { "False" } else { "True" },
                 );
             }
@@ -1384,8 +1386,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if !self.is_subset_eq(cdef, ctype) =>
             {
                 emit_instance_is_class_warning(
-                    &ctype.to_string(),
-                    cdef_inner.name().as_str(),
+                    &ctype.display_with(self).to_string(),
+                    cdef_inner.name(self).as_str(),
                     is_op,
                 );
             }
@@ -1419,8 +1421,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if left_group == right_group {
             return;
         }
-        let left_display = self.for_display(left.clone());
-        let right_display = self.for_display(right.clone());
+        let left_display = self.display(left.clone());
+        let right_display = self.display(right.clone());
         self.error(
             errors,
             range,
