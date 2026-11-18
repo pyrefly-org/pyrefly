@@ -1098,6 +1098,57 @@ mod tests {
     }
 
     #[test]
+    fn test_diagnostic_mode_setting_compatibility() {
+        let root = TempDir::new().unwrap();
+        let scope_uri = Some(Uri::from_directory_path(root.path()).unwrap());
+        let path = root.path().join("main.py");
+        for (settings, expected) in [
+            (json!({}), DiagnosticMode::OpenFilesOnly),
+            (
+                json!({"analysis": {"diagnosticMode": "workspace"}}),
+                DiagnosticMode::Workspace,
+            ),
+            (
+                json!({"pyrefly": {"diagnosticMode": "workspace"}}),
+                DiagnosticMode::Workspace,
+            ),
+            (
+                json!({
+                    "analysis": {"diagnosticMode": "openFilesOnly"},
+                    "pyrefly": {"diagnosticMode": "workspace"},
+                }),
+                DiagnosticMode::Workspace,
+            ),
+            (
+                json!({
+                    "analysis": {"diagnosticMode": "workspace"},
+                    "pyrefly": {"diagnosticMode": "openFilesOnly"},
+                }),
+                DiagnosticMode::OpenFilesOnly,
+            ),
+        ] {
+            let workspaces = Workspaces::new(Workspace::new(), &[root.path().to_path_buf()]);
+            let mut modified = false;
+            workspaces.apply_client_configuration(
+                &mut modified,
+                &scope_uri,
+                settings.clone(),
+                ServerMode::LanguageServer,
+            );
+            assert_eq!(workspaces.diagnostic_mode(&path), expected, "{settings}");
+            assert_eq!(
+                workspaces.workspace_diagnostic_roots(),
+                if expected == DiagnosticMode::Workspace {
+                    vec![root.path().to_path_buf()]
+                } else {
+                    Vec::new()
+                },
+                "{settings}"
+            );
+        }
+    }
+
+    #[test]
     fn test_scoped_config_path_is_absolute_and_preserves_relative_suffix() {
         let root = TempDir::new().unwrap();
         let root_path = root.path().to_path_buf();

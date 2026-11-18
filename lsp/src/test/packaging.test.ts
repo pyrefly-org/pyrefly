@@ -23,3 +23,20 @@ suite('find_pyrefly.py', () => {
     );
   });
 });
+
+suite('diagnosticMode setting', () => {
+  test('declares only the analysis setting', () => {
+    const extension = vscode.extensions.getExtension('meta.pyrefly');
+    assert.ok(extension);
+    const properties = extension.packageJSON.contributes.configuration.properties;
+    assert.strictEqual(properties['python.pyrefly.diagnosticMode'], undefined);
+    assert.deepStrictEqual(
+      properties['python.analysis.diagnosticMode'].enum,
+      ['openFilesOnly', 'workspace'],
+    );
+    assert.strictEqual(
+      properties['python.analysis.diagnosticMode'].default,
+      'openFilesOnly',
+    );
+  });
+});
