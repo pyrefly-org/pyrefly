@@ -1496,11 +1496,11 @@ impl<'a> Transaction<'a> {
             context,
         }) = self.identifier_at(handle, position)
         else {
-            if let Some((_, name)) = self.get_exports_data(handle).dunder_all_name_at(position) {
-                return self
-                    .get_solutions(handle)?
-                    .get_hashed_opt(Hashed::new(&KeyExport(name)))
-                    .cloned();
+            if let Some((_, name)) = self.get_exports_data(handle).dunder_all_name_at(position)
+                && let Some(solutions) = self.get_solutions(handle)
+                && let Some(ty) = solutions.get_hashed_opt(Hashed::new(&KeyExport(name)))
+            {
+                return Some(ty.clone());
             }
             return self
                 .type_from_match_wildcard_at_impl(handle, position)

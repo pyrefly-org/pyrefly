@@ -16,6 +16,28 @@ use tempfile::TempDir;
 use crate::test::lsp::lsp_interaction::util::get_test_files_root;
 
 #[test]
+fn hover_dunder_all_unimported_submodule_has_fallback() {
+    let root = TempDir::new().unwrap();
+    fs::create_dir(root.path().join("pkg")).unwrap();
+    fs::write(
+        root.path().join("pkg").join("__init__.py"),
+        "__all__ = ['sub']\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("pkg").join("sub.py"), "value = 1\n").unwrap();
+    let mut interaction = LspInteraction::new();
+    interaction.set_root(root.path().to_path_buf());
+    interaction.initialize(Default::default()).unwrap();
+    interaction.client.did_open("pkg/__init__.py");
+    interaction
+        .client
+        .hover("pkg/__init__.py", 0, 13)
+        .expect_hover_response_with_markup(|value| value.is_some_and(|text| text.contains("sub")))
+        .unwrap();
+    interaction.shutdown().unwrap();
+}
+
+#[test]
 fn hover_dunder_all_uses_open_buffer_export() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("main.pyi"), "value: bytes\n").unwrap();
