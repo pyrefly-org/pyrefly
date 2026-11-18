@@ -1554,6 +1554,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             row_index_name,
         } = common;
         let (mut columns, selection) = match schema {
+            // A complete schema changes only for positional dtype overrides.
             CsvSchema::Given(columns) => (columns, selection),
             CsvSchema::Missing => {
                 let CsvColumnSelection::Names(names) = selection else {
