@@ -2900,6 +2900,7 @@ pub enum TypeVarSpecializationError {
         name: Name,
         got: Type,
         want: Type,
+        argument: Option<ArgumentKey>,
     },
     BadConstraintSpecialization {
         name: Name,
@@ -2943,14 +2944,14 @@ impl TypeVarSpecializationError {
                 restriction.kind_name(),
                 ans.display(selected),
             ),
-            Self::BadBoundSpecialization { name, got, want } => {
-                TypeCheckKind::TypeVarSpecialization(name).format_error(
-                    ans,
-                    &ans.for_display(got),
-                    &ans.for_display(want),
-                    ans.module().name(),
-                )
-            }
+            Self::BadBoundSpecialization {
+                name, got, want, ..
+            } => TypeCheckKind::TypeVarSpecialization(name).format_error(
+                ans,
+                &ans.for_display(got),
+                &ans.for_display(want),
+                ans.module().name(),
+            ),
             Self::BadConstraintSpecialization { name, got, want } => {
                 format!(
                     "`{}` is not assignable to any of constraints {} of type variable `{name}`",
@@ -3974,6 +3975,7 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                                 name: q.name().clone(),
                                 got: t1_p.clone(),
                                 want: bound,
+                                argument: self.active_call_context.argument(),
                             };
                         (t1_p.clone(), Some(specialization_error))
                     } else {
@@ -4259,6 +4261,7 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                                         name,
                                         got: t2.clone(),
                                         want: bound,
+                                        argument: self.active_call_context.argument(),
                                     },
                                 );
                             }
@@ -4700,6 +4703,7 @@ mod tests {
             name: param.name().clone(),
             got: Type::None,
             want: bound,
+            argument: None,
         };
         solver.variables.lock().insert_fresh(
             var,

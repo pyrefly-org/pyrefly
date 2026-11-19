@@ -744,6 +744,18 @@ assert_type(C[bool](0), C[bool])  # E: Argument `Literal[0]` is not assignable t
 );
 
 testcase!(
+    test_generic_constructor_specialization_identifies_parameter,
+    r#"
+class Holder[T: int]:
+    def __init__(self, value: T, fallback: T) -> None: ...
+
+Holder(1, 2)
+Holder(1, "bad fallback")  # E: `str` is not assignable to upper bound `int` of type variable `T` for parameter `fallback`
+Holder(1, fallback="bad fallback")  # E: `str` is not assignable to upper bound `int` of type variable `T` for parameter `fallback`
+"#,
+);
+
+testcase!(
     test_new_return_self,
     r#"
 from typing import Self, assert_type
