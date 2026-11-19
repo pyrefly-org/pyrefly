@@ -6,6 +6,7 @@
  */
 
 use std::cmp::max;
+use std::sync::Arc;
 
 use itertools::Either;
 use itertools::Itertools;
@@ -520,7 +521,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     .as_ref()
                     .filter(|tparams| !tparams.is_empty())
                     .cloned();
-                OverloadTrace::new(target.1.signature.clone(), tparams)
+                OverloadTrace::new(
+                    target.1.signature.clone(),
+                    tparams,
+                    target
+                        .1
+                        .metadata
+                        .kind
+                        .as_func_def_id()
+                        .map(|func_id| Arc::new(func_id.clone())),
+                )
             };
             let all_overload_traces = overloads.iter().map(&mut overload_trace).collect();
             let closest_overload_trace = overload_trace(closest_overload.func);
