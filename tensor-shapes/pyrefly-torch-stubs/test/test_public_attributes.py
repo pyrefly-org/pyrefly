@@ -17,6 +17,13 @@ def test_public_attributes() -> None:
     assert_type(torch.complex64, torch.dtype)
     assert_type(torch.complex128, torch.dtype)
     assert_type(torch.strided, torch.layout)
+    assert_type(torch.jagged, torch.layout)
+    assert torch.jagged != torch.strided
+    assert_type(torch.sparse_coo, torch.layout)
+    assert_type(torch.sparse_csr, torch.layout)
+    assert_type(torch.sparse_csc, torch.layout)
+    assert_type(torch.sparse_bsr, torch.layout)
+    assert_type(torch.sparse_bsc, torch.layout)
     assert_type(torch.get_num_threads(), int)
     assert_type(torch.get_float32_matmul_precision(), str)
     assert_type(torch.are_deterministic_algorithms_enabled(), bool)

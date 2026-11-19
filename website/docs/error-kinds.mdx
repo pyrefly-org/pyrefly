@@ -1035,7 +1035,7 @@ assigned via the class.
 
 ## internal-error
 
-Ideally you'll never see this one. If you do, please consider [filing a bug](https://github.com/facebook/pyrefly/issues).
+Ideally you'll never see this one. If you do, please consider [filing a bug](https://github.com/pyrefly-org/pyrefly/issues).
 
 ## invalid-abstract-method
 
@@ -1895,6 +1895,25 @@ opts: Options = {}
 f(name="test", **opts)  # E: Multiple values for argument `name`
 ```
 
+## property-type-mismatch
+
+Default severity: `ignore`
+
+The `strict` preset enables this check as an error.
+
+Pyrefly reports a property setter whose value type cannot overlap the getter's return type.
+Such a property is type safe, but reading it back never returns a value of the type that was assigned, which is usually a mistake.
+A setter that accepts a wider or narrower type than the getter returns is not reported.
+
+```python
+class Config:
+    @property
+    def port(self) -> int: ...
+
+    @port.setter
+    def port(self, value: str) -> None: ...  # property-type-mismatch
+```
+
 ## protected-access
 
 Default severity: `ignore`
@@ -2136,11 +2155,35 @@ class MyProto(Protocol):
     x: int | None = None
 ```
 
+## unannotated-public-return
+
+Default severity: `ignore`
+
+A public function is missing a return annotation. Here, public means a name without a leading underscore (or a dunder name), with only public classes as enclosing scopes. Functions nested inside functions are excluded. This is a name-based check: it does not follow `__all__`, re-exports, or module visibility. As with [unannotated-return](#unannotated-return), `__init__` methods and `@no_type_check` functions are exempt.
+
+To require return annotations only on public functions:
+
+```toml
+[errors]
+unannotated-return = "ignore"
+unannotated-public-return = "error"
+```
+
+```python
+def calculate_sum(x: int, y: int):  # error: missing a return annotation
+    return x + y
+
+def _helper():  # private: return type is inferred
+    return 1
+```
+
+This is a sub-kind of `unannotated-return`: it inherits that code's configured severity unless overridden explicitly. Suppressing `unannotated-return` also suppresses this code.
+
 ## unannotated-return
 
 Default severity: `ignore`
 
-This error is raised when a function is missing a return type annotation. This helps enforce fully-typed codebases by ensuring all functions declare their return types explicitly. To fix it, add a return type annotation to the function.
+This error is raised when a function is missing a return type annotation. This helps enforce fully-typed codebases by ensuring all functions declare their return types explicitly. Public functions are reported under the [unannotated-public-return](#unannotated-public-return) sub-kind. To fix it, add a return type annotation to the function.
 
 ```python
 def calculate_sum(x: int, y: int):  # error: `calculate_sum` is missing a return annotation
@@ -2491,44 +2534,6 @@ __all__ = generate_all()
 # `__all__` could not be statically analyzed [unresolvable-dunder-all]
 ```
 
-## unresolved-import-signature
-
-Default severity: `warn`
-
-For example, when `missing_backend` cannot be resolved:
-
-```python
-from missing_backend import Array
-
-
-def consume(value: Array) -> None: ...
-
-
-value = object()
-consume(value)  # unresolved-import-signature
-```
-
-This warning is emitted when a call needs input types recovered from unresolved
-imports. Known alternatives such as `int` in `int | missing.Array` remain usable,
-and an omitted optional parameter does not make the call unavailable. The warning
-is reported for the signature, not separately for each affected parameter.
-
-In overloaded functions, each signature is checked independently. Unavailable
-candidates do not prevent another overload from matching. If only one overload has
-compatible arity, it can still supply recovery information while this warning is
-reported. When no overload matches, `no-matching-overload` may also be reported.
-Configuring this warning to `ignore` hides it without restoring skipped candidates.
-
-Explicit `Any` and imports intentionally replaced with `Any` are unaffected.
-Passing an unknown value to a well-defined generic API does not make its signature
-unavailable.
-
-This check does not validate every imported annotation. Return-only and nested
-contravariant dependencies can still weaken inference or shadow a usable overload.
-In non-overloaded calls, arguments containing calls or contextual
-lambda/comprehension bindings are not checked for this warning and retain their
-normal contextual typing.
-
 ## unsafe-overlap
 
 Protocols decorated with `@runtime_checkable` may be used in `isinstance` and `issubclass` checks, but the runtime will only check that all the required attributes are present, without looking at their types.
@@ -2764,11 +2769,6 @@ This warning suggests covariance or contravariance for an invariant protocol
 only returns `T`, the warning suggests declaring `T` as covariant. Incorrect usage
 of an explicitly covariant or contravariant `TypeVar` is reported as
 [`invalid-variance`](#invalid-variance) instead.
-
-Constrained `TypeVar`s, such as `TypeVar("T", str, bytes)`, are exempt from this
-warning. Constraints commonly describe a fixed set of unrelated alternatives, so
-invariance is often sufficient and narrower-variance suggestions are noisy.
-Bounded `TypeVar`s, such as `TypeVar("T", bound=float)`, are still checked.
 
 ```python
 from typing import Protocol, TypeVar

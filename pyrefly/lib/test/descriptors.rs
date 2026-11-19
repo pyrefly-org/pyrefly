@@ -334,6 +334,113 @@ class Foo:
     "#,
 );
 
+// https://github.com/pyrefly-org/pyrefly/issues/3654
+testcase!(
+    test_property_setter_type_disjoint_from_getter,
+    TestEnv::new().enable_property_type_mismatch_error(),
+    r#"
+class Foo:
+    @property
+    def value(self) -> int:
+        return 1
+
+    @value.setter
+    def value(self, new_value: str) -> None:  # E: Setter for property `value` accepts `str`, which cannot overlap the getter type `int`
+        pass
+
+class Bar:
+    @property
+    def value(self) -> int | None:
+        return None
+
+    @value.setter
+    def value(self, new_value: str | bytes) -> None:  # E: Setter for property `value` accepts `bytes | str`, which cannot overlap the getter type `int | None`
+        pass
+    "#,
+);
+
+testcase!(
+    test_property_setter_type_overlapping_getter,
+    TestEnv::new().enable_property_type_mismatch_error(),
+    r#"
+from pathlib import Path
+from typing import overload
+
+class Wider:
+    @property
+    def path(self) -> Path:
+        return Path()
+
+    @path.setter
+    def path(self, value: str | Path) -> None:
+        pass
+
+class Narrower:
+    @property
+    def count(self) -> int | None:
+        return None
+
+    @count.setter
+    def count(self, value: bool) -> None:
+        pass
+
+class Base: ...
+class Other: ...
+
+class Unrelated:
+    @property
+    def item(self) -> Base:
+        return Base()
+
+    @item.setter
+    def item(self, value: Other) -> None:
+        pass
+
+class Generic[T]:
+    @property
+    def item(self) -> T:
+        raise NotImplementedError
+
+    @item.setter
+    def item(self, value: list[T]) -> None:
+        pass
+
+class Unannotated:
+    @property
+    def inferred(self):
+        pass
+
+    @inferred.setter
+    def inferred(self, value: int) -> None:
+        pass
+
+    @property
+    def value(self) -> int:
+        return 1
+
+    @value.setter
+    def value(self, value) -> None:
+        pass
+
+class OverloadedSetter:
+    @property
+    def x(self) -> int:
+        return 1
+
+    @x.setter
+    @overload
+    def x(self, value: None) -> None: ...
+
+    @x.setter
+    @overload
+    def x(self, value: int) -> None: ...
+
+    @x.setter
+    def x(self, value: int | None) -> None:
+        pass
+    "#,
+);
+
 testcase!(
     test_cached_property_assignment_allowed,
     r#"
@@ -424,13 +531,13 @@ class Foo:
         return {"a": "b"}
 
 def main() -> None:
-    Foo.foo.get("a")
+    Foo.foo.get("a")  # E: Object of class `property` has no attribute `get`
     Foo().foo.get("a")
     "#,
 );
 
 testcase!(
-    bug = "cached_property's __name__ should not exist and attrname should be a str",
+    bug = "cached_property is modeled as property",
     test_cached_property_attrname,
     r#"
 from functools import cached_property
@@ -442,7 +549,7 @@ class C:
         return 42
 
 reveal_type(C.foo.__name__)  # E: revealed type: str
-reveal_type(C.foo.attrname)  # E: revealed type: Any
+reveal_type(C.foo.attrname)  # E: revealed type: Unknown  # E: Object of class `property` has no attribute `attrname`
     "#,
 );
 
@@ -961,7 +1068,7 @@ C.d = "wrong"  # E: `Literal['wrong']` is not assignable to attribute `d` with t
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1792
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1792
 testcase!(
     test_descriptor_in_dataclass_transform,
     r#"
@@ -1063,7 +1170,7 @@ class Unsafe(Model):
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1803
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1803
 testcase!(
     test_set_instance_attribute,
     r#"
@@ -1184,7 +1291,7 @@ def main(cat: Cat[Literal["pyarrow"]]) -> None:
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4826: an implicit `__get__` call
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4826: an implicit `__get__` call
 // should go through overload step 5 (materialization) just like an explicit call does.
 testcase!(
     test_overloaded_descriptor_get_any_instance_is_ambiguous,
@@ -1398,7 +1505,7 @@ def f(foo: Foo) -> None:
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4844.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4844.
 testcase!(
     test_descriptor_concatenate_infers_remaining_paramspec,
     r#"
@@ -1432,7 +1539,7 @@ assert Example().field(1) == 1
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4844.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4844.
 // This simulates the descriptor typing used by `weave.op`.
 testcase!(
     test_descriptor_concatenate_consumes_named_receiver,
@@ -1478,7 +1585,7 @@ assert Example().call() == 1
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4592
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4592
 testcase!(
     test_callable_descriptor_self_concatenate_with_sibling_type_var,
     r#"
@@ -1591,6 +1698,24 @@ class D:
 class K:
     x: D = D()  # E: Cannot set field `x` to data descriptor `D` with inconsistent types
 reveal_type(K.__init__)  # E: revealed type: (self: K, x: bool = ...) -> None
+"#,
+);
+
+testcase!(
+    test_descriptor_setter_missing_value_param_in_dataclass,
+    r#"
+from dataclasses import dataclass
+from typing import Any, reveal_type
+
+class Bad:
+    def __get__(self, obj: object, objtype: Any = None) -> int: ...
+    def __set__(self, obj: object) -> None: ...
+
+@dataclass
+class Owner:
+    b: Bad = Bad()
+
+reveal_type(Owner.__init__)  # E: revealed type: (self: Owner, b: Unknown = ...) -> None
 "#,
 );
 

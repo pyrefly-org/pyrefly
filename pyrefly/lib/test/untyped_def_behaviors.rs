@@ -556,7 +556,7 @@ assert_type(C.__new__(D), D)
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3561
+// https://github.com/pyrefly-org/pyrefly/issues/3561
 testcase!(
     test_no_type_check_suppresses_unannotated_return,
     TestEnv::new().enable_unannotated_return_error(),
@@ -576,7 +576,7 @@ def h():  # E: `h` is missing a return annotation
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3561 — typing_extensions alias
+// https://github.com/pyrefly-org/pyrefly/issues/3561 — typing_extensions alias
 testcase!(
     test_no_type_check_typing_extensions_suppresses_unannotated_return,
     TestEnv::new().enable_unannotated_return_error(),
@@ -592,7 +592,7 @@ def g():  # E: `g` is missing a return annotation
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5133
+// https://github.com/pyrefly-org/pyrefly/issues/5133
 testcase!(
     test_init_method_unannotated_return,
     TestEnv::new().enable_unannotated_return_error(),
@@ -609,6 +609,109 @@ testcase!(
     r#"
 def __init__():  # E: `__init__` is missing a return annotation
     ...
+"#,
+);
+
+// https://github.com/pyrefly-org/pyrefly/issues/5132
+testcase!(
+    test_unannotated_public_return,
+    TestEnv::new().enable_unannotated_public_return_error(),
+    r#"
+from typing import Literal, assert_type, no_type_check
+
+def foo() -> int:
+    return _bar()
+
+def _bar():
+    return 1
+
+class _Baz:
+    def fn(self):
+        return 1
+
+    class Nested:
+        def method(self):
+            return 1
+
+def public():  # E: `public` is missing a return annotation
+    def local():
+        return 1
+    class Local:
+        def method(self):
+            return 1
+    return local()
+
+class Public:
+    def __init__(self):
+        pass
+
+    def method(self):  # E: `method` is missing a return annotation
+        return 1
+
+    def _private(self):
+        return 1
+
+    def __mangled(self):
+        return 1
+
+    def __str__(self):  # E: `__str__` is missing a return annotation
+        return "public"
+
+    @staticmethod
+    def static():  # E: `static` is missing a return annotation
+        return 1
+
+    @classmethod
+    def class_method(cls):  # E: `class_method` is missing a return annotation
+        return 1
+
+    @property
+    def prop(self):  # E: `prop` is missing a return annotation
+        return 1
+
+    class Nested:
+        def method(self):  # E: `method` is missing a return annotation
+            return 1
+
+    class _Private:
+        def method(self):
+            return 1
+
+async def async_public():  # E: `async_public` is missing a return annotation
+    return 1
+
+async def _async_private():
+    return 1
+
+@no_type_check
+def unchecked():
+    return 1
+
+def suppressed():  # pyrefly: ignore[unannotated-return]
+    return 1
+
+assert_type(foo(), int)
+assert_type(_bar(), Literal[1])
+assert_type(_Baz().fn(), Literal[1])
+assert_type(public(), Literal[1])
+"#,
+);
+
+testcase!(
+    test_unannotated_return_includes_private_functions,
+    TestEnv::new().enable_unannotated_return_error(),
+    r#"
+def public():  # E: `public` is missing a return annotation
+    def local():  # E: `local` is missing a return annotation
+        return 1
+    return local()
+
+def _private():  # E: `_private` is missing a return annotation
+    return 1
+
+class _Private:
+    def method(self):  # E: `method` is missing a return annotation
+        return 1
 "#,
 );
 

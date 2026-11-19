@@ -16,7 +16,8 @@ use std::fmt;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::hash::Hasher;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::slice;
 use std::sync::Arc;
@@ -32,7 +33,10 @@ use pyrefly_graph::calculation::Calculation;
 #[cfg(test)]
 use pyrefly_graph::calculation::ProposalResult;
 use pyrefly_graph::index::Idx;
+use pyrefly_python::module_key::ExactModuleKey;
+use pyrefly_python::module_key::ModuleKey;
 use pyrefly_python::module_name::ModuleName;
+#[cfg(test)]
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_types::class::ClassType;
 use pyrefly_types::heap::TypeHeap;
@@ -41,6 +45,7 @@ use pyrefly_types::type_alias::TypeAlias;
 use pyrefly_types::type_alias::TypeAliasData;
 use pyrefly_util::arc_id::ArcId;
 use pyrefly_util::display::DisplayWithCtx;
+use pyrefly_util::display::Fmt;
 use pyrefly_util::recurser::Guard;
 use pyrefly_util::uniques::UniqueFactory;
 use pyrefly_util::visit::Visit;
@@ -59,6 +64,7 @@ use crate::alt::answers::AnswerTable;
 use crate::alt::answers::Answers;
 use crate::alt::answers::AnyAnswer;
 use crate::alt::answers::LookupAnswer;
+use crate::alt::answers::LookupModule;
 use crate::alt::answers::OverloadedCallee;
 use crate::alt::answers::Solutions;
 use crate::alt::answers::SolutionsEntry;
@@ -94,12 +100,11 @@ use crate::export::exports::LookupExport;
 use crate::module::module_info::ModuleInfo;
 use crate::solver::solver::CallContext;
 use crate::solver::solver::PinError;
-#[cfg(test)]
-use crate::solver::solver::Solver;
 use crate::solver::solver::SubsetError;
 use crate::solver::solver::VarRecurser;
 use crate::solver::type_order::TypeOrder;
 use crate::types::class::Class;
+use crate::types::class::ClassDef;
 use crate::types::class::ClassFields;
 use crate::types::env::TypeEnv;
 use crate::types::equality::TypeEq;
@@ -139,67 +144,33 @@ impl<'a, 'subset> TypeCheckOptions<'a, 'subset> {
 
 /// Compactly represents the identity of a binding, for the purposes of
 /// understanding the calculation stack.
-#[derive(Clone, Dupe)]
-pub struct CalcId(pub Arc<Answers>, pub AnyIdx);
+///
+/// The module is compared exactly, so an open buffer and its file on disk are
+/// different modules here.
+#[derive(Clone, Dupe, PartialEq, Eq, Hash)]
+pub struct CalcId(pub ExactModuleKey, pub AnyIdx);
 
 impl Debug for CalcId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let module = self.0.key();
         write!(
             f,
             "CalcId({}, {}, {:?})",
-            self.bindings().module().name(),
-            self.bindings().module().path(),
-            self.1,
+            module.name(),
+            module.path(),
+            self.1
         )
     }
 }
 
-impl Display for CalcId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "CalcId({}, {}, {})",
-            self.bindings().module().name(),
-            self.bindings().module().path(),
-            self.1.display_with(self.bindings()),
-        )
-    }
-}
-
-impl PartialEq for CalcId {
-    fn eq(&self, other: &Self) -> bool {
-        (
-            self.bindings().module().name(),
-            self.bindings().module().path(),
-            &self.1,
-        ) == (
-            other.bindings().module().name(),
-            other.bindings().module().path(),
-            &other.1,
-        )
-    }
-}
-
-impl Eq for CalcId {}
-
+/// Orders by index, then by module name and path, which is the same in every run.
 impl Ord for CalcId {
     fn cmp(&self, other: &Self) -> Ordering {
-        match self.1.cmp(&other.1) {
-            Ordering::Equal => match self
-                .bindings()
-                .module()
-                .name()
-                .cmp(&other.bindings().module().name())
-            {
-                Ordering::Equal => self
-                    .bindings()
-                    .module()
-                    .path()
-                    .cmp(other.bindings().module().path()),
-                not_equal => not_equal,
-            },
-            not_equal => not_equal,
-        }
+        let (module, other_module) = (self.0.key(), other.0.key());
+        self.1
+            .cmp(&other.1)
+            .then_with(|| module.name().cmp(&other_module.name()))
+            .then_with(|| module.path().cmp(other_module.path()))
     }
 }
 
@@ -209,19 +180,7 @@ impl PartialOrd for CalcId {
     }
 }
 
-impl Hash for CalcId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.bindings().module().name().hash(state);
-        self.bindings().module().path().hash(state);
-        self.1.hash(state);
-    }
-}
-
 impl CalcId {
-    pub(crate) fn bindings(&self) -> &Bindings {
-        self.0.bindings()
-    }
-
     /// Create a CalcId for testing purposes.
     ///
     /// The `module_name` creates a distinguishable module, and `idx` creates
@@ -229,19 +188,9 @@ impl CalcId {
     /// (module_name, idx) pairs will compare as not equal.
     #[cfg(test)]
     pub fn for_test(module_name: &str, idx: usize) -> Self {
-        use pyrefly_graph::index::Idx;
-
-        let answers = Arc::new(Answers::new(
-            Bindings::for_test(module_name),
-            Solver::new(Default::default()),
-            false,
-            false,
-            ErrorStyle::Never,
-        ));
-        // Create a fake Key index - the actual key doesn't matter for test purposes,
-        // only that different idx values produce different CalcIds
-        let key_idx: Idx<Key> = Idx::new(idx);
-        CalcId(answers, AnyIdx::Key(key_idx))
+        let path = ModulePath::filesystem(PathBuf::from(format!("/test/{module_name}.py")));
+        let module = ModuleKey::new(ModuleName::from_str(module_name), &path);
+        CalcId(module.exact(), AnyIdx::Key(Idx::new(idx)))
     }
 }
 
@@ -549,6 +498,10 @@ pub struct CalcStack {
     /// driver, owns an SCC. Merges preserve the oldest identity so nested
     /// drivers leave the merged SCC for the suspended outer driver to commit.
     next_scc_owner: Cell<u64>,
+    /// Counts reads of SCC-local answers: previous-iteration answers, placeholders, and answers
+    /// computed in the current iteration. These are provisional until the SCC converges, so a
+    /// calculation during which this count does not change used only final answers.
+    scc_local_reads: Cell<u64>,
 }
 
 /// One active entry on `CalcStack`. Dropping the guard pops the entry and
@@ -588,7 +541,16 @@ impl CalcStack {
             position_of: RefCell::new(FxHashMap::default()),
             pending_completed_scc: RefCell::new(None),
             next_scc_owner: Cell::new(0),
+            scc_local_reads: Cell::new(0),
         }
+    }
+
+    fn record_scc_local_read(&self) {
+        self.scc_local_reads.set(self.scc_local_reads.get() + 1);
+    }
+
+    pub fn scc_local_reads(&self) -> u64 {
+        self.scc_local_reads.get()
     }
 
     /// Pop the current frame and take the completed SCC (if any).
@@ -848,7 +810,6 @@ impl CalcStack {
     ///
     /// When a new SCC overlaps with existing SCCs (shares participants),
     /// we merge them to form a larger SCC.
-    #[allow(clippy::mutable_key_type)] // CalcId's Hash impl doesn't depend on mutable parts
     fn on_scc_detected(&self, raw: Vec1<CalcId>) {
         let calc_stack_vec = self.into_vec();
 
@@ -913,8 +874,7 @@ impl CalcStack {
                     .rev()
                     .skip(1)
                     .all(|scc| !scc.node_state.contains_key(current)),
-                "on_calculation_finished: CalcId {} found in multiple SCCs",
-                current,
+                "on_calculation_finished: {current:?} found in multiple SCCs",
             );
             canonical
         }; // scc_stack borrow dropped here
@@ -966,7 +926,6 @@ impl CalcStack {
     /// `detected_at`; this has the potentially-useful property of being a valid
     /// identifier of the merged Scc *after* the merge, since we always use the
     /// very first cycle detected for `detected_at`.
-    #[allow(clippy::mutable_key_type)]
     fn merge_sccs(&self, detected_at_of_scc: &CalcId) {
         let calc_stack_vec = self.into_vec();
         let mut scc_stack = self.scc_stack.borrow_mut();
@@ -1053,9 +1012,8 @@ impl CalcStack {
         // If we merged but the target is somehow not in iteration state,
         // this is a bug: the merge should have included it.
         unreachable!(
-            "membership back-edge: target {} was in iterating SCC but \
+            "membership back-edge: target {current:?} was in iterating SCC but \
              not found in merged SCC's iteration state",
-            current,
         );
     }
 
@@ -1188,8 +1146,7 @@ impl CalcStack {
                 .rev()
                 .skip(1)
                 .all(|scc| !scc.node_state.contains_key(target)),
-            "set_iteration_placeholder: CalcId {} found in multiple SCCs",
-            target,
+            "set_iteration_placeholder: {target:?} found in multiple SCCs",
         );
         answer
     }
@@ -1277,10 +1234,6 @@ impl CalcStack {
     ///
     /// Within a warm iteration of an SCC, a member that was widened once stays
     /// widened until the SCC restarts cold, so the widening is monotonic.
-    #[expect(
-        clippy::mutable_key_type,
-        reason = "CalcId's Hash impl doesn't depend on mutable parts"
-    )]
     pub fn widen_inferred_return(&self, exceeds_limit: bool) -> bool {
         let mut scc_stack = self.scc_stack.borrow_mut();
         let Some(top_scc) = scc_stack.last_mut() else {
@@ -1610,7 +1563,7 @@ impl Display for Scc {
         let states: Vec<_> = self.node_state.iter().collect();
         write!(
             f,
-            "Scc{{node_state: {:?}, detected_at: {}}}",
+            "Scc{{node_state: {:?}, detected_at: {:?}}}",
             states, self.detected_at,
         )
     }
@@ -1626,7 +1579,6 @@ impl Scc {
         SccDriver(id)
     }
 
-    #[allow(clippy::mutable_key_type)] // CalcId's Hash impl doesn't depend on mutable parts
     fn new(raw: Vec1<CalcId>, calc_stack_vec: &[CalcId], owner: SccOwner) -> Self {
         let detected_at = raw.first().dupe();
 
@@ -1737,7 +1689,6 @@ impl Scc {
     /// state). Answer generations from both SCCs remain available while active
     /// calculations unwind; their `NeedsDemotion` representation makes the
     /// required cold restart explicit.
-    #[allow(clippy::mutable_key_type)]
     fn merge(mut self, other: Scc) -> Self {
         // Union node_state maps (keep the more advanced state)
         for (k, v) in other.node_state {
@@ -1804,7 +1755,6 @@ impl Scc {
     /// They must be `InProgress` (not `Fresh`) because their computation has
     /// already started — a revisit of a `Fresh` node would incorrectly trigger
     /// the `Participant → InProgress` transition again.
-    #[allow(clippy::mutable_key_type)]
     fn absorb_calc_stack_members(&mut self, calc_stack: &[CalcId], from_pos: usize) {
         let mut added_new = false;
         for calc_id in calc_stack.iter().skip(from_pos) {
@@ -1819,7 +1769,6 @@ impl Scc {
     }
 
     /// Pair every final answer with its node's deferred side effects.
-    #[allow(clippy::mutable_key_type)] // CalcId's ordering does not depend on mutable parts.
     fn into_final_answers(
         self,
     ) -> impl ExactSizeIterator<
@@ -1863,7 +1812,7 @@ impl Scc {
                     | SccNodeState::InProgress
                     | SccNodeState::HasPlaceholder(_) => {
                         panic!(
-                            "SCC node {} is {:?} when collecting final answers",
+                            "SCC node {:?} is {:?} when collecting final answers",
                             calc_id, node_state,
                         );
                     }
@@ -1905,7 +1854,6 @@ impl Scc {
     /// Advances answer storage so the current generation becomes the previous
     /// generation, resets all member states to Fresh, increments the iteration
     /// counter, resets `has_changed`, and clears `recursion_breaks`.
-    #[allow(clippy::mutable_key_type)]
     fn advance_to_next_warm_iteration(&mut self) {
         let current_iteration = self.iterative.iteration;
         self.iterative.answers.advance();
@@ -1934,8 +1882,8 @@ impl Scc {
 }
 
 struct LambdaBindingFrame {
-    parameters: SmallSet<(ModuleName, ModulePath, LambdaParamId)>,
-    answers: FxHashMap<(ModuleName, ModulePath, Idx<Key>), TypeInfo>,
+    parameters: SmallSet<(ExactModuleKey, LambdaParamId)>,
+    answers: FxHashMap<(ExactModuleKey, Idx<Key>), TypeInfo>,
     generation: u64,
 }
 
@@ -1983,9 +1931,9 @@ pub struct ThreadState {
     /// Solve-time mapping from per-module lambda parameter IDs to their
     /// contextually inferred types in the current solve.
     ///
-    /// The `ModulePath` is needed to distinguish the in-memory and on-disk
-    /// versions of the same module, which can coexist in the IDE (issue #3789).
-    lambda_param_types: RefCell<FxHashMap<(ModuleName, ModulePath, LambdaParamId), Type>>,
+    /// The exact module key distinguishes the in-memory and on-disk versions
+    /// of the same module, which can coexist in the IDE (issue #3789).
+    lambda_param_types: RefCell<FxHashMap<(ExactModuleKey, LambdaParamId), Type>>,
     /// Each inference attempt owns its narrowed answers. Nested lambda attempts use separate
     /// frames; changing an enclosing parameter invalidates its frame and all nested frames.
     lambda_binding_frames: RefCell<Vec<LambdaBindingFrame>>,
@@ -2137,10 +2085,6 @@ const MAX_DEMOTIONS: u32 = 10;
 /// Check whether the demotion count has exceeded `MAX_DEMOTIONS`, and panic
 /// if so. Extracted from the `iterative_resolve_scc` loop to allow direct
 /// unit testing of the safety limit.
-///
-/// Uses `Debug` formatting for `scc_identity` rather than `Display` because
-/// `CalcId::Display` requires a populated bindings table (which panics in
-/// test contexts), while `CalcId::Debug` prints the raw index safely.
 fn check_demotion_limit(demotions: u32, scc_identity: &CalcId) {
     if demotions > MAX_DEMOTIONS {
         panic!(
@@ -2183,6 +2127,22 @@ pub struct AnswersSolver<'ctx, 'answer, Ans: LookupAnswer> {
 impl<Ans: LookupAnswer> TypeEnv for AnswersSolver<'_, '_, Ans> {
     fn stdlib(&self) -> &Stdlib {
         self.stdlib
+    }
+
+    /// A class of this module reads its row from this module's bindings, which are fixed for the
+    /// solver's lifetime. A class of another module reads it through
+    /// `LookupAnswer::get_class_def`, which records a dependency on the class's definition facts.
+    /// The module is compared exactly, so an open buffer and its file on disk are different
+    /// modules here.
+    fn class_def<'a>(&'a self, cls: &'a Class) -> &'a ClassDef {
+        if cls.module_key().exact() == self.module().key().exact() {
+            return &self
+                .bindings()
+                .metadata()
+                .get_class_or_placeholder(cls.index())
+                .def;
+        }
+        self.answers.get_class_def(cls)
     }
 
     /// May solve the class's `KeyTParams` on demand, so no variable lock may be held across
@@ -2359,11 +2319,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// which caches metadata per module and registers class-level dependencies
     /// for proper incremental invalidation.
     ///
-    /// Returns `None` if the `ClassDefIndex` is stale (cross-module only;
-    /// same-module indices are always valid).
+    /// Returns `None` if the `ClassDefIndex` is stale, e.g. because its module was rebuilt with
+    /// fewer classes. A class of this module can be stale too, when it comes from a mutually
+    /// recursive module whose answers predate this module's rebuild.
     pub fn get_class_fields(&self, cls: &Class) -> Option<&ClassFields> {
-        if cls.module_path() == self.module().path() {
-            return Some(&self.bindings().metadata().get_class(cls.index()).fields);
+        if cls.module_key().exact() == self.module().key().exact() {
+            return self.bindings().get_class_fields(cls.index());
         }
         self.answers.get_class_fields(cls)
     }
@@ -2381,7 +2342,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .push(LambdaBindingFrame {
                 parameters: parameters
                     .into_iter()
-                    .map(|id| (self.module().name(), self.module().path().dupe(), id))
+                    .map(|id| (self.module().key().exact(), id))
                     .collect(),
                 answers: FxHashMap::default(),
                 generation,
@@ -2394,7 +2355,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     fn invalidate_lambda_binding_context(
         &self,
-        parameter: Option<&(ModuleName, ModulePath, LambdaParamId)>,
+        parameter: Option<&(ExactModuleKey, LambdaParamId)>,
     ) {
         let mut frames = self.thread_state.lambda_binding_frames.borrow_mut();
         let start = match parameter {
@@ -2414,7 +2375,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     pub(crate) fn set_lambda_param_type(&self, id: LambdaParamId, ty: Type) {
-        let key = (self.module().name(), self.module().path().dupe(), id);
+        let key = (self.module().key().exact(), id);
         // Solver Vars can change without changing their syntax. Only closed, identical hints
         // establish that an installation leaves its parameter's dependency state unchanged.
         if ty.collect_all_vars().is_empty()
@@ -2425,7 +2386,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.thread_state
             .lambda_param_types
             .borrow_mut()
-            .insert(key.clone(), ty);
+            .insert(key, ty);
         self.invalidate_lambda_binding_context(Some(&key));
     }
 
@@ -2436,7 +2397,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         binding: &Binding,
     ) -> Option<TypeInfo> {
         let parameter = self.bindings().lambda_parameter_origin(idx)?;
-        let parameter_key = (self.module().name(), self.module().path().dupe(), parameter);
+        let parameter_key = (self.module().key().exact(), parameter);
         let has_context = self
             .thread_state
             .lambda_binding_frames
@@ -2448,7 +2409,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let _context = self.enter_lambda_binding_context([parameter]);
             return self.lambda_binding_answer(idx, binding);
         }
-        let key = (self.module().name(), self.module().path().dupe(), idx);
+        let key = (self.module().key().exact(), idx);
         let generation = {
             let frames = self.thread_state.lambda_binding_frames.borrow();
             let frame = frames
@@ -2481,7 +2442,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.thread_state
             .lambda_param_types
             .borrow()
-            .get(&(self.module().name(), self.module().path().dupe(), id))
+            .get(&(self.module().key().exact(), id))
             .cloned()
     }
 
@@ -2502,7 +2463,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.invalidate_lambda_binding_context(None);
         let mut types = self.thread_state.lambda_param_types.borrow_mut();
         for (id, ty) in snapshot {
-            let key = (self.module().name(), self.module().path().dupe(), *id);
+            let key = (self.module().key().exact(), *id);
             match ty {
                 Some(ty) => {
                     types.insert(key, ty.clone());
@@ -2521,7 +2482,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         for id in self.bindings().owned_lambda_params(owner) {
             if let Some(ty) = self.get_lambda_param_type(*id) {
                 self.current()
-                    .publish_lambda_param_type(*id, self.solver().expand(ty));
+                    .publish_lambda_param_type(*id, self.solver().expand(ty, self));
             }
         }
     }
@@ -2551,8 +2512,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     pub fn django_reverse_relations_index(&self) -> &'answer DjangoReverseRelationIndex {
         self.answers
             .get(
-                self.module().name(),
-                Some(self.module().path()),
+                LookupModule::Exact(self.module().key()),
                 &KeyDjangoRelations,
                 self.thread_state,
                 self.answer_scope,
@@ -2688,7 +2648,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     pub fn for_display(&self, t: Type) -> Type {
-        self.solver().for_display(t)
+        self.solver().for_display(t, self)
+    }
+
+    /// Render a type for an error message, after `for_display` resolves its variables and
+    /// simplifies it.
+    pub fn display(&self, t: Type) -> impl Display + '_ {
+        let t = self.for_display(t);
+        let env: &dyn TypeEnv = self;
+        Fmt(move |f| write!(f, "{}", t.display_with(env)))
     }
 
     pub fn type_order(&self) -> TypeOrder<'_, Ans> {
@@ -2742,15 +2710,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
 
         // Fast path: if the value is already calculated, return it immediately
-        // without constructing a CalcId or touching the CalcStack. This avoids
-        // the CalcId Arc increment, position_of hash map insert/remove, RefCell
-        // borrows, and SCC checks for the common case of re-reading an already-
-        // solved binding.
+        // without touching the CalcStack. This avoids the position_of hash map
+        // insert/remove, RefCell borrows, and SCC checks for the common case of
+        // re-reading an already-solved binding.
         if let Some(v) = self.current().get_idx(idx) {
             return (v, true);
         }
 
-        let current = CalcId(self.current.dupe(), K::to_anyidx(idx));
+        let current = CalcId(self.module().key().exact(), K::to_anyidx(idx));
 
         // Check depth limit before any calculation
         let borrowed = if let Some(config) = self.recursion_limit_config()
@@ -2761,10 +2728,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let frame = self.stack().push(self.answer_scope, &current);
             let borrowed = match frame.action() {
                 BindingAction::Calculate => self.calculate_and_record_answer(&current, idx),
-                BindingAction::SccLocalAnswer(type_erased) => type_erased
-                    .downcast_ref::<K::Answer>()
-                    .expect("SccLocalAnswer downcast failed: type mismatch"),
+                BindingAction::SccLocalAnswer(type_erased) => {
+                    self.stack().record_scc_local_read();
+                    type_erased
+                        .downcast_ref::<K::Answer>()
+                        .expect("SccLocalAnswer downcast failed: type mismatch")
+                }
                 BindingAction::NeedsColdPlaceholder => {
+                    self.stack().record_scc_local_read();
                     self.attempt_to_unwind_cycle_from_here(&current, idx)
                 }
             };
@@ -2927,7 +2898,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     fn force_exported_answer<K: Solve<Ans>>(&self, mut answer: K::Answer) -> K::Answer {
         if K::EXPORTED {
-            answer.visit_mut(&mut |ty| self.current.solver().force_mut(ty));
+            answer.visit_mut(&mut |ty| self.current.solver().force_mut(ty, self));
         }
         answer
     }
@@ -2940,7 +2911,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) {
         let mut vars = Vec::new();
         answer.visit(&mut |ty| vars.extend(ty.collect_all_vars()));
-        for error in self.solver().sanitize_vars(vars, true) {
+        for error in self.solver().sanitize_vars(vars, true, self) {
             self.report_pin_error(error, range, errors);
         }
     }
@@ -2964,9 +2935,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         .to_owned(),
                 )
                 .emit(),
-            PinError::UnfinishedQuantified(q) => {
-                errors.internal_error(range, format!("Unfinished Variable::Quantified: {q}"))
-            }
+            PinError::UnfinishedQuantified(q) => errors.internal_error(
+                range,
+                format!("Unfinished Variable::Quantified: {}", q.name()),
+            ),
         }
     }
 
@@ -3024,7 +2996,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // Deep-force to resolve all type variables, matching the
                 // invariant that all iterative answers are deep-forced.
                 let mut forced = prior_answer.clone();
-                forced.visit_mut(&mut |x| self.current.solver().force_mut(x));
+                forced.visit_mut(&mut |x| self.current.solver().force_mut(x, self));
                 let answer = AnswerBox::new(forced);
 
                 let answer_erased = AnyAnswer::new::<Key>(answer);
@@ -3110,7 +3082,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // for convergence comparisons: without forcing, structurally identical
         // answers can appear different due to unresolved Var IDs.
         let mut forced = answer;
-        forced.visit_mut(&mut |x| self.current.solver().force_mut(x));
+        forced.visit_mut(&mut |x| self.current.solver().force_mut(x, self));
 
         let answer_erased = AnyAnswer::new::<K>(AnswerBox::new(forced));
 
@@ -3151,9 +3123,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Returns true if the cell is same-module.
     fn is_same_module(&self, calc_id: &CalcId) -> bool {
-        let bindings = calc_id.bindings();
-        bindings.module().name() == self.bindings().module().name()
-            && bindings.module().path() == self.bindings().module().path()
+        calc_id.0 == self.module().key().exact()
     }
 
     /// Reserve a single result slot for SCC publication.
@@ -3283,7 +3253,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ///
     /// Called after the fixpoint iteration converges (or max iterations are
     /// reached).
-    #[allow(clippy::mutable_key_type)]
     fn commit_final_answers(&self, scc: Scc) {
         let members = scc.into_final_answers();
 
@@ -3316,31 +3285,27 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Drive a single iteration member by calling `get_idx` for its typed index.
     ///
-    /// The member is a `CalcId` containing `(Answers, AnyIdx)`. For same-module
+    /// The member is a `CalcId` containing `(ExactModuleKey, AnyIdx)`. For same-module
     /// members (where the member's module matches this solver's module), we
     /// dispatch through `dispatch_anyidx!` to call `get_idx` with the concrete
     /// key type. Cross-module members are driven via `solve_idx_erased`, which
     /// constructs a temporary `AnswersSolver` in the target module's context
     /// using the shared `ThreadState` (and therefore the shared `CalcStack`).
     fn drive_member(&self, calc_id: &CalcId) {
-        let any_idx = &calc_id.1;
-        let bindings = calc_id.bindings();
-        if bindings.module().name() != self.bindings().module().name()
-            || bindings.module().path() != self.bindings().module().path()
-        {
+        if !self.is_same_module(calc_id) {
             // Cross-module member: drive via LookupAnswer::solve_idx_erased,
             // which routes to the target module's Answers and constructs a
             // temporary AnswersSolver there with the shared ThreadState.
             assert!(
                 self.answers
                     .solve_idx_erased(calc_id, self.thread_state, self.answer_scope),
-                "drive_member: cross-module driving failed for {}. \
+                "drive_member: cross-module driving failed for {:?}. \
                  The target module's Answers may not be loaded.",
                 calc_id,
             );
             return;
         }
-        dispatch_anyidx!(any_idx, self, drive_member_typed);
+        dispatch_anyidx!(&calc_id.1, self, drive_member_typed);
     }
 
     /// Type-specialized helper for `drive_member`. Calls `get_idx` for the
@@ -3410,7 +3375,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// driver returns without popping or committing it. The older driver is
     /// suspended lower on the Rust call stack and resumes ownership when the
     /// nested calculation returns.
-    #[allow(clippy::mutable_key_type)]
     fn iterative_resolve_scc(&self, mut scc: Scc) {
         let driver = scc.start_driver();
         let mut demotions: u32 = 0;
@@ -3488,6 +3452,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let errors = errors
                     .as_ref()
                     .expect("a final non-convergent SCC member must have collected errors");
+                // A cross-module member's module is looked up as it is for publication. If its
+                // Answers are gone, another worker published its Solutions, and publication
+                // discards this member's errors as well.
+                let member_answers = if self.is_same_module(calc_id) {
+                    self.current.dupe()
+                } else {
+                    let Some(answers) = self.answers.answers_in_module(calc_id) else {
+                        continue;
+                    };
+                    answers
+                };
                 let current = scc
                     .iterative
                     .answers
@@ -3500,7 +3475,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     report_non_convergent_member,
                     current,
                     previous,
-                    &calc_id.0,
+                    &member_answers,
                     errors
                 );
             }
@@ -3523,7 +3498,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     {
         let final_answer = K::record_recursive(self, answer, var);
         if var != Var::ZERO {
-            self.solver().force_var(var);
+            self.solver().force_var(var, self);
         }
         final_answer
     }
@@ -3628,7 +3603,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         eprintln!("\n--- CalcStack ---");
         let stack_vec = self.stack().into_vec();
         for (i, calc_id) in stack_vec.iter().rev().enumerate() {
-            eprintln!("  [{}] {}", i, calc_id);
+            eprintln!("  [{}] {:?}", i, calc_id);
         }
 
         eprintln!("\n--- Scc Stack ---");
@@ -3653,8 +3628,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     fn get_from_module<K: Solve<Ans> + Exported>(
         &self,
-        module: ModuleName,
-        path: Option<&ModulePath>,
+        module: LookupModule,
         k: &K,
     ) -> Option<&'answer K::Answer>
     where
@@ -3662,32 +3636,32 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
-        if module == self.module().name() && path == Some(self.module().path()) {
+        if let LookupModule::Exact(key) = module
+            && key.exact() == self.module().key().exact()
+        {
             // We are working in our own module, so don't have to go back to the `LookupAnswer` trait.
             // But even though we are looking at our own module, we might be using our own type via an import
             // from a mutually recursive module, so have to deal with key_to_idx finding nothing due to incremental.
             Some(self.get_idx(self.bindings().key_to_idx_hashed_opt(Hashed::new(k))?))
         } else {
             self.answers
-                .get(module, path, k, self.thread_state, self.answer_scope)
+                .get(module, k, self.thread_state, self.answer_scope)
         }
     }
 
-    pub fn get_from_export(
-        &self,
-        module: ModuleName,
-        path: Option<&ModulePath>,
-        k: &KeyExport,
-    ) -> &'answer Type {
-        self.get_from_module(module, path, k).unwrap_or_else(|| {
-            panic!("We should have checked Exports before calling this, {module} {k:?}")
+    pub fn get_from_export(&self, module: LookupModule, k: &KeyExport) -> &'answer Type {
+        self.get_from_module(module, k).unwrap_or_else(|| {
+            panic!(
+                "We should have checked Exports before calling this, {} {k:?}",
+                module.name()
+            )
         })
     }
 
     pub fn try_get_from_export(&self, module: ModuleName, attr: Name) -> Option<&'answer Type> {
         self.exports
             .export_exists(module, &attr)
-            .then(|| self.get_from_export(module, None, &KeyExport(attr)))
+            .then(|| self.get_from_export(LookupModule::Import(module), &KeyExport(attr)))
     }
 
     /// Might return None if the class is no longer present on the underlying module.
@@ -3701,7 +3675,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
         SolutionsTable: TableKeyed<K, Value = SolutionsEntry<K>>,
     {
-        self.get_from_module(cls.module_name(), Some(cls.module_path()), k)
+        self.get_from_module(LookupModule::Exact(cls.module_key()), k)
     }
 
     /// Resolve a type alias, borrowing it when no substitution is needed.
@@ -3716,8 +3690,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         match data {
             TypeAliasData::Ref(r) => {
                 let ta = self.get_from_module(
-                    r.module_name,
-                    Some(&r.module_path),
+                    LookupModule::Exact(ModuleKey::new(r.module_name, &r.module_path)),
                     &KeyTypeAlias(r.index),
                 );
                 let Some(ta) = ta else {
@@ -3772,7 +3745,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     pub fn record_recursive(&self, ty: Type, recursive: Var) -> Type {
-        self.solver().record_recursive(recursive, ty)
+        self.solver().record_recursive(recursive, ty, self)
     }
 
     /// Check if `got` matches `want`, returning `want` if the check fails.
@@ -3923,7 +3896,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::StringAsIterable,
                 format!(
                     "Passing `{}` to `{}` treats the string as an iterable of characters",
-                    got_display, want_display
+                    got_display.display_with(self),
+                    want_display.display_with(self)
                 ),
             )
             .with_detail("Did you mean to pass an iterable of strings?".to_owned())
@@ -3941,7 +3915,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) {
         let mut builder = self
             .solver()
-            .error_builder(got, want, errors, loc, tcc, error);
+            .error_builder(self, got, want, errors, loc, tcc, error);
         if let Some(replacement) = self.suggest_enum_member_for_value(got, want) {
             builder = builder
                 .with_detail(format!("Did you mean `{replacement}`?"))
@@ -3957,7 +3931,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     (
                         Some(format!(
                             "Consider narrowing the value with an `is not None` check or changing the declared type to `{} | None`",
-                            self.for_display(want.clone()),
+                            self.display(want.clone()),
                         )),
                         true,
                     )
@@ -3995,7 +3969,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 _ => (
                     Some(format!(
                         "Consider changing the declared type to `{} | None`",
-                        self.for_display(want.clone())
+                        self.display(want.clone())
                     )),
                     false,
                 ),
@@ -4055,7 +4029,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         u.members.iter().for_each(|ty| self.go(ty, true))
                     }
                     Type::Var(v) if let Some(_guard) = self.me.recurse(*v) => {
-                        self.go(&self.me.solver().force_var(*v), in_type)
+                        self.go(&self.me.solver().force_var(*v, self.me), in_type)
                     }
                     _ if in_type => (self.f)(&self.me.heap.mk_type_of(ty.clone())),
                     _ => {
@@ -4142,7 +4116,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) -> Type {
         errors
             .error_builder(range, kind, msg)
-            .with_context(context)
+            .with_context(self, context)
             .emit();
         self.heap.mk_any_error()
     }
@@ -4286,7 +4260,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             format!(
                 "Fixpoint iteration did not converge. \
                  Inferred {} `{}`. Adding annotations may help.",
-                noun, typed_answer,
+                noun,
+                typed_answer.display_with(self),
             ),
         );
         // If PYREFLY_FIXPOINT_DETAILS=1 is set, we output much more detailed information useful
@@ -4353,7 +4328,6 @@ mod scc_tests {
     ///
     /// This bypasses the normal Scc::new constructor to allow direct construction
     /// for testing merge logic.
-    #[allow(clippy::mutable_key_type)]
     fn make_test_scc(
         node_state: BTreeMap<CalcId, SccNodeState>,
         detected_at: CalcId,
@@ -4393,7 +4367,6 @@ mod scc_tests {
     }
 
     /// Helper to create node_state map with all nodes Fresh.
-    #[allow(clippy::mutable_key_type)]
     fn fresh_nodes(ids: &[CalcId]) -> BTreeMap<CalcId, SccNodeState> {
         ids.iter()
             .map(|id| (id.dupe(), SccNodeState::Fresh))
@@ -4536,7 +4509,6 @@ mod scc_tests {
     }
 
     #[test]
-    #[allow(clippy::mutable_key_type)]
     fn test_scc_merge_retains_current_and_previous_answers() {
         let a = CalcId::for_test("m", 0);
         let b = CalcId::for_test("m", 1);
@@ -4830,7 +4802,6 @@ mod scc_tests {
     }
 
     #[test]
-    #[allow(clippy::mutable_key_type)]
     fn test_merge_many_takes_most_advanced_state() {
         let a = CalcId::for_test("m", 0);
         let b = CalcId::for_test("m", 1);
@@ -5000,7 +4971,6 @@ mod scc_tests {
     }
 
     #[test]
-    #[allow(clippy::mutable_key_type)]
     fn test_membership_back_edge_merge_and_demotion() {
         // Verify that pushing a CalcId which is a member of a non-top iterating
         // SCC causes the SCCs and their answer generations to merge.
@@ -5207,5 +5177,20 @@ mod scc_tests {
         // developers investigating a crash can identify the root cause.
         let id = CalcId::for_test("m", 0);
         check_demotion_limit(MAX_DEMOTIONS + 1, &id);
+    }
+
+    #[test]
+    fn test_calc_id_keeps_open_buffer_and_disk_file_apart() {
+        // An open buffer and its file on disk are solved separately, so the
+        // same index in each is a different calculation.
+        let name = ModuleName::from_str("foo");
+        let path = PathBuf::from("/test/foo.py");
+        let disk = ModuleKey::new(name, &ModulePath::filesystem(path.clone()));
+        let memory = ModuleKey::new(name, &ModulePath::memory(path));
+        let disk_id = CalcId(disk.exact(), AnyIdx::Key(Idx::new(0)));
+        let memory_id = CalcId(memory.exact(), AnyIdx::Key(Idx::new(0)));
+        assert_ne!(disk_id, memory_id);
+        assert_ne!(disk_id.cmp(&memory_id), Ordering::Equal);
+        assert_eq!(disk_id, CalcId(disk.exact(), AnyIdx::Key(Idx::new(0))));
     }
 }

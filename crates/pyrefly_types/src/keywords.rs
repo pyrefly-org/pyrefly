@@ -6,12 +6,14 @@
  */
 
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
 use pyrefly_util::visit::VisitMut;
 use ruff_python_ast::name::Name;
 use starlark_map::ordered_map::OrderedMap;
 
+use crate::env::TypeEnv;
 use crate::function::FuncMetadata;
 use crate::function::FunctionKind;
 use crate::literal::Lit;
@@ -20,7 +22,7 @@ use crate::types::CalleeKind;
 use crate::types::Type;
 
 #[derive(
-    Debug, Clone, PartialEq, Eq, TypeEq, PartialOrd, Ord, Hash, Visit, VisitMut
+    Debug, Clone, PartialEq, Eq, TypeEq, TypeOrd, PartialOrd, Ord, Hash, Visit, VisitMut
 )]
 pub struct TypeMap(pub OrderedMap<Name, Type>);
 
@@ -49,7 +51,7 @@ impl TypeMap {
 
 /// Wraps the result of a function call whose keyword arguments have typing effects.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct KwCall {
     /// The metadata of the called function.
     pub func_metadata: FuncMetadata,
@@ -68,7 +70,7 @@ impl KwCall {
 /// Parameters to `typing.dataclass_transform`.
 /// See https://typing.python.org/en/latest/spec/dataclasses.html#dataclass-transform-parameters.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct DataclassTransformMetadata {
     pub eq_default: bool,
     pub order_default: bool,
@@ -84,28 +86,44 @@ impl DataclassTransformMetadata {
     const FROZEN_DEFAULT: Name = Name::new_static("frozen_default");
     const FIELD_SPECIFIERS: Name = Name::new_static("field_specifiers");
 
-    pub fn from_type_map(map: &TypeMap) -> Self {
+    pub fn from_type_map(map: &TypeMap, env: &dyn TypeEnv) -> Self {
+        let default = Self::new();
         Self {
-            eq_default: map.get_bool(&Self::EQ_DEFAULT).unwrap_or(true),
-            order_default: map.get_bool(&Self::ORDER_DEFAULT).unwrap_or(false),
-            kw_only_default: map.get_bool(&Self::KW_ONLY_DEFAULT).unwrap_or(false),
-            frozen_default: map.get_bool(&Self::FROZEN_DEFAULT).unwrap_or(false),
+            eq_default: map
+                .get_bool(&Self::EQ_DEFAULT)
+                .unwrap_or(default.eq_default),
+            order_default: map
+                .get_bool(&Self::ORDER_DEFAULT)
+                .unwrap_or(default.order_default),
+            kw_only_default: map
+                .get_bool(&Self::KW_ONLY_DEFAULT)
+                .unwrap_or(default.kw_only_default),
+            frozen_default: map
+                .get_bool(&Self::FROZEN_DEFAULT)
+                .unwrap_or(default.frozen_default),
             field_specifiers: match map.0.get(&Self::FIELD_SPECIFIERS) {
                 Some(Type::Tuple(Tuple::Concrete(elts))) => {
-                    elts.iter().filter_map(|e| e.callee_kind()).collect()
+                    elts.iter().filter_map(|e| e.callee_kind(env)).collect()
                 }
-                _ => Vec::new(),
+                _ => default.field_specifiers,
             },
         }
     }
 
+    /// The metadata of a `dataclass_transform()` call without arguments.
     pub fn new() -> Self {
-        Self::from_type_map(&TypeMap::new())
+        Self {
+            eq_default: true,
+            order_default: false,
+            kw_only_default: false,
+            frozen_default: false,
+            field_specifiers: Vec::new(),
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, TypeEq)]
+#[derive(Visit, TypeEq, TypeOrd)]
 pub struct ConverterMap(OrderedMap<Type, Type>);
 
 impl ConverterMap {
@@ -139,7 +157,7 @@ impl VisitMut<Type> for ConverterMap {
 /// Parameters to dataclass field specifiers.
 /// See https://typing.python.org/en/latest/spec/dataclasses.html#field-specifier-parameters.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct DataclassFieldKeywords {
     pub init: bool,
     /// This field's default, if any. Note that this is derived from the various
@@ -219,7 +237,7 @@ impl DataclassFieldKeywords {
 /// Dataclass parameters.
 /// See https://typing.python.org/en/latest/spec/dataclasses.html#decorator-function-and-class-metaclass-parameters.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct DataclassKeywords {
     pub init: bool,
     pub order: bool,

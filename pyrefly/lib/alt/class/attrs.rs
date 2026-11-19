@@ -18,8 +18,8 @@ use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::typed_dict::AnonymousTypedDictInner;
-use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::typed_dict::TypedDictField;
+use pyrefly_util::display::DisplayWithCtx;
 use ruff_python_ast::Arguments;
 use ruff_python_ast::Expr;
 use ruff_python_ast::name::Name;
@@ -147,7 +147,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let defining_class = self
                 .get_class_member_with_defining_class(cls, name)
                 .map_or_else(|| cls.dupe(), |member| member.defining_class);
-            let class_name = defining_class.name().as_str().trim_start_matches('_');
+            let class_name = defining_class.name(self).as_str().trim_start_matches('_');
             (!class_name.is_empty()).then(|| format!("_{class_name}{name}"))
         } else {
             None
@@ -259,7 +259,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     range,
                     ErrorKind::BadClassDefinition,
                     format!(
-                        "Return type `{return_ty}` of the `@{name}.default` method is not assignable to field `{name}` of type `{field_ty}`"
+                        "Return type `{}` of the `@{name}.default` method is not assignable to field `{name}` of type `{}`",
+                        return_ty.display_with(self),
+                        field_ty.display_with(self),
                     ),
                 );
             }
@@ -392,9 +394,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             };
             let (cls, class_type) = match ty {
                 Type::ClassDef(cls) => (Some(cls), None),
-                Type::SpecializedClassDef(c) => (Some(c.class_object().clone()), Some(c)),
+                Type::SpecializedClassDef(c) => (Some(*c.class_object()), Some(c)),
                 Type::Type(inner) => match *inner {
-                    Type::ClassType(c) => (Some(c.class_object().clone()), Some(c)),
+                    Type::ClassType(c) => (Some(*c.class_object()), Some(c)),
                     _ => (None, None),
                 },
                 _ => (None, None),
@@ -473,9 +475,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .collect();
         Some(
             self.heap
-                .mk_typed_dict(TypedDict::Anonymous(Box::new(AnonymousTypedDictInner {
-                    fields,
-                }))),
+                .mk_anonymous_typed_dict(AnonymousTypedDictInner { fields }),
         )
     }
 
@@ -484,7 +484,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let name = Name::new_static("Attribute");
         for module in [ModuleName::attr(), ModuleName::attrs()] {
             if let Some(Type::ClassDef(cls)) = self.try_get_from_export(module, name.clone()) {
-                return Some(cls.clone());
+                return Some(*cls);
             }
         }
         None
@@ -532,7 +532,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // These converters are overloaded, so match on the resolved definition identity via
         // `callee_kind` (which looks through overloads) rather than a bare `Type::Function`.
         let Some(CalleeKind::Function(FunctionKind::Def(id))) =
-            self.expr_infer(&call.func, errors).callee_kind()
+            self.expr_infer(&call.func, errors).callee_kind(self)
         else {
             return None;
         };

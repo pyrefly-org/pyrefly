@@ -116,6 +116,9 @@ pub enum NameReadInfo {
         key: Key,
         initialized: InitializationStatus,
         is_module_scope: bool,
+        /// Whether the name is a member of an enclosing class. Only a postponed read finds a
+        /// class member this way.
+        is_class_scope: bool,
         implicit_builtin_module: Option<ModuleName>,
     },
     /// No such name is defined in the current scope stack, but it resolves to an implicit
@@ -900,12 +903,13 @@ pub enum FlowStyle {
     /// would get `foo.bar` here.
     ImportAs(ModuleName),
     /// Am I a function definition? Used to chain overload definitions.
-    /// Track whether the return type has an explicit annotation and whether this
-    /// definition is marked as an overload.
+    /// Track whether the return type has an explicit annotation, whether this
+    /// definition is marked as an overload, and whether it may be an abstract method.
     FunctionDef {
         function_idx: Idx<KeyDecoratedFunction>,
         has_return_annotation: bool,
         is_overload: bool,
+        may_be_abstract: bool,
     },
     /// Am I a name carrying class identity? `class_idx` is the `Idx<Key>` of
     /// the class's `class_object` binding — the canonical class identity that
@@ -3303,7 +3307,7 @@ impl Scopes {
     }
 
     /// Check if a name is declared as `global` or `nonlocal` in the current scope.
-    fn is_mutable_capture(&self, name: &Name) -> bool {
+    pub fn is_mutable_capture(&self, name: &Name) -> bool {
         self.current()
             .stat
             .0
@@ -3857,10 +3861,12 @@ impl Scopes {
                     let definition = match &value.style {
                         FlowStyle::FunctionDef {
                             has_return_annotation,
+                            may_be_abstract,
                             ..
                         } => ClassFieldDefinition::MethodLike {
                             definition: value.idx,
                             has_return_annotation: *has_return_annotation,
+                            may_be_abstract: *may_be_abstract,
                             annotation: static_info.annotation(),
                         },
                         // Only treat pristine class definitions as nested classes.
@@ -4325,6 +4331,7 @@ impl Scopes {
                             InitializationStatus::Uninitialized
                         },
                         is_module_scope: matches!(scope.kind, ScopeKind::Module),
+                        is_class_scope: is_class,
                         implicit_builtin_module: static_info.implicit_builtin_module(),
                     });
                 }
@@ -5543,7 +5550,10 @@ impl<'a> BindingsBuilder<'a> {
 
     /// When annotations in this module are evaluated.
     pub fn annotation_evaluation(&self) -> Evaluation {
-        if self.scopes.has_future_annotations() || self.sys_info.version().at_least(3, 14) {
+        if self.scopes.has_future_annotations()
+            || self.sys_info.version().at_least(3, 14)
+            || self.module_info.path().is_interface()
+        {
             Evaluation::Postponed
         } else {
             Evaluation::Eager

@@ -237,9 +237,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
 
         let first_targ = class.targs().as_slice().first()?;
-        let Type::TypedDict(pyrefly_types::typed_dict::TypedDict::TypedDict(typed_dict_inner)) =
-            first_targ
-        else {
+        let Type::ClassType(typed_dict_inner) = first_targ else {
             return None;
         };
 
@@ -290,9 +288,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) -> Type {
         // Check if the first type argument is a TypedDict
-        if let Some(Type::TypedDict(pyrefly_types::typed_dict::TypedDict::TypedDict(
-            typed_dict_inner,
-        ))) = cls.targs().as_slice().first()
+        if let Some(Type::ClassType(typed_dict_inner)) = cls.targs().as_slice().first()
+            && self.is_typed_dict_class(typed_dict_inner.class_object())
         {
             // Check if the slice is a string literal
             let key_ty = self.expr_infer(slice, errors);
@@ -329,7 +326,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         format!(
                             "ModuleDict key `{}` not found in TypedDict `{}`",
                             field_name,
-                            typed_dict_inner.name()
+                            typed_dict_inner.name(self)
                         ),
                     );
                 }

@@ -265,6 +265,7 @@ pub struct TestEnv {
     explicit_any_use_error: bool,
     implicit_any_error: bool,
     unannotated_return_error: bool,
+    unannotated_public_return_error: bool,
     implicit_any_parameter_error: bool,
     implicit_any_attribute_error: bool,
     implicit_bool_error: bool,
@@ -305,6 +306,7 @@ pub struct TestEnv {
     implicit_any_lambda_error: bool,
     invalid_abstract_method_error: bool,
     abstract_method_with_implementation_error: bool,
+    property_type_mismatch_error: bool,
     empty_body_error: bool,
     instance_var_assign_error: bool,
     unknown_argument_type_error: bool,
@@ -348,6 +350,7 @@ impl TestEnv {
             explicit_any_use_error: false,
             implicit_any_error: false,
             unannotated_return_error: false,
+            unannotated_public_return_error: false,
             implicit_any_parameter_error: false,
             implicit_any_attribute_error: false,
             implicit_bool_error: false,
@@ -388,6 +391,7 @@ impl TestEnv {
             implicit_any_lambda_error: false,
             invalid_abstract_method_error: false,
             abstract_method_with_implementation_error: false,
+            property_type_mismatch_error: false,
             empty_body_error: false,
             instance_var_assign_error: false,
             unknown_argument_type_error: false,
@@ -559,6 +563,11 @@ impl TestEnv {
 
     pub fn enable_unannotated_return_error(mut self) -> Self {
         self.unannotated_return_error = true;
+        self
+    }
+
+    pub fn enable_unannotated_public_return_error(mut self) -> Self {
+        self.unannotated_public_return_error = true;
         self
     }
 
@@ -747,6 +756,11 @@ impl TestEnv {
 
     pub fn enable_abstract_method_with_implementation_error(mut self) -> Self {
         self.abstract_method_with_implementation_error = true;
+        self
+    }
+
+    pub fn enable_property_type_mismatch_error(mut self) -> Self {
+        self.property_type_mismatch_error = true;
         self
     }
 
@@ -976,6 +990,9 @@ impl TestEnv {
         if self.unannotated_return_error {
             errors.set_error_severity(ErrorKind::UnannotatedReturn, Severity::Error);
         }
+        if self.unannotated_public_return_error {
+            errors.set_error_severity(ErrorKind::UnannotatedPublicReturn, Severity::Error);
+        }
         if self.implicit_any_parameter_error {
             errors.set_error_severity(ErrorKind::ImplicitAnyParameter, Severity::Error);
         }
@@ -1066,6 +1083,9 @@ impl TestEnv {
         }
         if self.abstract_method_with_implementation_error {
             errors.set_error_severity(ErrorKind::AbstractMethodWithImplementation, Severity::Error);
+        }
+        if self.property_type_mismatch_error {
+            errors.set_error_severity(ErrorKind::PropertyTypeMismatch, Severity::Error);
         }
         if self.empty_body_error {
             errors.set_error_severity(ErrorKind::EmptyBody, Severity::Error);

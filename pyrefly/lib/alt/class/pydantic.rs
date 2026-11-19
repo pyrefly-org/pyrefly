@@ -35,6 +35,7 @@ use starlark_map::small_set::SmallSet;
 
 use crate::alt::answers::LookupAnswer;
 use crate::alt::answers_solver::AnswersSolver;
+use crate::alt::callable::ArgMap;
 use crate::alt::callable::CallArg;
 use crate::alt::callable::CallKeyword;
 use crate::alt::class::class_field::DataclassMember;
@@ -68,6 +69,7 @@ use crate::binding::pydantic::VALIDATE_BY_ALIAS;
 use crate::binding::pydantic::VALIDATE_BY_NAME;
 use crate::binding::pydantic::VALIDATION_FLAGS;
 use crate::error::collector::ErrorCollector;
+use crate::solver::solver::ArgumentKey;
 use crate::types::class::Class;
 use crate::types::types::Type;
 
@@ -225,7 +227,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if dataclass.kws.extra {
             params.push(Param::Kwargs(None, self.heap.mk_any_explicit()));
         }
-        let mut metadata = FuncMetadata::method(cls, MODEL_CONSTRUCT);
+        let mut metadata = FuncMetadata::method(self, cls, MODEL_CONSTRUCT);
         metadata.flags.is_classmethod = true;
         let ty = self.heap.mk_function(Function {
             signature: Callable::list(ParamList::new(params), self_type),
@@ -712,8 +714,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadArgumentType,
                     format!(
                         "Pydantic `{label}` value has type `{}`, which is not assignable to field type `{}`",
-                        self.for_display(val.clone()),
-                        self.for_display(field_ty.clone())
+                        self.display(val.clone()),
+                        self.display(field_ty.clone())
                     ),
                 );
             }
@@ -741,9 +743,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 .members
                 .iter()
                 .all(|member| self.is_pydantic_decimal_constraint_value(member)),
-            Type::Quantified(quantified) => self.is_pydantic_decimal_constraint_value(
-                &quantified.upper_bound(self.stdlib, self.heap),
-            ),
+            Type::Quantified(quantified) => {
+                self.is_pydantic_decimal_constraint_value(&quantified.upper_bound(self, self.heap))
+            }
             _ => {
                 !self.is_subset_eq(val, &self.stdlib.bool().clone().to_type())
                     && (self.is_subset_eq(val, &self.stdlib.float().clone().to_type())
@@ -784,9 +786,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadArgumentType,
                     format!(
                         "Default value `{}` violates Pydantic `{}` constraint `{}` for field `{}`",
-                        self.for_display(default_ty.clone()),
+                        self.display(default_ty.clone()),
                         label,
-                        self.for_display(constraint_ty.clone()),
+                        self.display(constraint_ty.clone()),
                         field_name
                     ),
                 );
@@ -910,7 +912,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     };
                     let func = self.expr_infer(&call.func, &ignore_errors);
                     !func
-                        .callee_kind()
+                        .callee_kind(self)
                         .is_some_and(|kind| dm.kind.field_specifiers().contains(&kind))
                 });
             // A metadata item whose `__get_pydantic_core_schema__` hook is defined outside
@@ -926,7 +928,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // Metadata that is not a class (such as `Any`) is excluded.
             let has_custom_schema = metadata_items.iter().any(|metadata_item| {
                 let cls = match self.expr_infer(metadata_item, &ignore_errors) {
-                    Type::ClassType(cls) => cls.class_object().clone(),
+                    Type::ClassType(cls) => *cls.class_object(),
                     Type::ClassDef(cls) => cls,
                     _ => return false,
                 };
@@ -935,7 +937,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         let owner = &member.defining_class;
                         owner.module_name().first_component() != "pydantic"
                             || matches!(
-                                owner.name().as_str(),
+                                owner.name(self).as_str(),
                                 "BeforeValidator" | "PlainValidator" | "WrapValidator"
                             )
                     })
@@ -984,6 +986,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         dataclass: &DataclassMetadata,
         args: &[CallArg],
         keywords: &[CallKeyword],
+        argmap: &ArgMap,
         errors: &ErrorCollector,
     ) {
         let constraints = self.collect_pydantic_constraint_params(cls, dataclass);
@@ -991,18 +994,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return;
         };
 
-        let infer_errors = self.error_swallower();
         for (index, arg) in args.iter().enumerate() {
             match arg {
-                CallArg::Arg(value) => {
-                    let value_ty = value.infer(self, &infer_errors);
-                    if let Some(info) = constraints.get(&PydanticParamKey::Position(index)) {
-                        self.emit_pydantic_argument_constraint(
-                            &value_ty,
-                            info,
-                            arg.range(),
-                            errors,
-                        );
+                CallArg::Arg(_) => {
+                    if let Some(info) = constraints.get(&PydanticParamKey::Position(index))
+                        && let Some(value_ty) =
+                            argmap.source_argument_type(ArgumentKey::Positional(index))
+                    {
+                        self.emit_pydantic_argument_constraint(value_ty, info, arg.range(), errors);
                     }
                 }
                 CallArg::Star(..) => {
@@ -1012,14 +1011,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
         }
 
-        for kw in keywords {
+        for (index, kw) in keywords.iter().enumerate() {
             let Some(identifier) = kw.arg.as_ref() else {
                 continue;
             };
             let key = PydanticParamKey::Name(identifier.id.clone());
-            if let Some(info) = constraints.get(&key) {
-                let value_ty = kw.value.infer(self, &infer_errors);
-                self.emit_pydantic_argument_constraint(&value_ty, info, kw.range, errors);
+            if let Some(info) = constraints.get(&key)
+                && let Some(value_ty) = argmap.source_argument_type(ArgumentKey::Keyword(index))
+            {
+                self.emit_pydantic_argument_constraint(value_ty, info, kw.range, errors);
             }
         }
     }
@@ -1287,9 +1287,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::BadArgumentType,
                 format!(
                     "Argument value `{}` is not valid for Pydantic field `{}` with type `{}`",
-                    self.for_display(value_ty.clone()),
+                    self.display(value_ty.clone()),
                     info.field_name,
-                    self.for_display(field_ty.clone()),
+                    self.display(field_ty.clone()),
                 ),
             );
         }
@@ -1327,9 +1327,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadArgumentType,
                     format!(
                         "Argument value `{}` violates Pydantic `{}` constraint `{}` for field `{}`",
-                        self.for_display(value_ty.clone()),
+                        self.display(value_ty.clone()),
                         label,
-                        self.for_display(constraint_ty.clone()),
+                        self.display(constraint_ty.clone()),
                         info.field_name
                     ),
                 );

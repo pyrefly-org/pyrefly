@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+mod code_lens;
 mod event_loop;
 
 use std::cmp::min;
@@ -50,9 +51,7 @@ use lsp_types::CodeActionProvider;
 use lsp_types::CodeActionRequest;
 use lsp_types::CodeActionResponse;
 use lsp_types::CodeActionTriggerKind;
-use lsp_types::CodeLens;
 use lsp_types::CodeLensOptions;
-use lsp_types::CodeLensParams;
 use lsp_types::CodeLensRequest;
 use lsp_types::CompletionItem;
 use lsp_types::CompletionList;
@@ -303,7 +302,6 @@ use crate::lsp::non_wasm::code_lens::OverrideCodeLensRefreshNotification;
 use crate::lsp::non_wasm::code_lens::OverrideCodeLensRequest;
 use crate::lsp::non_wasm::code_lens::OverrideCodeLensTarget;
 use crate::lsp::non_wasm::code_lens::OverrideCodeLensTargets;
-use crate::lsp::non_wasm::code_lens::runnable_lsp_code_lens;
 use crate::lsp::non_wasm::convert_module_package::convert_module_package_code_actions;
 use crate::lsp::non_wasm::document_symbols::flatten_to_symbol_information;
 use crate::lsp::non_wasm::external_provider::ExternalProvider;
@@ -395,6 +393,7 @@ use crate::tsp::type_facts::TypeFactsQuery;
 use crate::tsp::type_facts::type_fact;
 use crate::types::class::ClassDefIndex;
 use crate::types::class::ClassType;
+use crate::types::env::TypeEnv;
 
 enum RequestError {
     Cancelled,
@@ -2434,10 +2433,10 @@ impl Server {
                 // Store cancellation handle so the recheck thread can cancel this
                 // request if it needs to commit.
                 let request_id_for_cancel = x.id.clone();
-                self.cancellation_handles.lock().insert(
-                    request_id_for_cancel.clone(),
-                    transaction.get_cancellation_handle(),
-                );
+                let request_cancellation = transaction.get_cancellation_handle();
+                self.cancellation_handles
+                    .lock()
+                    .insert(request_id_for_cancel.clone(), request_cancellation.dupe());
 
                 // Set up immediate per-call telemetry for ad-hoc solves. Each solve event is
                 // logged the instant it completes rather than batched.
@@ -2458,7 +2457,6 @@ impl Server {
                     Some(&self.lsp_thread_pool),
                 );
                 info!("Handling non-canceled request {} ({})", x.method, &x.id);
-                let mut queued_override_code_lens = false;
                 if let Some(params) = as_request::<DefinitionRequest>(&x) {
                     if let Some(params) = self
                         .extract_request_params_or_send_err_response::<DefinitionRequest>(
@@ -2712,7 +2710,7 @@ impl Server {
                             params,
                             telemetry_event.activity_key.clone(),
                         ) {
-                            Ok(()) => queued_override_code_lens = true,
+                            Ok(()) => {}
                             Err(reason) => {
                                 telemetry_event.set_empty_response_reason(reason);
                                 self.send_response(new_response(
@@ -3018,10 +3016,15 @@ impl Server {
                     ));
                     info!("Unhandled request: {x:?}");
                 }
-                if !queued_override_code_lens {
-                    self.cancellation_handles
-                        .lock()
-                        .remove(&request_id_for_cancel);
+                {
+                    let mut handles = self.cancellation_handles.lock();
+                    // Background tasks replace the dispatch token before they are queued.
+                    if handles
+                        .get(&request_id_for_cancel)
+                        .is_some_and(|handle| handle.ptr_eq(&request_cancellation))
+                    {
+                        handles.remove(&request_id_for_cancel);
+                    }
                 }
                 ide_transaction_manager.save(transaction, telemetry_event);
             }
@@ -3212,24 +3215,6 @@ impl Server {
         };
 
         telemetry.set_file_stats(TelemetryFileStats { uri, config_root });
-    }
-
-    fn runnable_code_lens_cwd(&self, path: &std::path::Path) -> Option<String> {
-        let config = self.state.config_finder().python_file(
-            ModuleNameWithKind::guaranteed(ModuleName::unknown()),
-            &ModulePath::filesystem(path.to_path_buf()),
-        );
-        let cwd = config
-            .source
-            .root_from_file()
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| {
-                self.workspaces
-                    .get_with(path.to_path_buf(), |(workspace_root, _)| {
-                        workspace_root.cloned()
-                    })
-            })?;
-        Some(cwd.to_string_lossy().into_owned())
     }
 
     fn send_response(&self, x: Response) {
@@ -4006,7 +3991,7 @@ impl Server {
 
         let mut deleted_uris: Vec<Uri> = Vec::new();
         let handles: Vec<Handle> = transaction
-            .handles()
+            .loaded_handles_one_per_file()
             .into_iter()
             .filter(|handle| {
                 // Skip Memory handles — they exist only for open-file diagnostics.
@@ -5307,6 +5292,7 @@ impl Server {
                 &handle,
                 range,
                 import_format,
+                lsp_config.and_then(|c| c.inlay_hints).unwrap_or_default(),
                 Some(&self.lsp_thread_pool),
             ) {
                 actions.extend(quickfixes.into_iter().filter_map(|(title, edits)| {
@@ -5657,6 +5643,11 @@ impl Server {
                 return Err(reason);
             }
         };
+        // The queued token remains registered until the worker installs its transaction token.
+        let queued_cancellation = CancellationHandle::default();
+        self.cancellation_handles
+            .lock()
+            .insert(request_id.clone(), queued_cancellation.dupe());
         let uri_for_telemetry = uri.clone();
         self.find_reference_queue.queue_task(
             TelemetryEventKind::FindFromDefinition,
@@ -5664,30 +5655,41 @@ impl Server {
                 server.set_file_stats(uri_for_telemetry, telemetry_event);
                 telemetry_event.set_activity_key(activity_key);
                 let mut transaction = server.state.cancellable_transaction();
-                server
-                    .cancellation_handles
-                    .lock()
-                    .insert(request_id.clone(), transaction.get_cancellation_handle());
-                server.validate_in_memory_for_transaction(
-                    transaction.as_mut(),
-                    telemetry_event,
-                    None,
-                );
-                match find_fn(
-                    &mut transaction,
-                    &handle,
-                    definition,
-                    telemetry,
-                    telemetry_event,
-                ) {
+                let result = (|| {
+                    {
+                        let mut handles = server.cancellation_handles.lock();
+                        if queued_cancellation.is_cancelled() {
+                            return Err(RequestError::Cancelled);
+                        }
+                        handles.insert(request_id.clone(), transaction.get_cancellation_handle());
+                    }
+                    server.validate_in_memory_for_transaction(
+                        transaction.as_mut(),
+                        telemetry_event,
+                        None,
+                    );
+                    let result = find_fn(
+                        &mut transaction,
+                        &handle,
+                        definition,
+                        telemetry,
+                        telemetry_event,
+                    )?;
+                    if transaction.get_cancellation_handle().is_cancelled() {
+                        return Err(RequestError::Cancelled);
+                    }
+                    Ok(result)
+                })();
+                server.cancellation_handles.lock().remove(&request_id);
+                match result {
                     Ok(results) => {
-                        server.cancellation_handles.lock().remove(&request_id);
                         server.connection.send(Message::Response(new_response(
                             request_id,
                             Ok(Some(transform_result(results))),
                         )));
                     }
                     Err(RequestError::Cancelled) => {
+                        telemetry_event.canceled = true;
                         let message = format!("Request {request_id} is canceled");
                         info!("{message}");
                         server.connection.send(Message::Response(Response::new_err(
@@ -6264,36 +6266,6 @@ impl Server {
             }),
         );
         Ok(())
-    }
-
-    fn code_lens(
-        &self,
-        transaction: &Transaction<'_>,
-        params: CodeLensParams,
-    ) -> Option<Vec<CodeLens>> {
-        let uri = &params.text_document.uri;
-        let path = self.path_for_uri(uri)?;
-        let runnable_code_lens = self
-            .workspaces
-            .get_with(path.clone(), |(_, workspace)| workspace.runnable_code_lens);
-        let maybe_cell_idx = self.maybe_get_code_cell_index(uri);
-        let handle = self
-            .make_handle_if_enabled(uri, Some(CodeLensRequest::METHOD.as_str()))
-            .ok()?;
-        let info = transaction.get_module_info(&handle)?;
-        let entries = transaction.runnable_code_lens_entries(&handle, uri, runnable_code_lens)?;
-        let cwd = self.runnable_code_lens_cwd(&path);
-
-        let mut lenses = Vec::new();
-        for entry in entries {
-            if info.to_cell_for_lsp(entry.range.start()) != maybe_cell_idx {
-                continue;
-            }
-            let range = info.to_lsp_range(entry.range);
-            lenses.push(runnable_lsp_code_lens(uri, range, entry, cwd.as_deref()));
-        }
-
-        Some(lenses)
     }
 
     fn semantic_tokens_full(
@@ -7082,8 +7054,7 @@ impl Server {
             Some(CallHierarchyOutgoingCallsRequest::METHOD.as_str()),
         )?;
 
-        // Clone uri for use in the transform closure
-        let uri_for_transform = uri.clone();
+        let path_remapper = self.path_remapper.clone();
 
         // The CallHierarchyItem we receive is already at the definition position
         // (thanks to prepare_call_hierarchy doing the go-to-definition step).
@@ -7106,7 +7077,7 @@ impl Server {
                 Ok((callees, definition.module))
             },
             move |(callees, source_module)| {
-                transform_outgoing_calls(callees, &source_module, &uri_for_transform)
+                transform_outgoing_calls(callees, &source_module, path_remapper.as_ref())
             },
         )
     }
@@ -7328,16 +7299,16 @@ impl Server {
 
         let path_remapper = self.path_remapper.clone();
         let type_hierarchy_item_from_class_type =
-            move |class_type: &ClassType| -> Option<TypeHierarchyItem> {
+            move |env: &dyn TypeEnv, class_type: &ClassType| -> Option<TypeHierarchyItem> {
                 let class = class_type.class_object();
-                let module = class.module();
+                let module = class.module(env);
                 let uri = module_info_to_uri(module, path_remapper.as_ref())?;
-                let range = module.to_lsp_range(class.range());
+                let range = module.to_lsp_range(class.range(env));
                 Some(TypeHierarchyItem {
-                    name: class.name().to_string(),
+                    name: class.name(env).to_string(),
                     kind: SymbolKind::Class,
                     tags: None,
-                    detail: Some(format!("{}.{}", module.name(), class.name())),
+                    detail: Some(format!("{}.{}", module.name(), class.name(env))),
                     uri,
                     range,
                     selection_range: range,
@@ -7366,16 +7337,19 @@ impl Server {
 
                 let mro = solutions.get(&KeyClassMro(target.def_index));
                 let stdlib = transaction.as_ref().get_stdlib(handle);
+                let type_env = transaction.as_ref().type_env(handle);
                 let mut items = Vec::new();
                 // Skip the implicit trailing `object` for cyclic MROs.
                 if let ClassMro::Resolved { ancestors, .. } = mro {
                     for ancestor in ancestors {
-                        if let Some(item) = type_hierarchy_item_from_class_type(ancestor) {
+                        if let Some(item) = type_hierarchy_item_from_class_type(&type_env, ancestor)
+                        {
                             items.push(item);
                         }
                     }
                     if !target.is_object
-                        && let Some(item) = type_hierarchy_item_from_class_type(stdlib.object())
+                        && let Some(item) =
+                            type_hierarchy_item_from_class_type(&type_env, stdlib.object())
                     {
                         items.push(item);
                     }

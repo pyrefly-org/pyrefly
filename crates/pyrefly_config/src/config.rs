@@ -260,16 +260,20 @@ pub enum OutputFormat {
 }
 
 impl ConfigSource {
-    /// The config root marked by a config or marker file
-    pub fn root_from_file(&self) -> Option<&Path> {
+    /// The config or marker file that this config comes from, if any.
+    pub fn file(&self) -> Option<&Path> {
         match self {
             Self::File(path)
             | Self::PythonToolMarker(path)
             | Self::Marker(path)
-            | Self::FailedParse(path) => path.parent(),
-            // Synthetic roots are deliberately excluded
+            | Self::FailedParse(path) => Some(path),
             Self::Synthetic(_) => None,
         }
+    }
+
+    /// The config root marked by a config or marker file
+    pub fn root_from_file(&self) -> Option<&Path> {
+        self.file()?.parent()
     }
 }
 
@@ -1856,10 +1860,34 @@ impl ConfigFile {
                 Ok(interpreter) => {
                     let (env, error) = PythonEnvironment::get_interpreter_env(&interpreter);
                     self.python_environment.override_empty(env);
-                    self.interpreters.python_interpreter_path = Some(interpreter);
                     if let Some(error) = error {
                         configure_errors.push(error);
                     }
+                    // A project environment with Pyrefly installed expects that version, unless
+                    // `required-version` says which versions the project accepts. The default
+                    // interpreter on `PATH` is not a project environment.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if self.required_version.is_none()
+                        && let Some(installed_version) =
+                            &self.python_environment.interpreter_pyrefly_version
+                        && !matches!(
+                            &interpreter,
+                            ConfigOrigin::Auto(path) if Some(path.as_path()) == Interpreters::get_default_interpreter()
+                        )
+                        && installed_version.parse::<Version>().ok()
+                            != Some(
+                                env!("CARGO_PKG_VERSION")
+                                    .parse::<Version>()
+                                    .expect("Pyrefly's package version must be PEP 440 compatible"),
+                            )
+                    {
+                        configure_errors.push(anyhow!(
+                            "Pyrefly {} is running, but the Python environment of `{}` has Pyrefly {installed_version} installed, so results can differ from that version. Run the Pyrefly from that environment, or set `required-version` to allow other versions.",
+                            env!("CARGO_PKG_VERSION"),
+                            interpreter.display()
+                        ));
+                    }
+                    self.interpreters.python_interpreter_path = Some(interpreter);
                 }
                 Err(error) => {
                     self.python_environment.set_empty_to_default();
@@ -2877,6 +2905,7 @@ mod tests {
                         .python_environment
                         .interpreter_editable_path
                         .clone(),
+                    interpreter_pyrefly_version: None,
                 },
                 interpreters: Interpreters {
                     python_interpreter_path: Some(ConfigOrigin::config(PathBuf::from(
@@ -3157,6 +3186,7 @@ mod tests {
                         .python_environment
                         .interpreter_stdlib_path
                         .clone(),
+                    interpreter_pyrefly_version: None,
                 },
                 output_format: Some(OutputFormat::Json),
                 coverage: CoverageConfig {
@@ -3212,6 +3242,7 @@ mod tests {
                         .python_environment
                         .interpreter_stdlib_path
                         .clone(),
+                    interpreter_pyrefly_version: None,
                 },
                 ..Default::default()
             }
@@ -5558,7 +5589,7 @@ output-format = "omit-errors"
         );
     }
 
-    /// Regression test for facebook/pyrefly#3607. With
+    /// Regression test for pyrefly-org/pyrefly#3607. With
     /// `enable-fallback-search-path = true` in the config, `configure()` must
     /// populate `fallback_search_path` with a `DirectoryRelative` walk bounded
     /// by the config root, matching what build-system configs already do.
@@ -5590,7 +5621,7 @@ output-format = "omit-errors"
         }
     }
 
-    /// Regression test for facebook/pyrefly#3005. Mirrors the polars repro:
+    /// Regression test for pyrefly-org/pyrefly#3005. Mirrors the polars repro:
     /// a src-layout project where the import root is `src/` but a test file
     /// imports from `tests.conftest`. With `enable-fallback-search-path =
     /// true`, the file's parent directory walks up to the config root, which

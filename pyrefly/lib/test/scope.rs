@@ -716,7 +716,7 @@ C().x  # E: `C` has no attribute `x`
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1210
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1210
 testcase!(
     test_mutable_capture_with_annotation_class_body,
     r#"
@@ -754,7 +754,7 @@ def f():
 );
 
 // Regression test against a panic in the presence of parser error recovery:
-// https://github.com/facebook/pyrefly/issues/1203
+// https://github.com/pyrefly-org/pyrefly/issues/1203
 testcase!(
     test_mutable_capture_syntax_error,
     r#"
@@ -785,7 +785,7 @@ z = str(z)  # E: `z` is uninitialized  # E: `str` is not assignable to variable 
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5177
+// https://github.com/pyrefly-org/pyrefly/issues/5177
 // Inside a function, deleting a name from a target list must make the name local
 // to that function, the way `del e` does.
 testcase!(
@@ -1192,7 +1192,7 @@ y = 42
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/246
+// https://github.com/pyrefly-org/pyrefly/issues/246
 testcase!(
     test_declare_after_write_no_error,
     r#"
@@ -1283,7 +1283,7 @@ def try_except_else_finally():
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/959
+// https://github.com/pyrefly-org/pyrefly/issues/959
 testcase!(
     test_lambda_captures_narrowed_variable,
     r#"
@@ -1370,7 +1370,7 @@ assert_type(A, type[A])
     "#,
 );
 
-// This does come up in practice - see https://github.com/facebook/pyrefly/issues/1146
+// This does come up in practice - see https://github.com/pyrefly-org/pyrefly/issues/1146
 testcase!(
     test_class_scope_annotation_shadows_global,
     r#"
@@ -1401,7 +1401,7 @@ class D:
 
 // Nested scopes - except for parameter scopes - cannot see a containing class
 // body. This applies not only to methods but also other scopes like lambda, inner
-// class bodies, and comprehensions. See https://github.com/facebook/pyrefly/issues/264
+// class bodies, and comprehensions. See https://github.com/pyrefly-org/pyrefly/issues/264
 testcase!(
     test_class_scope_lookups_when_skip,
     r#"
@@ -1418,8 +1418,8 @@ class A:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1073 and
-// https://github.com/facebook/pyrefly/issues/1074
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1073 and
+// https://github.com/pyrefly-org/pyrefly/issues/1074
 testcase!(
     test_class_scope_lookups_when_permitted,
     r#"
@@ -1864,7 +1864,7 @@ def test_2(cond: bool):
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/2930
+// https://github.com/pyrefly-org/pyrefly/issues/2930
 testcase!(
     bug = "del in dead code should still make the variable local, hiding the outer binding",
     test_del_in_dead_code_makes_local,
@@ -1880,7 +1880,7 @@ def f():
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4318
+// https://github.com/pyrefly-org/pyrefly/issues/4318
 testcase!(
     test_conditionally_defined_class_member,
     TestEnv::new().enable_possibly_uninitialized_attribute_error(),
@@ -1965,7 +1965,7 @@ CompleteWithNever().value
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3398
+// https://github.com/pyrefly-org/pyrefly/issues/3398
 testcase!(
     test_walrus_in_comprehension_reads_enclosing_scope_param,
     r#"
@@ -1974,7 +1974,7 @@ def demo(text: str) -> None:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3670
+// https://github.com/pyrefly-org/pyrefly/issues/3670
 testcase!(
     test_walrus_in_comprehension_read_before_write_multiple_defs,
     r#"
@@ -2090,11 +2090,25 @@ def A() -> A: ...  # E: Expected a type form, got instance of `() -> Unknown`
 );
 
 testcase!(
+    test_circular_ref_through_property,
+    r#"
+from __future__ import annotations
+class A:
+    x: type[int]
+class B:
+    @property
+    def A(self) -> A.x: ...  # E: Expected a type form, got class attribute `A`
+    "#,
+);
+
+testcase!(
     test_forward_reference_to_shadowing_method,
     r#"
+from typing import assert_type
 class A:
-    x: "int"  # E: Expected a type form, got instance of `(self: Self@A) -> None`
+    x: "int"  # E: Expected a type form, got class attribute `int` of type `(self: Self@A) -> None`\n  Note: falling back to `builtins.int` from an enclosing scope
     def int(self) -> None: ...
+assert_type(A().x, int)
     "#,
 );
 
@@ -2104,7 +2118,7 @@ testcase!(
     r#"
 from __future__ import annotations
 class C:
-    def list(self) -> list[str]:  # E: `(self: Self@C) -> Unknown` is not subscriptable
+    def list(self) -> list[str]:  # E: falling back to `builtins.list` from an enclosing scope
         return list({"a": 1}.keys())
     "#,
 );
@@ -2115,11 +2129,50 @@ testcase!(
 from __future__ import annotations
 from typing import assert_type
 class C:
-    def f(self, x: str, y: object) -> None:  # E: Expected a type form, got instance of `Literal[1]`
+    def f(self, x: str, y: object) -> None:  # E: falling back to `builtins.str` from an enclosing scope
         if isinstance(y, str):
             assert_type(y, str)
         assert_type(str(1), str)
     str = 1
+    "#,
+);
+
+testcase!(
+    test_class_scope_non_type_without_fallback,
+    r#"
+from __future__ import annotations
+class C:
+    def f(self) -> g: ...  # E: Expected a type form, got instance of `(self: Self@C) -> None`
+    def g(self) -> None: ...
+    "#,
+);
+
+testcase!(
+    test_class_scope_module_is_not_replaced_by_fallback,
+    r#"
+from __future__ import annotations
+import collections.abc as abc
+class C:
+    def f(self) -> abc.Any: ...
+    import typing as abc
+    "#,
+);
+
+testcase!(
+    bug = "`ns.T` should resolve to `C.ns.T`, which is `str`, without an error",
+    test_class_scope_fallback_for_attribute_base,
+    r#"
+from __future__ import annotations
+from typing import assert_type, TypeAlias
+class Namespace1:
+    T: TypeAlias = int
+ns = Namespace1()
+class Namespace2:
+    T: TypeAlias = str
+class C:
+    x: ns.T  # E: Expected a type form, got class attribute `ns` of type `Namespace2`
+    ns = Namespace2()
+assert_type(C.x, str)  # E: assert_type(int, str) failed
     "#,
 );
 
@@ -2133,4 +2186,23 @@ class C:
     X: TypeAlias = Y  # E: Could not find name `Y`
     Y = int
     "#,
+);
+
+fn class_scope_in_stub_file_env() -> TestEnv {
+    TestEnv::one_with_path(
+        "foo",
+        "foo.pyi",
+        r#"
+class A:
+    x: type[int]  # E: Expected a type form, got class attribute `type`
+    def type(self) -> int: ...
+    "#,
+    )
+}
+
+// See `class_scope_in_stub_file_env` - test checks `foo.pyi` for expected error
+testcase!(
+    test_class_scope_in_stub_file,
+    class_scope_in_stub_file_env(),
+    "import foo",
 );

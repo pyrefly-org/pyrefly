@@ -11,7 +11,7 @@ use std::sync::Arc;
 use dupe::Dupe as _;
 use pyrefly_graph::index::Idx;
 use pyrefly_python::ast::Ast;
-use pyrefly_python::docstring::Docstring;
+use pyrefly_python::docstring::DocRanges;
 use pyrefly_python::keywords::is_valid_identifier;
 use pyrefly_python::nesting_context::NestingContext;
 use pyrefly_python::short_identifier::ShortIdentifier;
@@ -82,6 +82,7 @@ use crate::binding::django::collect_django_queryset_only;
 use crate::binding::expr::Evaluation;
 use crate::binding::expr::StaticUsage;
 use crate::binding::expr::Usage;
+use crate::binding::metadata::ClassMetadata;
 use crate::binding::pydantic::PydanticConfigDict;
 use crate::binding::scope::ClassIndices;
 use crate::binding::scope::FlowStyle;
@@ -89,10 +90,14 @@ use crate::binding::scope::Scope;
 use crate::binding::shape_type::ShapeDeclarationOwner;
 use crate::config::error_kind::ErrorKind;
 use crate::export::deprecation::parse_deprecation;
+use crate::export::doc_ranges::class_doc_ranges;
+use crate::export::doc_ranges::function_doc_ranges;
 use crate::export::special::SpecialExport;
+use crate::types::class::ClassDef;
 use crate::types::class::ClassDefIndex;
 use crate::types::class::ClassFieldProperties;
 use crate::types::class::ClassFields;
+use crate::types::quantified::QuantifiedAnchor;
 use crate::types::types::AnyStyle;
 
 enum IllegalIdentifierHandling {
@@ -263,7 +268,7 @@ impl<'a> BindingsBuilder<'a> {
             .find_map(|decorator| parse_deprecation(&decorator.expression))
             .map(Box::new);
         let mut pydantic_config_dict = PydanticConfigDict::default();
-        let docstring_range = Docstring::range_from_stmts(x.body.as_slice());
+        let doc_ranges = class_doc_ranges(&x);
         let body = mem::take(&mut x.body);
         let field_docstrings = Self::extract_field_docstrings(&body);
         let pydantic_before_validator_fields = self.extract_field_validator_fields(&body);
@@ -277,6 +282,7 @@ impl<'a> BindingsBuilder<'a> {
             &x.name,
             x.range().end(),
             ShapeDeclarationOwner::Class(class_indices.class_idx),
+            QuantifiedAnchor::Class(class_indices.def_index),
         );
         let decorators =
             self.ensure_and_bind_decorators(mem::take(&mut x.decorator_list), class_object.usage());
@@ -288,10 +294,13 @@ impl<'a> BindingsBuilder<'a> {
             .as_mut()
             .map(|tp| {
                 let owner = parent.owner_path(&self.module_info, x.name.id.as_str());
-                self.type_params_with_owner(tp, owner)
+                self.type_params(tp, QuantifiedAnchor::Class(class_indices.def_index), owner)
             })
             .unwrap_or_default();
-        let mut legacy = LegacyTParamCollector::new(x.type_params.is_some());
+        let mut legacy = LegacyTParamCollector::new(
+            x.type_params.is_some(),
+            QuantifiedAnchor::Class(class_indices.def_index),
+        );
         let bases = x.bases().map(|base| {
             let mut base = base.clone();
             if self.shape_comments.annotations.contains_key(&base.range())
@@ -467,7 +476,7 @@ impl<'a> BindingsBuilder<'a> {
             class_indices.clone(),
             x.name.clone(),
             has_protocol_base,
-            docstring_range,
+            doc_ranges.docstring(),
         ));
         let previous_tracking = self.begin_classmethod_receivers(&body);
         // Record the class body range for solve-time `typing.Self` resolution.
@@ -531,8 +540,19 @@ impl<'a> BindingsBuilder<'a> {
                     }
                     _ => (true, false, true),
                 };
+            let may_be_abstract = match &definition {
+                ClassFieldDefinition::MethodLike {
+                    may_be_abstract, ..
+                } => *may_be_abstract,
+                ClassFieldDefinition::DefinedInMethod { .. }
+                | ClassFieldDefinition::NestedClass { .. } => false,
+                ClassFieldDefinition::DeclaredByAnnotation { .. }
+                | ClassFieldDefinition::DeclaredWithoutAnnotation
+                | ClassFieldDefinition::AssignedInBody { .. }
+                | ClassFieldDefinition::DefinedWithoutAssign { .. } => true,
+            };
 
-            let docstring_range = field_docstrings.get(&range).copied();
+            let doc_ranges = field_docstrings.get(&range).cloned().unwrap_or_default();
 
             let attrs_field_specifier =
                 self.attrs_field_specifier(&definition, name.key(), range, &attrs_decorators);
@@ -580,9 +600,10 @@ impl<'a> BindingsBuilder<'a> {
                     is_annotated,
                     is_initialized_on_class,
                     is_defined_in_class_body,
+                    may_be_abstract,
                     attrs_field_specifier,
                     range,
-                    docstring_range,
+                    doc_ranges,
                 )
                 .with_django_queryset_only(django_queryset_only.get(name.key()).copied()),
             );
@@ -613,17 +634,21 @@ impl<'a> BindingsBuilder<'a> {
             },
         );
 
-        // Insert a `KeyTParams` / `BindingTParams` pair, but only if there is at least
-        // one generic base class - otherwise, it is not possible that legacy tparams are used.
+        // Whether a class declares type parameters is decided from syntax: it writes a scoped type
+        // parameter list, it has a shape declaration, or it names a possible legacy type variable
+        // in a generic base. The type parameters themselves are always computed by its
+        // `KeyTParams`, so that solving the class needs none of them.
         let legacy_tparams = legacy.lookup_keys();
-        let tparams_require_binding = !legacy_tparams.is_empty();
-        if tparams_require_binding {
-            let scoped_type_params = mem::take(&mut x.type_params);
+        let has_tparams = !legacy_tparams.is_empty()
+            || x.type_params.is_some()
+            || self.shape_declarations.declared_by(x.name.range).is_some();
+        if has_tparams {
             self.insert_binding(
                 KeyTParams(class_indices.def_index),
                 BindingTParams {
+                    class_idx: class_indices.class_idx,
                     name: x.name.clone(),
-                    scoped_type_params,
+                    scoped_type_params: mem::take(&mut x.type_params),
                     generic_bases: bases
                         .iter()
                         .filter_map(|base| match base {
@@ -638,18 +663,25 @@ impl<'a> BindingsBuilder<'a> {
         }
 
         fields.reserve(0); // Attempt to shrink to capacity
-        let metadata = self.metadata.get_class_mut(class_indices.def_index);
-        metadata.fields = ClassFields::new(fields);
+        *self.metadata.get_class_mut(class_indices.def_index) = ClassMetadata {
+            def: ClassDef::new(
+                x.name.clone(),
+                parent.dupe(),
+                self.module_info.dupe(),
+                has_tparams,
+                has_protocol_base,
+                deprecation,
+            ),
+            fields: ClassFields::new(fields),
+        };
         self.insert_binding_idx(
             class_indices.class_idx,
             BindingClass::ClassDef(ClassBinding {
                 def_index: class_indices.def_index,
                 def: ClassDefData::new(x),
                 parent: parent.dupe(),
-                is_protocol: has_protocol_base,
-                deprecation,
-                tparams_require_binding,
-                docstring_range,
+                has_tparams,
+                doc_ranges,
             }),
         );
 
@@ -693,10 +725,10 @@ impl<'a> BindingsBuilder<'a> {
         );
     }
 
-    /// Extracts docstrings for each field, mapping the field's range to the docstring's range.
+    /// Extracts the documentation of each field, keyed by the field's range.
     pub fn extract_field_docstrings(
         body: &[ruff_python_ast::Stmt],
-    ) -> SmallMap<TextRange, TextRange> {
+    ) -> SmallMap<TextRange, DocRanges> {
         use ruff_python_ast::Expr;
         use ruff_python_ast::Stmt;
 
@@ -713,26 +745,28 @@ impl<'a> BindingsBuilder<'a> {
                 let first_range = *first_function_ranges
                     .entry(func_def.name.id.clone())
                     .or_insert(func_def.name.range);
-                if let Some(docstring_range) = Docstring::range_from_stmts(&func_def.body) {
-                    field_docstrings.insert(func_def.name.range, docstring_range);
+                let doc_ranges = function_doc_ranges(func_def);
+                if !doc_ranges.is_empty() {
+                    field_docstrings.insert(func_def.name.range, doc_ranges.clone());
                     // Class field metadata points at the first declaration in an overload chain,
                     // while its documentation belongs to the implementation.
-                    field_docstrings.insert(first_range, docstring_range);
+                    field_docstrings.insert(first_range, doc_ranges);
                 }
             } else if let Stmt::ClassDef(class_def) = stmt {
-                if let Some(docstring_range) = Docstring::range_from_stmts(&class_def.body) {
-                    field_docstrings.insert(class_def.name.range, docstring_range);
+                let doc_ranges = class_doc_ranges(class_def);
+                if !doc_ranges.is_empty() {
+                    field_docstrings.insert(class_def.name.range, doc_ranges);
                 }
             } else if is_field
                 && let Some(next_stmt) = body.get(i + 1)
                 && let Stmt::Expr(expr_stmt) = next_stmt
                 && matches!(&*expr_stmt.value, Expr::StringLiteral(_))
             {
-                let docstring_range = next_stmt.range();
+                let doc_ranges = DocRanges::of_docstring(Some(next_stmt.range()));
                 let mut target_ranges = Vec::new();
                 Self::collect_field_docstring_target_ranges(stmt, &mut target_ranges);
                 for range in target_ranges {
-                    field_docstrings.insert(range, docstring_range);
+                    field_docstrings.insert(range, doc_ranges.clone());
                 }
             }
 
@@ -1090,10 +1124,11 @@ impl<'a> BindingsBuilder<'a> {
                 ClassFieldProperties::new(
                     member_annotation.is_some() || class_kind == SynthesizedClassKind::NamedTuple,
                     member_value.is_some(),
-                    true, // Synthesized fields are class body fields
-                    None, // Synthesized fields are never attrs field specifiers
+                    true,  // Synthesized fields are class body fields
+                    false, // Synthesized fields are never abstract methods
+                    None,  // Synthesized fields are never attrs field specifiers
                     range,
-                    None, // Synthesized fields don't have docstrings
+                    DocRanges::default(), // Synthesized fields don't have docstrings
                 ),
             );
             let annotation = member_annotation.map(|annotation_expr| {
@@ -1216,7 +1251,17 @@ impl<'a> BindingsBuilder<'a> {
             force_class_initialization,
             class_kind,
         );
-        self.metadata.get_class_mut(class_indices.def_index).fields = ClassFields::new(fields);
+        *self.metadata.get_class_mut(class_indices.def_index) = ClassMetadata {
+            def: ClassDef::new(
+                class_name.clone(),
+                parent.dupe(),
+                self.module_info.dupe(),
+                false,
+                false,
+                None,
+            ),
+            fields: ClassFields::new(fields),
+        };
         if bind_to_name {
             self.bind_current_as(
                 &class_name,
@@ -1235,7 +1280,7 @@ impl<'a> BindingsBuilder<'a> {
         }
         self.insert_binding_idx(
             class_indices.class_idx,
-            BindingClass::FunctionalClassDef(class_indices.def_index, class_name, parent.dupe()),
+            BindingClass::FunctionalClassDef(class_indices.def_index, class_name),
         );
 
         self.insert_binding_idx(

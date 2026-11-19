@@ -11,12 +11,15 @@
  * file contains the implementations of a few special calls that need to be hard-coded.
  */
 
+use std::iter;
+
 use pyrefly_python::dunder;
 use pyrefly_types::display::TypeDisplayContext;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::shaped_array::IntTuple;
 use pyrefly_types::shaped_array::IntTupleView;
 use pyrefly_types::shaped_array::is_tuple_carrier_shape_middle;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::visit::Visit;
 use pyrefly_util::visit::VisitMut;
 use ruff_python_ast::Expr;
@@ -33,16 +36,19 @@ use crate::alt::callable::CallValue;
 use crate::alt::expr::ExprOptions;
 use crate::alt::shape_extension::is_int_tuple_bound;
 use crate::alt::solve::TypeFormContext;
+use crate::alt::types::class_metadata::ProtocolMetadata;
 use crate::alt::types::decorated_function::Decorator;
 use crate::alt::unwrap::HintRef;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 use crate::error::context::TypeCheckContext;
 use crate::error::context::TypeCheckKind;
+use crate::solver::solver::SubsetError;
 use crate::types::callable::Param;
 use crate::types::callable::Params;
 use crate::types::callable::unexpected_keyword;
 use crate::types::class::Class;
+use crate::types::env::TypeEnv;
 use crate::types::function::FunctionKind;
 use crate::types::literal::Lit;
 use crate::types::tuple::Tuple;
@@ -54,8 +60,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// A valid type variable contributes the shape constraints from its normalized upper bound.
     fn assert_shape_input_to_int_tuple(&self, ty: &Type) -> Option<IntTuple> {
         let upper_bound = match ty {
-            Type::Quantified(q) if q.is_type_var() => Some(q.upper_bound(self.stdlib, self.heap)),
-            Type::TypeVar(tv) => Some(tv.upper_bound(self.stdlib, self.heap)),
+            Type::Quantified(q) if q.is_type_var() => Some(q.upper_bound(self, self.heap)),
+            Type::TypeVar(tv) => Some(tv.upper_bound(self, self.heap)),
             _ => None,
         };
         if let Some(upper_bound) = upper_bound {
@@ -81,12 +87,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let expr_b = &args[1];
             let a = self
                 .solver()
-                .force(self.expr_infer_with_hint(expr_a, hint, errors));
-            let b = self.solver().force(self.expr_untype(
-                expr_b,
-                TypeFormContext::FunctionArgument,
-                errors,
-            ));
+                .force(self.expr_infer_with_hint(expr_a, hint, errors), self);
+            let b = self.solver().force(
+                self.expr_untype(expr_b, TypeFormContext::FunctionArgument, errors),
+                self,
+            );
             if !b.is_error() && !self.is_equivalent(&a, &b) {
                 // `a` is a subtype of `b` if every materialization of `a` is a subtype of every
                 // materialization of `b`.
@@ -97,8 +102,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 } else {
                     ErrorKind::AssertType
                 };
-                let a_display = self.for_display(a.clone());
-                let b_display = self.for_display(b);
+                let a_display = self.display(a.clone());
+                let b_display = self.display(b);
                 errors
                     .error_builder(
                         range,
@@ -267,7 +272,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             });
             let mut types = Vec::new();
             type_info.visit(&mut |ty| types.push(ty));
-            let mut ctx = TypeDisplayContext::new(&types);
+            let mut ctx = TypeDisplayContext::new(self, &types);
             if self.solver().config.reveal_type_qualified_names {
                 ctx.always_display_module_name_except_builtins();
             }
@@ -275,7 +280,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors,
                 range,
                 ErrorKind::RevealType,
-                format!("revealed type: {}", type_info.display_with(&ctx)),
+                format!("revealed type: {}", type_info.display_with_context(&ctx)),
             );
             ret
         } else {
@@ -347,7 +352,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let ret = if args.len() == 2 {
             let actual = self
                 .solver()
-                .force(self.expr_infer_with_hint(&args[0], hint, errors));
+                .force(self.expr_infer_with_hint(&args[0], hint, errors), self);
             let actual_shape = if actual.is_any() {
                 Some(IntTuple::shapeless())
             } else {
@@ -379,8 +384,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::AssertType,
                             format!(
                                 "assert_shape({}, {}) failed",
-                                format_assert_shape_shape(&actual_shape),
-                                format_assert_shape_shape(&shape)
+                                format_assert_shape_shape(self, &actual_shape),
+                                format_assert_shape_shape(self, &shape)
                             ),
                         );
                     }
@@ -395,7 +400,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadArgumentType,
                     format!(
                         "First argument to `assert_shape` must be an `IntTuple`, got `{}`",
-                        self.for_display(actual.clone())
+                        self.display(actual.clone())
                     ),
                 );
                 self.heap.mk_any_error()
@@ -566,8 +571,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::RedundantCast,
                     format!(
                         "Redundant cast: `{}` is the same type as `{}`",
-                        val_type.deterministic_printing(),
-                        ret.clone().deterministic_printing()
+                        val_type.deterministic_printing().display_with(self),
+                        ret.clone().deterministic_printing().display_with(self)
                     ),
                 );
             // A `...` in a `.pyi` file is an omitted value rather than a literal `...`
@@ -580,8 +585,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::InvalidCast,
                     format!(
                         "Cast from `{}` to `{}` is invalid because the types are disjoint",
-                        val_type.deterministic_printing(),
-                        ret.clone().deterministic_printing()
+                        val_type.deterministic_printing().display_with(self),
+                        ret.clone().deterministic_printing().display_with(self)
                     ),
                 );
             }
@@ -632,7 +637,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     );
                 }
                 let class_info_metadata = self.get_metadata_for_class(class_info_cls);
-                let func_display = || format!("{}()", func_kind.format(self.module().name()));
+                let func_display = || format!("{}()", func_kind.format(self, self.module().name()));
                 if class_info_metadata.is_new_type() {
                     self.error(
                         errors,
@@ -640,7 +645,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         error_kind,
                         format!(
                             "NewType `{}` not allowed in {}",
-                            class_info_cls.name(),
+                            class_info_cls.name(self),
                             func_display(),
                         ),
                     );
@@ -653,7 +658,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         error_kind,
                         format!(
                             "TypedDict `{}` not allowed as second argument to {}",
-                            class_info_cls.name(),
+                            class_info_cls.name(self),
                             func_display()
                         ),
                     );
@@ -665,7 +670,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors,
                             range,
                             error_kind,
-                            format!("Protocol `{}` is not decorated with @runtime_checkable and cannot be used with {}", class_info_cls.name(), func_display()),
+                            format!("Protocol `{}` is not decorated with @runtime_checkable and cannot be used with {}", class_info_cls.name(self), func_display()),
                         );
                     } else {
                         // Additional validation for runtime checkable protocols:
@@ -677,43 +682,56 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 errors,
                                 range,
                                 error_kind,
-                                format!("Protocol `{}` has non-method members and cannot be used with issubclass()", class_info_cls.name()),
+                                format!("Protocol `{}` has non-method members and cannot be used with issubclass()", class_info_cls.name(self)),
                             );
                         }
                         // Check for unsafe overlap:
                         // https://typing.python.org/en/latest/spec/protocol.html#runtime-checkable-decorator-and-narrowing-types-by-isinstance
-                        // We need to check if there is any field with unassignable types, since the `isinstance` check only
-                        // checks for the presence of the fields, not their types.
+                        // Presence of the runtime members decides whether an overlap is reported.
+                        // Every required static member is then checked, including runtime-excluded
+                        // ones the implementation lacks.
                         //
                         // Type arguments for the protocol are not provided, so we'll use
-                        // fresh vars and solve them during the `is_subset_eq` check below.
+                        // fresh vars and solve them during the member checks below.
                         let class_info_protocol = class_info_metadata.protocol_metadata().unwrap();
                         if let Some(object_type) = &object_or_class
                             && !object_type.is_never()
                             && let (vs, Type::ClassType(protocol_class_type)) =
                                 self.instantiate_fresh_class(class_info_cls)
                         {
-                            let mut all_members_present = true;
+                            let all_runtime_members_present = class_info_protocol
+                                .runtime_members
+                                .iter()
+                                .all(|field_name| self.has_attr(object_type, field_name));
                             let mut unsafe_overlap_errors = vec![];
-                            for field_name in &class_info_protocol.members {
-                                if !self.has_attr(object_type, field_name) {
-                                    all_members_present = false;
-                                    break;
-                                }
-                                if let Err(subset_err) = self.is_protocol_subset_at_attr(
-                                    object_type,
-                                    &protocol_class_type,
-                                    field_name,
-                                    &mut |x, y| self.is_subset_eq_with_reason(x, y),
-                                ) {
-                                    let error_msg = subset_err
-                                        .to_error_msg()
-                                        .map(|msg| format!(": {msg}"))
-                                        .unwrap_or_default();
-                                    unsafe_overlap_errors.push(format!(
-                                        "Attribute `{}` has incompatible types{}",
-                                        field_name, error_msg,
-                                    ));
+                            if all_runtime_members_present {
+                                for field_name in &class_info_protocol.members {
+                                    if !ProtocolMetadata::is_required_member(field_name) {
+                                        continue;
+                                    }
+                                    match self.is_protocol_subset_at_attr(
+                                        object_type,
+                                        &protocol_class_type,
+                                        field_name,
+                                        &mut |x, y| self.is_subset_eq_with_reason(x, y),
+                                    ) {
+                                        Ok(()) => {}
+                                        Err(SubsetError::MissingAttribute(..)) => {
+                                            unsafe_overlap_errors.push(format!(
+                                                "Attribute `{field_name}` is missing"
+                                            ));
+                                        }
+                                        Err(subset_err) => {
+                                            let error_msg = subset_err
+                                                .to_error_msg(self)
+                                                .map(|msg| format!(": {msg}"))
+                                                .unwrap_or_default();
+                                            unsafe_overlap_errors.push(format!(
+                                                "Attribute `{}` has incompatible types{}",
+                                                field_name, error_msg,
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                             if let Err(specialization_errors) = self.finish_quantified(vs, false) {
@@ -721,14 +739,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     unsafe_overlap_errors.push(e.to_error_msg(self))
                                 }
                             }
-                            if all_members_present && !unsafe_overlap_errors.is_empty() {
+                            if all_runtime_members_present && !unsafe_overlap_errors.is_empty() {
                                 errors.error_builder(
                                     range,
                                     ErrorKind::UnsafeOverlap,
                                     format!(
                                         "Runtime checkable protocol `{}` has an unsafe overlap with type `{}`",
-                                        class_info_cls.name(),
-                                        self.for_display(object_type.clone())
+                                        class_info_cls.name(self),
+                                        self.display(object_type.clone())
                                     ),
                                 ).with_details(unsafe_overlap_errors).emit();
                             }
@@ -748,7 +766,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     error_kind,
                     format!(
                         "Expected class object, got parameterized generic type: `{}`",
-                        self.for_display(class_info_ty)
+                        self.display(class_info_ty)
                     ),
                 );
             } else if let Type::Type(f) = &class_info_ty
@@ -769,7 +787,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     error_kind,
                     format!(
                         "Expected class object, got `{}`",
-                        self.for_display(class_info_ty)
+                        self.display(class_info_ty)
                     ),
                 );
             } else {
@@ -790,28 +808,60 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     /// Check if a protocol is a data protocol (has non-method members)
+    ///
+    /// Approximates CPython's runtime check `callable(getattr(cls, name))`:
+    /// - `property` objects and `__slots__` descriptors are never callable (data members).
+    /// - Other members fall back to checking if their declared read type is callable.
     fn is_data_protocol(&self, cls: &Class, range: TextRange) -> bool {
-        // A data protocol has at least one non-method member
-        // Use protocol metadata to get the member names
-        let metadata = self.get_metadata_for_class(cls);
-        if let Some(protocol_metadata) = metadata.protocol_metadata() {
-            for field_name in &protocol_metadata.members {
-                // Use the class type to access the field
-                let class_type = self.as_class_type_unchecked(cls);
-                let ty = self.type_of_attr_get(
-                    &self.heap.mk_class_type(class_type),
-                    field_name,
-                    range,
-                    &self.error_swallower(),
-                    ErrorKind::MissingAttribute,
-                    None,
-                    "is_data_protocol",
-                );
-
-                // If it's not a callable type, it's a data member
-                if !ty.is_toplevel_callable() {
+        let Some(protocol_metadata) = self.get_metadata_for_class(cls).protocol_metadata() else {
+            return false;
+        };
+        let class_type = self.heap.mk_class_type(self.as_class_type_unchecked(cls));
+        // `Protocol` and `Generic` never appear in a Pyrefly MRO, so together with skipping
+        // `object` this visits the same classes as CPython.
+        let ancestors = self.get_mro_for_class(cls).ancestors_no_object();
+        for field_name in &protocol_metadata.runtime_members {
+            for ancestor in
+                iter::once(cls).chain(ancestors.iter().map(|ancestor| ancestor.class_object()))
+            {
+                // Only class-body assignments and definitions are initialized on the class;
+                // annotation-only and method-defined fields are not.
+                if self
+                    .get_class_fields(ancestor)
+                    .is_some_and(|fields| fields.is_field_initialized_on_class(field_name))
+                {
+                    // `property`s cannot be `callable` -> data member
+                    if self
+                        .get_field_from_current_class_only(ancestor, field_name)
+                        .is_some_and(|field| field.is_property())
+                    {
+                        return true;
+                    }
+                    // Otherwise the declared read type decides.
+                    break;
+                }
+                if self
+                    .get_metadata_for_class(ancestor)
+                    .slots_info()
+                    .is_some_and(|slots| slots.names.contains(field_name))
+                {
+                    // Slot descriptors cannot be `callable` -> data member
                     return true;
                 }
+            }
+            let ty = self.type_of_attr_get(
+                &class_type,
+                field_name,
+                range,
+                &self.error_swallower(),
+                ErrorKind::MissingAttribute,
+                None,
+                "is_data_protocol",
+            );
+
+            // If it's not a callable type, it's a data member
+            if !ty.is_toplevel_callable() {
+                return true;
             }
         }
         false
@@ -869,16 +919,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     /// Returns the list of types passed as the second argument to `isinstance` or `issubclass`.
     pub fn as_class_info(&self, ty: Type) -> Vec<Type> {
-        fn f<Ans: LookupAnswer>(me: &AnswersSolver<'_, '_, Ans>, t: Type, res: &mut Vec<Type>) {
+        fn f<Ans: LookupAnswer>(
+            me: &AnswersSolver<'_, '_, Ans>,
+            t: Type,
+            res: &mut Vec<Type>,
+            env: &dyn TypeEnv,
+        ) {
             match t {
                 Type::Var(v) if let Some(_guard) = me.recurse(v) => {
-                    f(me, me.solver().force_var(v), res)
+                    f(me, me.solver().force_var(v, env), res, env)
                 }
                 Type::ClassType(ref c)
                     if let [arg] = c.targs().as_slice()
                         && c.class_object() == me.stdlib.tuple_object() =>
                 {
-                    f(me, arg.clone(), res)
+                    f(me, arg.clone(), res, env)
                 }
                 Type::ClassType(ref c) if Some(c) == me.stdlib.union_type() => {
                     // Could be anything inside here, so add in Any.
@@ -886,23 +941,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
                 Type::Tuple(Tuple::Concrete(ts)) => {
                     for t in ts {
-                        f(me, t, res)
+                        f(me, t, res, env)
                     }
                 }
                 Type::Union(u) => {
                     for t in u.members {
-                        f(me, t, res)
+                        f(me, t, res, env)
                     }
                 }
-                Type::Tuple(Tuple::Unbounded(t)) => f(me, *t, res),
+                Type::Tuple(Tuple::Unbounded(t)) => f(me, *t, res, env),
                 Type::Tuple(Tuple::Unpacked(unpacked)) => {
                     let (pre, mid, post) = unpacked.into_parts();
                     for t in pre {
-                        f(me, t, res)
+                        f(me, t, res, env)
                     }
-                    f(me, mid, res);
+                    f(me, mid, res, env);
                     for t in post {
-                        f(me, t, res)
+                        f(me, t, res, env)
                     }
                 }
                 Type::Type(inner) if matches!(&*inner, Type::Union(_)) => {
@@ -911,15 +966,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         unreachable!("guarded by matches! above")
                     };
                     for t in u.members {
-                        f(me, me.heap.mk_type_of(t), res)
+                        f(me, me.heap.mk_type_of(t), res, env)
                     }
                 }
-                Type::TypeAlias(ta) => f(me, me.get_type_alias(&ta).as_value(me.stdlib), res),
+                Type::TypeAlias(ta) => f(me, me.get_type_alias(&ta).as_value(me.stdlib), res, env),
                 _ => res.push(t),
             }
         }
         let mut res = Vec::new();
-        f(self, ty, &mut res);
+        f(self, ty, &mut res, self);
         res
     }
 
@@ -1018,10 +1073,11 @@ fn runtime_keyword_parameter(callee_ty: &Type) -> RuntimeKeywordParameter<'_> {
     }
 }
 
-fn format_assert_shape_shape(shape: &IntTuple) -> String {
+fn format_assert_shape_shape(env: &dyn TypeEnv, shape: &IntTuple) -> String {
+    let rendered = shape.display_with(env);
     match shape.as_concrete() {
         Some([]) => "()".to_owned(),
-        Some([_]) => format!("({shape},)"),
-        _ => format!("({shape})"),
+        Some([_]) => format!("({rendered},)"),
+        _ => format!("({rendered})"),
     }
 }

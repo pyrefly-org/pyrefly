@@ -179,7 +179,7 @@ class B(A):
  "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1493
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1493
 testcase!(
     test_override_with_differently_named_parent_overloads,
     r#"
@@ -353,14 +353,50 @@ class GradualBase:
 
 class Child(GradualBase):
     @override
-    def method1(self) -> None: ...
+    def method1(self) -> None: ...  # E: Class member `Child.method1` overrides parent class `GradualBase` in an inconsistent manner
+
+class LooseChild(GradualBase):
+    @override
+    def method1(self, a: int, b: str, /, *, k: int, m: int) -> None: ...
 
 class Base:
     def method1(self) -> None: ...
 
 class GradualChild(Base):
     @override
-    def method1(self, a: int, /, *args: Any, k: int, **kwargs: Any) -> None: ...
+    def method1(self, a: int, /, *args: Any, k: int, **kwargs: Any) -> None: ...  # E: Class member `GradualChild.method1` overrides parent class `Base` in an inconsistent manner
+
+class LooseGradualChild(Base):
+    @override
+    def method1(self, a: int = 0, /, *args: Any, k: int = 0, **kwargs: Any) -> None: ...
+    "#,
+);
+
+// The parameters that precede a gradual `*args: Any, **kwargs: Any` tail are still checked,
+// including against each signature of an overloaded parent method.
+testcase!(
+    test_override_parameter_gradual_prefix,
+    r#"
+from typing import Any, overload
+
+class Base:
+    @overload
+    def m(self, x: int) -> None: ...
+    @overload
+    def m(self, x: bytes) -> None: ...
+    def m(self, x: int | bytes) -> None: ...
+
+class Child(Base):
+    def m(self, x: str, *args: Any, **kwargs: Any) -> None: ...  # E: Class member `Child.m` overrides parent class `Base` in an inconsistent manner
+
+class Base2:
+    def m(self, x: int) -> None: ...
+
+class Child2(Base2):
+    def m(self, x: str, *args: Any, **kwargs: Any) -> None: ...  # E: Class member `Child2.m` overrides parent class `Base2` in an inconsistent manner
+
+class Child3(Base2):
+    def m(self, x: int, *args: Any, **kwargs: Any) -> None: ...
     "#,
 );
 
@@ -771,7 +807,7 @@ class B(A):
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3141
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3141
 testcase!(
     test_property_constructor_override,
     r#"
@@ -783,7 +819,7 @@ class B(A):
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3062
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3062
 testcase!(
     test_cached_property_overrides_unannotated_class_variable,
     r#"
@@ -1296,7 +1332,7 @@ class C:
 
 // Checking `__call__` against every parent reports a missing `@override`, and often a
 // signature mismatch, on the many classes that simply implement a callable interface, so
-// it is checked only against a Protocol parent. See https://github.com/facebook/pyrefly/issues/4220.
+// it is checked only against a Protocol parent. See https://github.com/pyrefly-org/pyrefly/issues/4220.
 testcase!(
     bug = "`__call__` inherited from a non-Protocol parent is not checked",
     test_override_dunder_call,
@@ -1312,7 +1348,7 @@ class UseDerived(UseBase):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4220
+// https://github.com/pyrefly-org/pyrefly/issues/4220
 testcase!(
     test_override_dunder_call_protocol,
     r#"
@@ -1470,7 +1506,7 @@ class Bar(Foo):
     "#,
 );
 
-// Test for https://github.com/facebook/pyrefly/issues/1372
+// Test for https://github.com/pyrefly-org/pyrefly/issues/1372
 testcase!(
     test_property_setter_inheritance,
     r#"
@@ -2736,7 +2772,7 @@ class ChildNarrowedSuppressed(Base):
 );
 
 // Overriding with a mutually incompatible type is not a mutability failure,
-// so it reports plain bad-override. https://github.com/facebook/pyrefly/issues/4720
+// so it reports plain bad-override. https://github.com/pyrefly-org/pyrefly/issues/4720
 testcase!(
     test_override_incompatible_attribute_is_plain_bad_override,
     r#"

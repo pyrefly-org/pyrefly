@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use ruff_python_ast::Expr;
 use ruff_python_ast::Stmt;
+use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 
@@ -78,6 +79,91 @@ impl Docstring {
     pub fn has_content(&self) -> bool {
         !normalize_literal(self.1.code_at(self.0)).trim().is_empty()
     }
+}
+
+/// The source ranges that document a definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocRanges(DocRangesRepr);
+
+/// Few definitions document parameters with `Doc`, so those ranges are boxed to keep
+/// `DocRanges` small.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DocRangesRepr {
+    Docstring(Option<TextRange>),
+    WithParameters(Box<DocRangesWithParameters>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocRangesWithParameters {
+    docstring: Option<TextRange>,
+    parameters: Box<[(Name, TextRange)]>,
+}
+
+impl Default for DocRanges {
+    fn default() -> Self {
+        Self::of_docstring(None)
+    }
+}
+
+impl DocRanges {
+    /// The documentation of a definition that has only a docstring, such as a module or an
+    /// attribute.
+    pub fn of_docstring(docstring: Option<TextRange>) -> Self {
+        Self(DocRangesRepr::Docstring(docstring))
+    }
+
+    /// The documentation of a function with the given docstring and the `Doc` string range of
+    /// each documented parameter.
+    pub fn new(docstring: Option<TextRange>, parameters: Box<[(Name, TextRange)]>) -> Self {
+        if parameters.is_empty() {
+            Self::of_docstring(docstring)
+        } else {
+            Self(DocRangesRepr::WithParameters(Box::new(
+                DocRangesWithParameters {
+                    docstring,
+                    parameters,
+                },
+            )))
+        }
+    }
+
+    pub fn docstring(&self) -> Option<TextRange> {
+        match &self.0 {
+            DocRangesRepr::Docstring(docstring) => *docstring,
+            DocRangesRepr::WithParameters(x) => x.docstring,
+        }
+    }
+
+    /// The range of the `Doc` string literal that documents each parameter.
+    pub fn parameters(&self) -> &[(Name, TextRange)] {
+        match &self.0 {
+            DocRangesRepr::Docstring(_) => &[],
+            DocRangesRepr::WithParameters(x) => &x.parameters,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.docstring().is_none() && self.parameters().is_empty()
+    }
+
+    /// The `Doc` text of each documented parameter, read from `module`, which defines it.
+    pub fn parameter_docs<'a>(
+        &'a self,
+        module: &'a Module,
+    ) -> impl Iterator<Item = (String, String)> + 'a {
+        self.parameters().iter().filter_map(|(name, range)| {
+            Some((
+                name.to_string(),
+                clean_annotated_doc(module.code_at(*range))?,
+            ))
+        })
+    }
+}
+
+/// The documentation text of a `Doc("...")` string literal, given its source: the string
+/// without its quotes, dedented, without surrounding blank lines. `None` if the text is blank.
+pub fn clean_annotated_doc(literal: &str) -> Option<String> {
+    dedent_block_preserving_layout(&normalize_literal(literal)).map(|doc| doc.trim().to_owned())
 }
 
 /// Render cleaned docstring lines into markdown, adding fences for code blocks.
@@ -838,8 +924,10 @@ mod tests {
     use std::ops::Range;
 
     use crate::docstring::CodeBlockKind;
+    use crate::docstring::DocRanges;
     use crate::docstring::Docstring;
     use crate::docstring::DocstringRenderState;
+    use crate::docstring::clean_annotated_doc;
     use crate::docstring::parse_parameter_documentation;
     use crate::docstring::parse_sphinx_param_types;
 
@@ -1702,5 +1790,24 @@ result : str
     fn test_parse_sphinx_param_types_ignores_prose() {
         let doc = "Summary : with a colon.\n\nSee also: nothing (really): at all.\n:returns: x\n";
         assert_eq!(param_types(doc), expected(&[]));
+    }
+
+    #[test]
+    fn test_clean_annotated_doc_dedents_multiline_text() {
+        let literal = r#""""
+        first line
+            indented line
+        """"#;
+        assert_eq!(
+            clean_annotated_doc(literal).as_deref(),
+            Some("first line\n    indented line")
+        );
+        assert_eq!(clean_annotated_doc(r#"" ""#), None);
+    }
+
+    #[test]
+    fn test_doc_ranges_size() {
+        // `DocRanges` is stored for every export and class field.
+        assert_eq!(size_of::<DocRanges>(), 16);
     }
 }

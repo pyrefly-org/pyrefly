@@ -20,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -106,6 +107,8 @@ use crate::error::suppress;
 use crate::error::suppress::CommentLocation;
 use crate::error::suppress::SerializedError;
 use crate::error::suppress::UnusedIgnoreKind;
+use crate::module::typeshed::typeshed;
+use crate::module::typeshed_third_party::typeshed_third_party;
 use crate::report;
 use crate::state::load::FileContents;
 use crate::state::require::Require;
@@ -169,6 +172,18 @@ pub struct FullCheckArgs {
     pub config_override: ConfigOverrideArgs,
 }
 
+/// Read the bundled stdlib stubs, which every check loads, and the index of the bundled
+/// third-party stubs, which every unresolved import consults, on a background thread, while the
+/// check finds its configuration and queries the Python interpreter, which need neither.
+fn preload_bundled_stubs() {
+    thread::spawn(|| {
+        if let Ok(typeshed) = typeshed() {
+            typeshed.preload();
+        }
+        let _ = typeshed_third_party();
+    });
+}
+
 impl FullCheckArgs {
     pub async fn run(
         self,
@@ -177,18 +192,21 @@ impl FullCheckArgs {
         thread_count: ThreadCount,
     ) -> anyhow::Result<(CommandExitStatus, Option<CheckResult>)> {
         self.config_override.validate()?;
-        let (files_to_check, config_finder, upsell) =
-            self.files.resolve(self.config_override, wrapper)?;
-        run_check(
-            self.args,
-            version,
-            self.watch,
-            files_to_check,
-            config_finder,
-            upsell,
-            thread_count,
-        )
-        .await
+        preload_bundled_stubs();
+        let resolve = || {
+            self.files
+                .clone()
+                .resolve(self.config_override.clone(), wrapper.clone())
+        };
+        if self.watch {
+            run_watch(self.args, version, resolve, thread_count).await?;
+            return Ok((CommandExitStatus::Success, None));
+        }
+        let (files_to_check, config_finder, upsell) = resolve()?;
+        let (status, check_result) =
+            self.args
+                .run_once(version, files_to_check, config_finder, upsell, thread_count)?;
+        Ok((status, Some(check_result)))
     }
 }
 
@@ -198,40 +216,6 @@ fn resolve_relative_to(relative_to: Option<&String>) -> PathBuf {
         || std::env::current_dir().ok().unwrap_or_default(),
         |x| PathBuf::from_str(x.as_str()).unwrap(),
     )
-}
-
-async fn run_check(
-    args: CheckArgs,
-    version: &str,
-    watch: bool,
-    files_to_check: Box<dyn Includes>,
-    config_finder: ConfigFinder,
-    upsell: UpsellDecision,
-    thread_count: ThreadCount,
-) -> anyhow::Result<(CommandExitStatus, Option<CheckResult>)> {
-    if watch {
-        let roots = files_to_check.roots();
-        info!(
-            "Watching for files in {}",
-            display::intersperse_iter(";", || roots.iter().map(|p| p.display()))
-        );
-        let watcher = Watcher::notify(&roots)?;
-        run_watch(
-            args,
-            watcher,
-            version,
-            files_to_check,
-            config_finder,
-            upsell,
-            thread_count,
-        )
-        .await?;
-        Ok((CommandExitStatus::Success, None))
-    } else {
-        let (status, check_result) =
-            args.run_once(version, files_to_check, config_finder, upsell, thread_count)?;
-        Ok((status, Some(check_result)))
-    }
 }
 
 /// Main arguments for Pyrefly type checker
@@ -1339,7 +1323,13 @@ impl Handles {
             config_finder.add_errors(warnings);
         }
         // TODO(connernilsen): wire in force logic
-        let reloaded_source_dbs = ConfigFile::query_source_db(&configs, false, None).reloaded;
+        let outcome = ConfigFile::query_source_db(&configs, false, None);
+        let sourcedb_errors = outcome
+            .error
+            .map(|error| ConfigError::error(anyhow::anyhow!(error)))
+            .into_iter()
+            .collect();
+        let reloaded_source_dbs = outcome.reloaded;
         let result = configs
             .iter()
             .flat_map(|(c, files)| files.iter().map(|p| c.handle_from_module_path(p.dupe())))
@@ -1353,7 +1343,7 @@ impl Handles {
                     .is_some_and(|db| reloaded_source_dbs.contains(db))
             })
             .collect();
-        (result, reloaded_configs, Vec::new())
+        (result, reloaded_configs, sourcedb_errors)
     }
 
     /// Removals need no `covers` check because a path the include set does not cover is
@@ -1612,6 +1602,32 @@ impl IncrementalChecker {
         )
     }
 
+    /// The config files of the configured file set, and the files that those configs extend. A
+    /// change to any of these files can change the configs.
+    fn config_paths(&self) -> SmallSet<PathBuf> {
+        let configs = self
+            .handles
+            .path_data
+            .iter()
+            .map(|path| {
+                self.state
+                    .config_finder()
+                    .python_file(ModuleNameWithKind::guaranteed(ModuleName::unknown()), path)
+            })
+            .collect::<SmallSet<_>>();
+        configs
+            .iter()
+            .flat_map(|config| {
+                config
+                    .source
+                    .file()
+                    .map(Path::to_path_buf)
+                    .into_iter()
+                    .chain(config.extended_config_paths.iter().cloned())
+            })
+            .collect()
+    }
+
     /// Return the number of configured files checked by this checker.
     pub fn checked_file_count(&self) -> usize {
         self.handles.len()
@@ -1747,27 +1763,107 @@ impl IncrementalCheckCommand {
     }
 }
 
+/// Checks the files that `resolve` gives, and checks them again after each change to them. A
+/// change to a config file or other project metadata resolves the files and configs again and
+/// starts a fresh check, since a config can change both which files are checked and how.
 async fn run_watch(
     args: CheckArgs,
-    mut watcher: Watcher,
     version: &str,
-    files_to_check: Box<dyn Includes>,
-    config_finder: ConfigFinder,
-    upsell: UpsellDecision,
+    resolve: impl Fn() -> anyhow::Result<(Box<dyn Includes>, ConfigFinder, UpsellDecision)>,
     thread_count: ThreadCount,
 ) -> anyhow::Result<()> {
-    // TODO: We currently make 1 unrealistic assumptions, which should be fixed in the future:
-    // - Config search is stable across incremental runs.
-    let mut command =
-        IncrementalCheckCommand::new(args, files_to_check, config_finder, thread_count)?;
-    if let Err(e) = command.check(version, &CategorizedEvents::default(), upsell) {
-        eprintln!("{e:#}");
-    }
+    let start = || -> anyhow::Result<(WatchedCheck, UpsellDecision)> {
+        let (files_to_check, config_finder, upsell) = resolve()?;
+        let roots = files_to_check.roots();
+        info!(
+            "Watching for files in {}",
+            display::intersperse_iter(";", || roots.iter().map(|p| p.display()))
+        );
+        let command = IncrementalCheckCommand::new(
+            args.clone(),
+            files_to_check,
+            config_finder,
+            thread_count,
+        )?;
+        let config_paths = command.checker.config_paths();
+        let config_dirs = config_paths
+            .iter()
+            .filter_map(|path| path.parent())
+            .filter(|dir| !roots.iter().any(|root| dir.starts_with(root)))
+            .map(Path::to_path_buf)
+            .collect::<SmallSet<_>>()
+            .into_iter()
+            .collect();
+        let check = WatchedCheck {
+            command,
+            config_paths,
+            roots,
+            config_dirs,
+        };
+        Ok((check, upsell))
+    };
+    let (mut check, mut upsell) = start()?;
+    let mut watcher = check.watch()?;
+    let mut events = CategorizedEvents::default();
     loop {
-        let events = get_watcher_events(&mut watcher).await?;
-        if let Err(e) = command.check(version, &events, UpsellDecision::Skip) {
+        if let Err(e) = check.command.check(version, &events, upsell) {
             eprintln!("{e:#}");
         }
+        upsell = UpsellDecision::Skip;
+        events = get_watcher_events(&mut watcher).await?;
+        // The same test as the language server's: config files can have any name, so the files
+        // of the current configs are matched by path.
+        if events
+            .iter()
+            .any(|path| ConfigFile::is_watched_metadata(path) || check.config_paths.contains(path))
+        {
+            // End the old watches first, so that a restart needs no more watches than the first
+            // start.
+            drop(watcher);
+            match start() {
+                Ok((started, _)) => {
+                    check = started;
+                    events = CategorizedEvents::default();
+                }
+                // Keep checking with the previous configs until the metadata is valid again.
+                Err(e) => eprintln!("{e:#}"),
+            }
+            // Watching fails while the system is out of watches or a watched directory is
+            // missing. Both can be temporary, so keep trying instead of ending the watch.
+            watcher = loop {
+                match check.watch() {
+                    Ok(watcher) => break watcher,
+                    Err(e) => {
+                        eprintln!("{e:#}\nTrying to watch again in {WATCH_RETRY_DELAY:?}");
+                        // `run_watch` is the only task on its runtime, and it already blocks on
+                        // the watcher, so blocking here stalls no other task.
+                        thread::sleep(WATCH_RETRY_DELAY);
+                    }
+                }
+            };
+        }
+    }
+}
+
+/// How long `run_watch` waits before it tries again to watch after a failure.
+const WATCH_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// A check in watch mode, and the paths that it watches.
+struct WatchedCheck {
+    command: IncrementalCheckCommand,
+    /// See `IncrementalChecker::config_paths`.
+    config_paths: SmallSet<PathBuf>,
+    /// The paths that are watched with everything under them.
+    roots: Vec<PathBuf>,
+    /// The directories of the config files outside of the roots, watched without their
+    /// subdirectories. A directory is watched instead of the file, because an editor can save the
+    /// file by replacing it, which ends a watch on the file.
+    config_dirs: Vec<PathBuf>,
+}
+
+impl WatchedCheck {
+    fn watch(&self) -> anyhow::Result<Watcher> {
+        Watcher::notify(&self.roots, &self.config_dirs)
     }
 }
 
@@ -1853,10 +1949,16 @@ impl CheckArgs {
 
         let state = Forgetter::new(State::new(config_finder, thread_count), true);
         let require_levels = self.get_required_levels();
-        let mut transaction = Forgetter::new(
-            state.as_ref().new_transaction(require_levels.default, None),
-            true,
-        );
+        // The dependency graph report reads the dependencies between modules, which a
+        // one-shot transaction does not record.
+        let transaction = if self.output.dependency_graph.is_some() {
+            state.as_ref().new_transaction(require_levels.default, None)
+        } else {
+            state
+                .as_ref()
+                .new_one_shot_transaction(require_levels.default)
+        };
+        let mut transaction = Forgetter::new(transaction, true);
         let (loaded_handles, _, sourcedb_errors) = handles.all(state.as_ref().config_finder());
 
         // With several files to check, config errors are not fatal when the configs are found,
@@ -2794,7 +2896,7 @@ mod tests {
     }
 
     /// Asking for two reports in one run must produce both of them in full.
-    /// See https://github.com/facebook/pyrefly/issues/4683: the CinderX report
+    /// See https://github.com/pyrefly-org/pyrefly/issues/4683: the CinderX report
     /// dropped the ASTs that the Glean report reads once the check is done, so
     /// the run died partway through writing its output.
     /// A module that a build system imports under a name its path doesn't give is found through
@@ -2863,6 +2965,61 @@ def go(p: Platform) -> None:
         );
         assert!(!facts.contains("<locals>.p.chat"));
         assert!(!facts.contains("lib.src.platform"));
+    }
+
+    /// The Glean report names a stub on a search path that overrides a stdlib module after its
+    /// path, like a copy of the module on a later search path.
+    #[test]
+    fn glean_report_names_stdlib_override_stubs() {
+        let temp = TempDir::new().unwrap();
+        // Canonical, so that the search paths and the checked files' paths agree.
+        let root = fs::canonicalize(temp.path()).unwrap().join("project");
+        let stubs = root.join("stubs");
+        let copies = root.join("copies");
+        fs::create_dir_all(&stubs).unwrap();
+        fs::create_dir_all(&copies).unwrap();
+        let stub = stubs.join("__future__.pyi");
+        fs::write(&stub, "class _Feature: ...\n\nannotations: _Feature\n").unwrap();
+        let copy = copies.join("__future__.py");
+        fs::write(&copy, "annotations = None\n").unwrap();
+        let main = root.join("main.py");
+        fs::write(&main, "from __future__ import annotations\n").unwrap();
+        let glean_dir = temp.path().join("glean");
+
+        let mut config = ConfigFile::default();
+        config.python_environment.set_empty_to_default();
+        config.interpreters.skip_interpreter_query = true;
+        config.search_path_from_file = vec![stubs, copies, root.clone()];
+        config.disable_search_path_heuristics = true;
+        config.configure();
+        let args = CheckArgs::parse_from(["check", "--report-glean", glean_dir.to_str().unwrap()]);
+        let (_, check_result) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root,
+                    initial_files: vec![stub, copy, main],
+                }),
+                ConfigFinder::new_constant(ArcId::new(config)),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        let errors = &check_result.legacy_errors;
+        assert!(errors.is_empty(), "unexpected type errors: {errors:#?}");
+
+        let facts: String = fs::read_dir(&glean_dir)
+            .unwrap()
+            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect();
+        assert!(
+            facts.contains("stubs.__future__.annotations\""),
+            "the stub should be named after its path"
+        );
+        assert!(
+            facts.contains("copies.__future__.annotations\""),
+            "the copy should be named after its path"
+        );
     }
 
     #[test]
@@ -3093,6 +3250,46 @@ def go(w: Widget) -> int:
             .check("test", &CategorizedEvents::default(), UpsellDecision::Skip)
             .unwrap();
         assert_eq!(fs::read_dir(glean_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn incremental_checker_config_paths() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("main.py");
+        fs::write(&path, "x = 1\n").unwrap();
+        assert!(
+            incremental_checker(&root, vec![path.clone()])
+                .config_paths()
+                .is_empty(),
+            "a synthesized config has no file to watch",
+        );
+
+        // A config given with `--config` can have any name.
+        let config_file = root.join("ci.toml");
+        let base_file = temp.path().join("base.toml");
+        let mut config = test_config(&root);
+        config.source = ConfigSource::File(config_file.clone());
+        config.extended_config_paths = vec![base_file.clone()];
+        let checker = IncrementalChecker::new(
+            RequireLevels {
+                specified: Require::Errors,
+                default: Require::Exports,
+            },
+            Box::new(TestIncludes {
+                root: root.clone(),
+                initial_files: vec![path],
+            }),
+            ConfigFinder::new_constant(ArcId::new(config)),
+            ThreadCount::Inline,
+        )
+        .unwrap();
+        assert_eq!(
+            checker.config_paths().into_iter().collect::<Vec<_>>(),
+            vec![config_file, base_file],
+            "the config file of a checked file and the file it extends are watched",
+        );
     }
 
     #[test]

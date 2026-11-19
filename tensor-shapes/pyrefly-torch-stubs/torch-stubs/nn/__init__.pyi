@@ -312,10 +312,11 @@ class Embedding[NUM_EMB: IntVar, EMB_DIM: IntVar](Module):
 class ModuleDict[T](Module):
     """Holds submodules in a dictionary"""
 
-    # A TypedDict is not assignable to `dict[str, M]`, so typed module dictionaries
-    # select the second overload and keep their per-key module types.
+    # A TypedDict is only assignable to `Mapping[str, object]`, which does not satisfy
+    # the `Module` bound, so typed module dictionaries select the second overload and
+    # keep their per-key module types.
     @overload
-    def __init__[M: Module](self: ModuleDict[M], modules: dict[str, M]) -> None: ...
+    def __init__[M: Module](self: ModuleDict[M], modules: Mapping[str, M]) -> None: ...
     @overload
     def __init__(self, modules: T | None = None) -> None: ...
     def __getitem__(self, key: str) -> T: ...
@@ -495,59 +496,32 @@ class GroupNorm(Module):
     ) -> None: ...
     def forward[S: IntTuple](self, input: Tensor[S]) -> Tensor[S]: ...
 
-class BatchNorm1d(Module):
+class _BatchNorm(Module):
+    """Common base of the batch normalization modules"""
+
+    weight: Tensor
+    bias: Tensor
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+        device: Any = None,
+        dtype: Any = None,
+    ) -> None: ...
+    def forward[S: IntTuple](self, input: Tensor[S]) -> Tensor[S]: ...
+
+class BatchNorm1d(_BatchNorm):
     """Applies Batch Normalization over a 2D or 3D input"""
 
-    weight: Tensor
-    bias: Tensor
-
-    def __init__(
-        self,
-        num_features: int,
-        eps: float = 1e-5,
-        momentum: float = 0.1,
-        affine: bool = True,
-        track_running_stats: bool = True,
-        device: Any = None,
-        dtype: Any = None,
-    ) -> None: ...
-    def forward[S: IntTuple](self, input: Tensor[S]) -> Tensor[S]: ...
-
-class BatchNorm2d(Module):
+class BatchNorm2d(_BatchNorm):
     """Applies Batch Normalization over a 4D input"""
 
-    weight: Tensor
-    bias: Tensor
-
-    def __init__(
-        self,
-        num_features: int,
-        eps: float = 1e-5,
-        momentum: float = 0.1,
-        affine: bool = True,
-        track_running_stats: bool = True,
-        device: Any = None,
-        dtype: Any = None,
-    ) -> None: ...
-    def forward[S: IntTuple](self, input: Tensor[S]) -> Tensor[S]: ...
-
-class BatchNorm3d(Module):
+class BatchNorm3d(_BatchNorm):
     """Applies Batch Normalization over a 5D input"""
-
-    weight: Tensor
-    bias: Tensor
-
-    def __init__(
-        self,
-        num_features: int,
-        eps: float = 1e-5,
-        momentum: float = 0.1,
-        affine: bool = True,
-        track_running_stats: bool = True,
-        device: Any = None,
-        dtype: Any = None,
-    ) -> None: ...
-    def forward[S: IntTuple](self, input: Tensor[S]) -> Tensor[S]: ...
 
 class InstanceNorm1d(Module):
     """Applies Instance Normalization over a 3D input"""
@@ -637,14 +611,16 @@ class Conv1d[
     InC: IntVar,
     OutC: IntVar,
     K: IntVar,
-    S: IntVar = 1,
-    P: IntVar = 0,
-    D: IntVar = 1,
+    S: IntVar = int,
+    P: IntVar = int,
+    D: IntVar = int,
 ](Module):
     """1D convolution. Tracks channel and spatial dimensions.
 
     Type parameters S, P, D are bound from constructor arguments via _Int[T].
-    PEP 696 defaults (S=1, P=0, D=1) apply when arguments are omitted.
+    Omitted arguments use their precise scalar defaults. The gradual class
+    defaults apply only when a control is not bound, as in an unparameterized
+    subclass. String padding leaves the output length gradual.
     """
 
     weight: Tensor[[OutC, InC, K]]
@@ -655,7 +631,7 @@ class Conv1d[
         out_channels: _Int[OutC],
         kernel_size: _Int[K],
         stride: _Int[S] = 1,
-        padding: _Int[P] = 0,
+        padding: _Int[P] | str = 0,
         dilation: _Int[D] = 1,
         groups: int = 1,
         bias: bool = True,
@@ -671,14 +647,16 @@ class Conv2d[
     InC: IntVar,
     OutC: IntVar,
     K: IntVar,
-    S: IntVar = 1,
-    P: IntVar = 0,
-    D: IntVar = 1,
+    S: IntVar = int,
+    P: IntVar = int,
+    D: IntVar = int,
 ](Module):
     """2D convolution. Tracks channel and spatial dimensions.
 
     Type parameters S, P, D are bound from constructor arguments via _Int[T].
-    PEP 696 defaults (S=1, P=0, D=1) apply when arguments are omitted.
+    Omitted arguments use their precise scalar defaults. The gradual class
+    defaults apply only when a control is not bound, as in an unparameterized
+    subclass.
 
     kernel_size, stride, padding, and dilation also accept tuple[int, int]
     for per-axis values.  When a tuple is passed the corresponding type
@@ -1134,7 +1112,7 @@ class LSTM[
         """Reset parameter data pointer for CUDA contiguous memory. No-op on CPU."""
         ...
     def forward[Shape: IntTuple](
-        self, input: Tensor[Shape]
+        self, input: Tensor[Shape], hx: tuple[Tensor, Tensor] | None = None
     ) -> tuple[
         Tensor[gru_output_shape(Shape, InputSize, HiddenSize, Bidirectional)],
         tuple[
@@ -1442,7 +1420,9 @@ class Flatten[StartDim: Flag[int], EndDim: Flag[int]](Module):
 
 class Unflatten(Module):
     """Unflattens a dimension"""
-    def __init__(self, dim: int | str, unflattened_size: tuple[int, ...]) -> None: ...
+    def __init__(
+        self, dim: int | str, unflattened_size: tuple[int, ...] | list[int]
+    ) -> None: ...
     def forward(self, input: Tensor) -> Tensor: ...
 
 class ReflectionPad2d[Padding: Flag[int]](Module):

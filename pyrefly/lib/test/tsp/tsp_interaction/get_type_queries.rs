@@ -286,7 +286,7 @@ fn test_get_computed_type_string_is_class() {
 
 #[test]
 fn test_get_computed_type_none_is_class() {
-    // Regression test for https://github.com/facebook/pyrefly/issues/4035:
+    // Regression test for https://github.com/pyrefly-org/pyrefly/issues/4035:
     // `None` must be a `NoneType` `ClassType`, not an off-spec `none`
     // `BuiltInType`, so consumers can reconstruct unions like `str | None`.
     // The declaration is sourced from the stdlib's `NoneType` class, so it
@@ -408,7 +408,7 @@ fn test_get_computed_type_function_is_function_type() {
 
 #[test]
 fn test_get_computed_type_in_unopened_file() {
-    // Regression test for https://github.com/facebook/pyrefly/issues/4228:
+    // Regression test for https://github.com/pyrefly-org/pyrefly/issues/4228:
     // `getComputedType` is keyed by `(uri, range)` and must resolve nodes in any
     // analyzable file, not only open documents. Here `lib.py` is on disk and
     // imported by the open `main.py`, but is itself never `didOpen`ed; querying a
@@ -684,6 +684,37 @@ fn test_get_computed_type_tuple_unpacked() {
     assert_eq!(args[1]["declaration"]["name"], "Ts");
     assert_eq!(args[1]["flags"], TypeFlags::UNPACKED.0);
     assert_eq!(args[2]["declaration"]["name"], "str");
+
+    tsp.shutdown();
+}
+
+#[test]
+fn test_get_computed_type_generic_typed_dict_has_type_args() {
+    // A generic TypedDict is an ordinary parameterized class, so `Box[int]` reports
+    // its specialization through `typeArgs` the same way any other generic class does.
+    let (mut tsp, file_uri, snapshot) = setup_project(
+        "from typing import Generic, TypedDict, TypeVar\nT = TypeVar(\"T\")\nclass Box(TypedDict, Generic[T]):\n    item: T\nb: Box[int] = {\"item\": 1}\n",
+    );
+
+    let result = get_computed_type_ok(&mut tsp, &file_uri, 4, 0, snapshot);
+    assert_kind(&result, TypeKind::Class);
+
+    let decl = result.get("declaration").expect("Expected declaration");
+    assert_eq!(decl.get("name").and_then(|v| v.as_str()), Some("Box"));
+
+    let type_args = result
+        .get("typeArgs")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("Expected typeArgs on a generic TypedDict: {result}"));
+    assert_eq!(type_args.len(), 1, "Expected one type arg in: {result}");
+    assert_eq!(
+        type_args[0]
+            .get("declaration")
+            .and_then(|d| d.get("name"))
+            .and_then(|v| v.as_str()),
+        Some("int"),
+        "Expected `Box[int]`'s type arg to be `int` in: {result}",
+    );
 
     tsp.shutdown();
 }
