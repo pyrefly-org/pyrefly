@@ -326,8 +326,9 @@ information is provided inline at the call site.
 Pyrefly infers complete schemas for `pl.read_csv` and `pl.scan_csv` when
 `schema=` is an inline dictionary or inline `pl.Schema`. `read_csv` produces a
 typed DataFrame, and `scan_csv` produces a typed LazyFrame whose schema survives
-`collect()`. If `schema` is not provided but `columns=` and `schema_overrides=`
-are, `read_csv` will try to infer a schema from them.
+`collect()`. If `schema` is not provided but `columns=` is a static name list,
+`read_csv` infers those columns with dtypes from `schema_overrides=` if
+provided, or `Unknown` otherwise.
 
 ```python
 reveal_type(
