@@ -6,6 +6,7 @@
  */
 
 use std::collections::VecDeque;
+use std::iter::successors;
 use std::sync::Arc;
 
 use dupe::Dupe;
@@ -879,10 +880,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // don't report the error for `__init__` methods
             && (stmt.name.id != dunder::INIT || def.defining_cls.is_none())
         {
+            let is_public_name = |name: &str| !name.starts_with('_') || name.ends_with("__");
+            let is_public = is_public_name(stmt.name.as_str())
+                && successors(Some(&binding.parent), |context| context.parent()).all(|context| {
+                    !context.is_function()
+                        && context
+                            .identifier()
+                            .is_none_or(|id| is_public_name(self.module().code_at(id.range())))
+                });
             self.error(
                 errors,
                 stmt.name.range(),
-                ErrorKind::UnannotatedReturn,
+                if is_public {
+                    ErrorKind::UnannotatedPublicReturn
+                } else {
+                    ErrorKind::UnannotatedReturn
+                },
                 format!("`{}` is missing a return annotation", stmt.name),
             );
         }
@@ -919,6 +932,36 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 format!(
                     "`{}` is decorated with `@abstractmethod` but has an implementation",
                     def.metadata.kind.format(self, self.module().name())
+                ),
+            );
+        }
+        // Compare only types the user wrote: an inferred getter return (e.g. `None` from a
+        // `pass` body) or an unannotated value parameter is not evidence of a mismatch.
+        // Overload signatures are skipped because the implementation states the full
+        // accepted type, and custom decorators may reshape the setter's parameters.
+        if def.decorators.is_empty()
+            && !def.metadata.flags.is_overload
+            && let Some(property) = &def.metadata.flags.property_metadata
+            && matches!(property.role, PropertyRole::Setter)
+            && property
+                .getter
+                .toplevel_func_metadata()
+                .is_some_and(|getter| !getter.flags.is_return_inferred)
+            && let Some(getter_ty) = property.getter.callable_return_type(self.heap, self)
+            && let Some(Param::Pos(_, value_ty, _) | Param::PosOnly(_, value_ty, _)) =
+                def.params.get(1)
+            && let Some(annotation) = stmt.parameters.iter().nth(1).and_then(|p| p.annotation())
+            && self.is_provably_disjoint(value_ty, &getter_ty)
+        {
+            self.error(
+                errors,
+                annotation.range(),
+                ErrorKind::PropertyTypeMismatch,
+                format!(
+                    "Setter for property `{}` accepts `{}`, which cannot overlap the getter type `{}`",
+                    stmt.name,
+                    self.display(value_ty.clone()),
+                    self.display(getter_ty),
                 ),
             );
         }

@@ -414,6 +414,8 @@ pub enum ErrorKind {
     /// guaranteed. This is a separate error code from BadKeywordArgument to allow
     /// users to opt-in to this stricter check.
     PotentialBadKeywordArgument,
+    /// A property setter accepts a value type that cannot overlap the getter's return type.
+    PropertyTypeMismatch,
     /// Accessing a protected class member from outside its defining class or a subclass.
     ProtectedAccess,
     /// A protocol attribute was first defined inside a method instead of the class body.
@@ -466,6 +468,9 @@ pub enum ErrorKind {
     UnannotatedParameter,
     /// A protocol member is assigned a value in the class body without an explicit type annotation.
     UnannotatedProtocolMember,
+    /// A public function is missing a return type annotation.
+    /// This is a sub-kind of [UnannotatedReturn].
+    UnannotatedPublicReturn,
     /// A function is missing a return type annotation.
     UnannotatedReturn,
     /// Attempting to use a name that may be unbound or uninitialized
@@ -620,6 +625,7 @@ impl ErrorKind {
             | ErrorKind::PytorchEfficiencyLintRedundantToCall => {
                 Some(ErrorKind::PytorchEfficiencyLints)
             }
+            ErrorKind::UnannotatedPublicReturn => Some(ErrorKind::UnannotatedReturn),
             _ => None,
         }
     }
@@ -695,6 +701,7 @@ impl ErrorKind {
             ErrorKind::OrderedDataclassInheritance => Severity::Warn,
             ErrorKind::PossiblyUninitializedAttribute => Severity::Ignore,
             ErrorKind::PotentialBadKeywordArgument => Severity::Ignore,
+            ErrorKind::PropertyTypeMismatch => Severity::Ignore,
             ErrorKind::ProtectedAccess => Severity::Ignore,
             ErrorKind::PytorchEfficiencyLintCudaCall => Severity::Ignore,
             ErrorKind::PytorchEfficiencyLintItemCall => Severity::Ignore,
@@ -707,6 +714,7 @@ impl ErrorKind {
             ErrorKind::StringAsIterable => Severity::Ignore,
             ErrorKind::UnannotatedAttribute => Severity::Ignore,
             ErrorKind::UnannotatedParameter => Severity::Ignore,
+            ErrorKind::UnannotatedPublicReturn => Severity::Ignore,
             ErrorKind::UnannotatedReturn => Severity::Ignore,
             ErrorKind::UnexpectedNever => Severity::Warn,
             ErrorKind::UninitializedInstanceVariable => Severity::Ignore,

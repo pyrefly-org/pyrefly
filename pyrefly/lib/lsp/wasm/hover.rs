@@ -26,6 +26,7 @@ use pyrefly_python::ignore::Ignore;
 use pyrefly_python::ignore::Tool;
 use pyrefly_python::ignore::TypeIgnoreUnknownTagBehavior;
 use pyrefly_python::module::Module;
+use pyrefly_python::module::TextRangeWithModule;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_python::symbol_kind::SymbolKind;
 use pyrefly_types::callable::Callable;
@@ -45,6 +46,7 @@ use regex::Regex;
 use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprContext;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::ModModule;
 use ruff_python_ast::Stmt;
@@ -92,6 +94,7 @@ pub struct HoverValue {
     pub range: Option<Range>,
     pub docstring: Option<Docstring>,
     pub parameter_docs: Vec<(String, String)>,
+    pub property_accessors: Option<String>,
     pub type_sources: Vec<String>,
     pub display: Option<String>,
     pub show_go_to_links: bool,
@@ -322,14 +325,21 @@ impl HoverValue {
             )
         });
 
+        let accessors_formatted = self
+            .property_accessors
+            .as_ref()
+            .map(|acc| format!("\n---\n**Property accessors**\n{acc}"))
+            .unwrap_or_default();
+
         Hover {
             contents: Contents::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: format!(
-                    "```python\n{}{}{}\n```{}{}{}{}",
+                    "```python\n{}{}{}\n```{}{}{}{}{}",
                     kind_formatted,
                     name_formatted,
                     type_display,
+                    accessors_formatted,
                     type_source_formatted,
                     docstring_formatted,
                     parameter_docs_formatted,
@@ -1500,29 +1510,92 @@ fn class_docstring_for_constructor(
         return None;
     }
 
-    let preferences = [
-        FindPreference {
-            resolve_call_dunders: false,
-            ..FindPreference::default()
-        },
-        FindPreference {
-            prefer_pyi: false,
-            include_interpreter_stdlib: true,
-            resolve_call_dunders: false,
-            ..FindPreference::default()
-        },
-    ];
-    let from_definition = preferences.into_iter().find_map(|preference| {
-        let item = transaction
+    let base = FindPreference {
+        resolve_call_dunders: false,
+        ..FindPreference::default()
+    };
+    docstring_preferring_stub(base, |preference| {
+        transaction
             .find_definition(handle, position, preference)
-            .ok()
-            .and_then(|items| items.into_vec().into_iter().next())?;
-        item.doc_ranges
-            .docstring()
-            .map(|range| Docstring(range, item.module))
-            .and_then(nonempty_docstring)
-    });
-    from_definition.or_else(|| docstring_for_class_object_type(transaction, handle, &callee_type))
+            .ok()?
+            .into_vec()
+            .into_iter()
+            .next()
+    })
+    .or_else(|| docstring_for_class_object_type(transaction, handle, &callee_type))
+}
+
+/// The first nonempty docstring that `lookup` finds when it prefers the stub, then when
+/// it prefers the implementation, so a stub docstring wins over the implementation's.
+fn docstring_preferring_stub(
+    base: FindPreference,
+    lookup: impl Fn(FindPreference) -> Option<FindDefinitionItemWithDocstring>,
+) -> Option<Docstring> {
+    let stub = FindPreference {
+        prefer_pyi: true,
+        ..base
+    };
+    let implementation = FindPreference {
+        prefer_pyi: false,
+        include_interpreter_stdlib: true,
+        ..base
+    };
+    [stub, implementation].into_iter().find_map(|preference| {
+        let item = lookup(preference)?;
+        nonempty_docstring(Docstring(item.doc_ranges.docstring()?, item.module))
+    })
+}
+
+/// Docstring inherited from the nearest base class method with the same name, for a
+/// method override that has no docstring of its own. For each base class, a stub
+/// docstring wins over the implementation.
+///
+/// Applies only when `hovered_name` is the method's own name: a field or variable bound to a
+/// method, such as `callback = Child.f`, is not an override. A private method is never an
+/// override, because name mangling gives each class its own attribute.
+fn inherited_method_docstring(
+    transaction: &Transaction<'_>,
+    handle: &Handle,
+    type_: &Type,
+    hovered_name: &str,
+) -> Option<Docstring> {
+    let metadata = type_.toplevel_func_metadata()?;
+    let cls = metadata.kind.class()?;
+    let name = metadata.kind.function_name().into_owned();
+    if name.as_str() != hovered_name || Ast::is_mangled_attr(&name) {
+        return None;
+    }
+    // Visit only ancestors that declare `name` directly. A lookup on any other ancestor follows
+    // that ancestor's own MRO and can skip an earlier declaration in the MRO of `cls`.
+    let ancestors: Vec<ClassType> =
+        transaction.ad_hoc_solve(handle, "inherited_docstring", |solver| {
+            solver
+                .get_mro_for_class(&cls)
+                .ancestors_no_object()
+                .iter()
+                .filter(|ancestor| {
+                    solver
+                        .get_class_fields(ancestor.class_object())
+                        .is_some_and(|fields| fields.field_decl_range(&name).is_some())
+                })
+                .cloned()
+                .collect()
+        })?;
+    ancestors.into_iter().find_map(|ancestor| {
+        docstring_preferring_stub(FindPreference::default(), |preference| {
+            transaction
+                .find_attribute_definition_for_base_type(
+                    handle,
+                    preference,
+                    Type::ClassType(ancestor.clone()),
+                    &name,
+                )
+                .ok()?
+                .into_vec()
+                .into_iter()
+                .next()
+        })
+    })
 }
 
 pub fn get_hover(
@@ -1541,6 +1614,36 @@ pub fn get_hover(
         },
     )
     .map(|result| result.hover)
+}
+
+fn resolve_property_accessors(
+    transaction: &Transaction,
+    handle: &Handle,
+    id: &IdentifierWithContext,
+    setter_type: &Type,
+) -> Option<String> {
+    let IdentifierContext::Attribute {
+        base_range,
+        expr_context: ExprContext::Store,
+        ..
+    } = &id.context
+    else {
+        return None;
+    };
+    let answers = transaction.get_answers(handle)?;
+    let base_type = answers.get_type_trace(*base_range)?;
+    transaction.ad_hoc_solve(handle, "property_accessors", |solver| {
+        let getter_type = solver.property_getter_type_for_assignment(
+            base_type,
+            &id.identifier.id,
+            setter_type,
+        )?;
+        let setter_str = setter_type.as_lsp_string(&solver, LspDisplayMode::Hover);
+        let getter_str = getter_type.as_lsp_string(&solver, LspDisplayMode::Hover);
+        Some(format!(
+            "- **Setter:** `{setter_str}` (assigned here)\n- **Getter:** `{getter_str}`"
+        ))
+    })?
 }
 
 /// Build hover contents and report whether the compact type display can be expanded.
@@ -1631,7 +1734,7 @@ pub fn get_hover_with_verbosity(
                     item.module.code_at(item.definition_range) == identifier.id.as_str()
                 })
         });
-    let interface_definition = definition.as_ref().and_then(|executable| {
+    let interface_docstring = definition.as_ref().and_then(|executable| {
         if keyword_argument_identifier.is_some() {
             return None;
         }
@@ -1652,6 +1755,22 @@ pub fn get_hover_with_verbosity(
                 interface.module.path().is_interface()
                     && executable.metadata.symbol_kind() == interface.metadata.symbol_kind()
                     && executable.display_name == interface.display_name
+            })
+            .and_then(|interface| {
+                interface
+                    .doc_ranges
+                    .docstring()
+                    .map(|range| Docstring(range, interface.module))
+            })
+            .or_else(|| {
+                let (interface, doc_ranges) = transaction.find_corresponding_interface_definition(
+                    *handle.sys_info(),
+                    &TextRangeWithModule::new(
+                        executable.module.dupe(),
+                        executable.definition_range,
+                    ),
+                )?;
+                Some(Docstring(doc_ranges.docstring()?, interface.module))
             })
     });
     let hover_constructor_dunder = definition
@@ -1678,12 +1797,7 @@ pub fn get_hover_with_verbosity(
         } else {
             (None, fallback_name_from_type, None, Vec::new())
         };
-    let docstring = interface_definition
-        .and_then(|item| {
-            item.doc_ranges
-                .docstring()
-                .map(|range| Docstring(range, item.module))
-        })
+    let docstring = interface_docstring
         .and_then(nonempty_docstring)
         .or_else(|| fallback_docstring.and_then(nonempty_docstring))
         .or_else(|| docstring_for_class_object_type(transaction, handle, &type_));
@@ -1693,7 +1807,8 @@ pub fn get_hover_with_verbosity(
     } else {
         docstring
     }
-    .or_else(|| field_docstring_at_definition(ast.as_deref()?, module_info?, position));
+    .or_else(|| field_docstring_at_definition(ast.as_deref()?, module_info?, position))
+    .or_else(|| inherited_method_docstring(transaction, handle, &type_, name.as_deref()?));
 
     let name = name.or_else(|| identifier_text_at(transaction, handle, position));
 
@@ -1759,6 +1874,9 @@ pub fn get_hover_with_verbosity(
         .into_iter()
         .chain(definition_parameter_docs)
         .collect();
+    let property_accessors = hover_identifier
+        .as_ref()
+        .and_then(|id| resolve_property_accessors(transaction, handle, id, &type_));
 
     let mut hover = HoverValue {
         kind,
@@ -1767,6 +1885,7 @@ pub fn get_hover_with_verbosity(
         range,
         docstring,
         parameter_docs,
+        property_accessors,
         type_sources: type_sources_for_hover(transaction, handle, position),
         display: type_display,
         show_go_to_links: options.show_go_to_links,

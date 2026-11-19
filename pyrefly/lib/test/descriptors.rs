@@ -334,6 +334,113 @@ class Foo:
     "#,
 );
 
+// https://github.com/pyrefly-org/pyrefly/issues/3654
+testcase!(
+    test_property_setter_type_disjoint_from_getter,
+    TestEnv::new().enable_property_type_mismatch_error(),
+    r#"
+class Foo:
+    @property
+    def value(self) -> int:
+        return 1
+
+    @value.setter
+    def value(self, new_value: str) -> None:  # E: Setter for property `value` accepts `str`, which cannot overlap the getter type `int`
+        pass
+
+class Bar:
+    @property
+    def value(self) -> int | None:
+        return None
+
+    @value.setter
+    def value(self, new_value: str | bytes) -> None:  # E: Setter for property `value` accepts `bytes | str`, which cannot overlap the getter type `int | None`
+        pass
+    "#,
+);
+
+testcase!(
+    test_property_setter_type_overlapping_getter,
+    TestEnv::new().enable_property_type_mismatch_error(),
+    r#"
+from pathlib import Path
+from typing import overload
+
+class Wider:
+    @property
+    def path(self) -> Path:
+        return Path()
+
+    @path.setter
+    def path(self, value: str | Path) -> None:
+        pass
+
+class Narrower:
+    @property
+    def count(self) -> int | None:
+        return None
+
+    @count.setter
+    def count(self, value: bool) -> None:
+        pass
+
+class Base: ...
+class Other: ...
+
+class Unrelated:
+    @property
+    def item(self) -> Base:
+        return Base()
+
+    @item.setter
+    def item(self, value: Other) -> None:
+        pass
+
+class Generic[T]:
+    @property
+    def item(self) -> T:
+        raise NotImplementedError
+
+    @item.setter
+    def item(self, value: list[T]) -> None:
+        pass
+
+class Unannotated:
+    @property
+    def inferred(self):
+        pass
+
+    @inferred.setter
+    def inferred(self, value: int) -> None:
+        pass
+
+    @property
+    def value(self) -> int:
+        return 1
+
+    @value.setter
+    def value(self, value) -> None:
+        pass
+
+class OverloadedSetter:
+    @property
+    def x(self) -> int:
+        return 1
+
+    @x.setter
+    @overload
+    def x(self, value: None) -> None: ...
+
+    @x.setter
+    @overload
+    def x(self, value: int) -> None: ...
+
+    @x.setter
+    def x(self, value: int | None) -> None:
+        pass
+    "#,
+);
+
 testcase!(
     test_cached_property_assignment_allowed,
     r#"
@@ -1591,6 +1698,24 @@ class D:
 class K:
     x: D = D()  # E: Cannot set field `x` to data descriptor `D` with inconsistent types
 reveal_type(K.__init__)  # E: revealed type: (self: K, x: bool = ...) -> None
+"#,
+);
+
+testcase!(
+    test_descriptor_setter_missing_value_param_in_dataclass,
+    r#"
+from dataclasses import dataclass
+from typing import Any, reveal_type
+
+class Bad:
+    def __get__(self, obj: object, objtype: Any = None) -> int: ...
+    def __set__(self, obj: object) -> None: ...
+
+@dataclass
+class Owner:
+    b: Bad = Bad()
+
+reveal_type(Owner.__init__)  # E: revealed type: (self: Owner, b: Unknown = ...) -> None
 "#,
 );
 

@@ -114,6 +114,8 @@ pub struct Index {
     /// The call-site range spells the class name, not the definition's own name, so these are
     /// gated behind `ReferenceOptions::include_constructor_call_sites`.
     pub constructor_references: SmallMap<ModulePath, Vec<(IndexedAttribute, TextRange)>>,
+    /// Literal slot occurrences, including attributes declared in this module.
+    pub slot_references: SmallMap<ModulePath, Vec<(IndexedAttribute, TextRange)>>,
     /// A map from (child method range) to a list of parent method definitions (ModulePath, parent method).
     /// This is used to find reimplementations when doing find-references on parent methods.
     pub parent_methods_map: SmallMap<TextRange, Vec<(ModulePath, IndexedAttribute)>>,
@@ -147,6 +149,8 @@ pub enum AttributeReferenceKind {
     /// constructor protocol, as in `Foo()` reaching `Foo.__init__`. Only class construction
     /// is recorded this way; calling an instance through its `__call__` is not.
     ConstructorCall,
+    /// A literal name in the owning class's `__slots__` binding.
+    Slot,
 }
 
 /// Visiting a trace store reaches every type recorded in it.
@@ -1300,6 +1304,16 @@ pub trait LookupAnswer: Sized {
     /// Default implementation does nothing (not supported).
     fn publish_reserved_in_module(&self, _reserved: &mut ReservedSlot<'_, '_, '_, Self>) {}
 
+    /// Look up the Answers of a cross-module SCC member's module, to report on
+    /// that member.
+    ///
+    /// Returns `None` if the Answers are unavailable, in which case
+    /// `reserve_in_module` does not reserve the member either. The default
+    /// implementation returns `None` (not supported).
+    fn answers_in_module(&self, _calc_id: &CalcId) -> Option<Arc<Answers>> {
+        None
+    }
+
     /// Look up the class fields for a class, which may be defined in another
     /// module. The fields are populated during the binding phase and can be
     /// queried without going through the solve code path.
@@ -1565,8 +1579,33 @@ impl Answers {
         }
         // `pre_solve` has published every exported slot. From this point on,
         // the preallocated solutions table represents a complete result set.
+        if self.index.is_some() {
+            for entry in bindings.dunder_slots_entries() {
+                if let Some(class) = answers_solver.get_idx(entry.class_idx).0.as_ref() {
+                    answers_solver.record_attribute_definition_index(
+                        &answers_solver.instantiate(class),
+                        &entry.name.id,
+                        entry.name.range,
+                        AttributeReferenceKind::Slot,
+                    );
+                }
+            }
+        }
         if let Some(index) = &self.index {
             let mut index = index.lock();
+            // Retain export occurrences so unopened reverse dependencies need no AST or answers.
+            for entry in bindings.dunder_all_entries() {
+                if let Some(key) = bindings.dunder_all_binding(&entry.id)
+                    && let Some(IntermediateDefinition::NamedImport(_, module, name, None)) =
+                        key_to_intermediate_definition(bindings, key)
+                {
+                    index
+                        .externally_defined_variable_references
+                        .entry((module, name))
+                        .or_default()
+                        .push(entry.range);
+                }
+            }
             // Index bindings with external definitions.
             for idx in bindings.keys::<Key>() {
                 let key = bindings.idx_to_key(idx);
@@ -1951,6 +1990,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         range: _,
                         doc_ranges: _,
                     } => match reference_kind {
+                        AttributeReferenceKind::Slot => index
+                            .lock()
+                            .slot_references
+                            .entry(cls.module_path().dupe())
+                            .or_default()
+                            .push((
+                                IndexedAttribute {
+                                    cls: cls.index(),
+                                    name,
+                                },
+                                attribute_reference_range,
+                            )),
                         AttributeReferenceKind::ConstructorCall => index
                             .lock()
                             .constructor_references

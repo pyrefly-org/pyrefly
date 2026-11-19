@@ -422,6 +422,13 @@ table! {
     pub struct BindingTable(pub BindingEntry)
 }
 
+/// A literal slot occurrence and the class whose field binding declares it.
+#[derive(Debug)]
+pub struct SlotEntry {
+    pub name: Identifier,
+    pub class_idx: Idx<KeyClass>,
+}
+
 #[derive(Debug)]
 pub struct Bindings {
     module_info: ModuleInfo,
@@ -438,6 +445,9 @@ pub struct Bindings {
     annotated_metadata_ranges: Vec<TextRange>,
     /// Ranges of the types that were read from docstrings, sorted and non-overlapping.
     docstring_type_ranges: Vec<TextRange>,
+    /// Each entry records an `__all__` name and its range without string delimiters.
+    dunder_all_entries: Vec<Identifier>,
+    dunder_slots_entries: Vec<SlotEntry>,
     scope_trace: Option<ScopeTrace>,
     /// Names `del`eted at module scope; retained outside the LSP `scope_trace`.
     module_deletes: SmallSet<Name>,
@@ -672,59 +682,6 @@ impl Bindings {
         let mut res = 0;
         table_for_each!(&self.table, |x: &BindingEntry<_>| res += x.1.len());
         res
-    }
-
-    /// Create a minimal Bindings for testing purposes.
-    ///
-    /// This creates a fake module with the given name and a mutation-free wrapper summary,
-    /// which is useful for creating distinguishable CalcIds in tests.
-    #[cfg(test)]
-    pub fn for_test(name: &str) -> Self {
-        use std::path::PathBuf;
-
-        use pyrefly_python::module::Module;
-        use pyrefly_python::module_path::ModulePath;
-
-        let module_name = ModuleName::from_str(name);
-        let module_path = ModulePath::filesystem(PathBuf::from(format!("/test/{}.py", name)));
-        let contents = Arc::new(String::new());
-        let module_info = Module::new(module_name, module_path, contents);
-        let mut table = BindingTable::default();
-        let functools_wrapper_mutation =
-            bind_functools_wrapper_mutation(&mut table, TextRange::default(), false);
-        let metadata = Arc::new(BindingsMetadata::new(&module_info));
-        Self {
-            module_info,
-            parse_errors: ModuleDiagnostics::default(),
-            binding_errors: ModuleDiagnostics::default(),
-            sys_info: SysInfo::default(),
-            table,
-            metadata,
-            module_ranges: None,
-            annotated_metadata_ranges: Vec::new(),
-            docstring_type_ranges: Vec::new(),
-            scope_trace: None,
-            module_deletes: SmallSet::new(),
-            unset_nodes: UnsetNodes::default(),
-            global_declarations: SmallSet::new(),
-            environment_definitions: SmallMap::new(),
-            environment_names: SmallSet::new(),
-            unused_imports: Vec::new(),
-            unused_variables: Vec::new(),
-            pytest_info: None,
-            setattr_name_literals: Vec::new(),
-            lambda_yield_keys: Vec::new(),
-            owned_lambda_params: SmallMap::new(),
-            lambda_parameter_derived: OnceLock::new(),
-            class_scopes: Vec::new(),
-            call_base_classes: Vec::new(),
-            class_field_definitions: SmallMap::new(),
-            shape_declarations: ShapeDeclarations::default(),
-            subsequently_initialized: SmallSet::new(),
-            class_scope_fallbacks: SmallMap::new(),
-            promote_ranges: SmallSet::new(),
-            functools_wrapper_mutation,
-        }
     }
 
     pub fn display<K: Keyed>(&self, idx: Idx<K>) -> impl Display + '_
@@ -970,6 +927,26 @@ impl Bindings {
         }
     }
 
+    pub fn dunder_slots_entries(&self) -> &[SlotEntry] {
+        &self.dunder_slots_entries
+    }
+
+    pub fn dunder_slots_entry_at(&self, position: TextSize) -> Option<&SlotEntry> {
+        self.dunder_slots_entries
+            .iter()
+            .find(|entry| entry.name.range.contains_inclusive(position))
+    }
+
+    pub fn dunder_all_entries(&self) -> &[Identifier] {
+        &self.dunder_all_entries
+    }
+
+    /// Return the final local binding for an export, preserving local import aliases.
+    pub fn dunder_all_binding(&self, name: &Name) -> Option<&Key> {
+        let export = self.key_to_idx_hashed_opt(Hashed::new(&KeyExport(name.clone())))?;
+        Some(self.idx_to_key(self.get(export).key_idx()))
+    }
+
     /// Within the LSP, check if a key exists.
     /// It may not exist within `if False:` or `if sys.version == 0:` style code.
     pub fn is_valid_key(&self, k: &Key) -> bool {
@@ -1131,6 +1108,12 @@ impl Bindings {
         use_shape_comments_and_stubs: bool,
     ) -> Self {
         let module_range = x.range;
+        let dunder_all_entries = exports
+            .dunder_all_names()
+            .filter_map(|(_, name, content_range)| {
+                Some(Identifier::new(name.clone(), content_range?))
+            })
+            .collect();
         let pytest_info = PytestBindingInfo::from_module(&x);
         let errors = ErrorCollector::new(module_info.dupe(), error_style);
         let shape_comments = if use_shape_comments_and_stubs {
@@ -1310,7 +1293,7 @@ impl Bindings {
                 classes: builder.django_relation_classes.into_boxed_slice(),
             },
         );
-        Self {
+        let mut bindings = Self {
             module_info,
             parse_errors,
             binding_errors: builder.errors.finish(),
@@ -1320,6 +1303,8 @@ impl Bindings {
             module_ranges,
             annotated_metadata_ranges: merge_ranges(builder.annotated_metadata_ranges),
             docstring_type_ranges: merge_ranges(builder.docstring_type_ranges),
+            dunder_all_entries,
+            dunder_slots_entries: Vec::new(),
             scope_trace: if enable_trace {
                 Some(scope_trace)
             } else {
@@ -1345,7 +1330,28 @@ impl Bindings {
             class_scope_fallbacks: builder.class_scope_fallbacks,
             promote_ranges: builder.promote_ranges,
             functools_wrapper_mutation,
-        }
+        };
+        bindings.dunder_slots_entries = bindings
+            .keys::<KeyClassField>()
+            .flat_map(|idx| {
+                let field = bindings.get(idx);
+                if field.name != *dunder::SLOTS {
+                    return Vec::new();
+                }
+                field
+                    .explicit_slots()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(name, range)| {
+                        Some(SlotEntry {
+                            name: Identifier::new(name, range?),
+                            class_idx: field.class_idx,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        bindings
     }
 
     fn should_emit_semantic_syntax_error(error: &SemanticSyntaxError) -> bool {
