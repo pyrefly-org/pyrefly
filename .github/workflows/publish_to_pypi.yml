@@ -10,10 +10,10 @@ on:
     branches: [ main, 'release/**' ]
   workflow_dispatch:
     inputs:
-      pgo:
-        description: 'Optimize with PGO and BOLT (turn off to ship plain executables if training is broken)'
+      skip_pgo:
+        description: 'Skip PGO and BOLT (to ship plain executables if training is broken)'
         type: boolean
-        default: true
+        default: false
 
 jobs:
   check_publish:
@@ -25,8 +25,9 @@ jobs:
     if: needs.check_publish.outputs.should_publish == 'true'
     uses: ./.github/workflows/publish_build_packages.yml
     with:
-      # `inputs.pgo` is empty when a version bump triggers the release.
-      pgo: ${{ inputs.pgo != false }}
+      # `inputs.skip_pgo` is null when a version bump triggers the release, which
+      # `|| false` turns into false.
+      skip_pgo: ${{ inputs.skip_pgo || false }}
   test:
     name: Test
     needs: check_publish

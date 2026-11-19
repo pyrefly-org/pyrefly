@@ -21,10 +21,10 @@ on:
     - cron: '0 8 * * *'
   workflow_dispatch:
     inputs:
-      pgo:
-        description: 'Optimize with PGO and BOLT'
+      skip_pgo:
+        description: 'Skip PGO and BOLT'
         type: boolean
-        default: true
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -32,10 +32,10 @@ on:
         required: false
         type: string
         default: ''
-      pgo:
-        description: 'Optimize with PGO and BOLT (turn off to ship plain executables if training is broken)'
+      skip_pgo:
+        description: 'Skip PGO and BOLT (to ship plain executables if training is broken)'
         type: boolean
-        default: true
+        default: false
 
 env:
   PACKAGE_NAME: pyrefly
@@ -113,11 +113,10 @@ jobs:
         if: ${{ matrix.platform.target == 'aarch64' }}
         run: echo "JEMALLOC_SYS_WITH_LG_PAGE=14" >> $GITHUB_ENV
       # A revision from before PGO, such as an old tag that the upload workflow
-      # rebuilds, has no scripts/pgo.py and builds without it. `inputs.pgo` is
-      # empty in the nightly run, which optimizes.
+      # rebuilds, has no scripts/pgo.py and builds without it.
       - name: Decide whether to use PGO
         shell: bash
-        run: echo "PGO=${{ matrix.platform.pgo && inputs.pgo != false && hashFiles('scripts/pgo.py') != '' }}" >> "$GITHUB_ENV"
+        run: echo "PGO=${{ matrix.platform.pgo && !inputs.skip_pgo && hashFiles('scripts/pgo.py') != '' }}" >> "$GITHUB_ENV"
       - name: Restore the PGO training corpus
         if: ${{ env.PGO == 'true' }}
         uses: actions/cache@v6
@@ -202,11 +201,10 @@ jobs:
         # by Cargo have long paths and will cause builds/tests to fail
         run: echo "CARGO_HOME=C:\\cargo" >> $env:GITHUB_ENV
       # A revision from before PGO, such as an old tag that the upload workflow
-      # rebuilds, has no scripts/pgo.py and builds without it. `inputs.pgo` is
-      # empty in the nightly run, which optimizes.
+      # rebuilds, has no scripts/pgo.py and builds without it.
       - name: Decide whether to use PGO
         shell: bash
-        run: echo "PGO=${{ matrix.platform.pgo && inputs.pgo != false && hashFiles('scripts/pgo.py') != '' }}" >> "$GITHUB_ENV"
+        run: echo "PGO=${{ matrix.platform.pgo && !inputs.skip_pgo && hashFiles('scripts/pgo.py') != '' }}" >> "$GITHUB_ENV"
       - name: Restore the PGO training corpus
         if: ${{ env.PGO == 'true' }}
         uses: actions/cache@v6
@@ -296,11 +294,10 @@ jobs:
         if: ${{ startsWith(matrix.platform.target, 'aarch64') }}
         run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
       # A revision from before PGO, such as an old tag that the upload workflow
-      # rebuilds, has no scripts/pgo.py and builds without it. `inputs.pgo` is
-      # empty in the nightly run, which optimizes.
+      # rebuilds, has no scripts/pgo.py and builds without it.
       - name: Decide whether to use PGO
         shell: bash
-        run: echo "PGO=${{ matrix.platform.pgo && inputs.pgo != false && hashFiles('scripts/pgo.py') != '' }}" >> "$GITHUB_ENV"
+        run: echo "PGO=${{ matrix.platform.pgo && !inputs.skip_pgo && hashFiles('scripts/pgo.py') != '' }}" >> "$GITHUB_ENV"
       - name: Restore the PGO training corpus
         if: ${{ env.PGO == 'true' }}
         uses: actions/cache@v6
@@ -471,11 +468,10 @@ jobs:
         # See https://github.com/pyrefly-org/pyrefly/issues/380
         run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
       # A revision from before PGO, such as an old tag that the upload workflow
-      # rebuilds, has no scripts/pgo.py and builds without it. `inputs.pgo` is
-      # empty in the nightly run, which optimizes.
+      # rebuilds, has no scripts/pgo.py and builds without it.
       - name: Decide whether to use PGO
         shell: bash
-        run: echo "PGO=${{ matrix.platform.pgo && inputs.pgo != false && hashFiles('scripts/pgo.py') != '' }}" >> "$GITHUB_ENV"
+        run: echo "PGO=${{ matrix.platform.pgo && !inputs.skip_pgo && hashFiles('scripts/pgo.py') != '' }}" >> "$GITHUB_ENV"
       - name: Restore the PGO training corpus
         if: ${{ env.PGO == 'true' }}
         uses: actions/cache@v6
