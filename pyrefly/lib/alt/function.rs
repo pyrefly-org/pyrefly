@@ -309,6 +309,14 @@ impl DecoratorParamHints {
     }
 }
 
+fn contains_int_var(ty: &Type) -> bool {
+    let mut quantifieds = SmallSet::new();
+    ty.collect_quantifieds(&mut quantifieds);
+    quantifieds
+        .iter()
+        .any(|quantified| quantified.kind() == QuantifiedKind::IntVar)
+}
+
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn decorator_param_hints(&self, decorators: &[(Type, usize)]) -> Option<DecoratorParamHints> {
         decorators.iter().rev().find_map(|(decorator_ty, _)| {
@@ -1557,6 +1565,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ty.collect_quantifieds(&mut qs);
             !qs.is_empty()
         });
+        // A literal default of a shape dimension is not a solution of that
+        // dimension, so the synthesized constructor does not solve from it.
+        if annotated.is_some_and(contains_int_var) {
+            return DataclassFieldDefault::Unknown;
+        }
         let ty = if has_type_var {
             let tcc = || {
                 TypeCheckContext::of_kind(TypeCheckKind::FunctionParameterDefault(
@@ -1582,7 +1595,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         ty: Type,
         annotated: Option<&Type>,
     ) -> DataclassFieldDefault {
-        if ty.is_any() {
+        if ty.is_any() || annotated.is_some_and(contains_int_var) {
             return DataclassFieldDefault::Unknown;
         }
         if let Some(expected) = annotated {
@@ -1603,7 +1616,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         DataclassFieldDefault::Known(ty.with_literal_style(LitStyle::Explicit))
     }
 
-    /// Determine the type and required-ness of a parameter.
     fn get_param_type_and_requiredness(
         &self,
         name: &Identifier,
