@@ -119,6 +119,40 @@ B: A = Sentinel("B")  # E: `sentinel` is not assignable to `A`
 );
 
 testcase!(
+    test_sentinel_is_instance_of_runtime_class,
+    r#"
+from typing_extensions import Sentinel
+
+MISSING = Sentinel("MISSING")
+OTHER = Sentinel("OTHER")
+
+value: Sentinel = MISSING
+
+def f(value: int | Sentinel = MISSING) -> Sentinel:
+    return OTHER
+
+def g(value: Sentinel) -> None:
+    specific: MISSING = value  # E: `sentinel` is not assignable to `MISSING`
+
+different: MISSING = OTHER  # E: `OTHER` is not assignable to `MISSING`
+not_class: type[Sentinel] = MISSING  # E: `MISSING` is not assignable to `type[sentinel]`
+    "#,
+);
+
+testcase!(
+    test_builtin_sentinel_is_instance_of_runtime_class_3_15,
+    TestEnv::new().with_version(PythonVersion::new(3, 15, 0)),
+    r#"
+from typing_extensions import Sentinel
+
+BUILTIN = sentinel("BUILTIN")
+UPPER = Sentinel("UPPER")
+
+def f(value: int | sentinel = BUILTIN, other: sentinel = UPPER) -> None: ...
+    "#,
+);
+
+testcase!(
     test_sentinel_typehint_any,
     r#"
 from typing import Any, assert_type

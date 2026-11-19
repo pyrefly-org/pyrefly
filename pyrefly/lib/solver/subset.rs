@@ -3029,6 +3029,14 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                     .heap
                     .mk_class_type(self.type_order.stdlib().none_type().clone()),
             ),
+            // A sentinel value is an instance of the runtime `sentinel` class.
+            (Type::Sentinel(_), _) => self.is_subset_eq(
+                &self
+                    .solver
+                    .heap
+                    .mk_class_type(self.type_order.stdlib().sentinel().clone()),
+                want,
+            ),
             (Type::Forall(forall), _) => {
                 let got = self.instantiate_fresh_forall((**forall).clone(), want);
                 self.is_subset_forall(got, want)
