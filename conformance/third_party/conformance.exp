@@ -9070,8 +9070,8 @@
     {
       "code": -2,
       "column": 50,
-      "concise_description": "`str` is not assignable to upper bound `LiteralString` of type variable `T`",
-      "description": "`str` is not assignable to upper bound `LiteralString` of type variable `T`",
+      "concise_description": "`str` is not assignable to upper bound `LiteralString` of type variable `T` for parameter `value`",
+      "description": "`str` is not assignable to upper bound `LiteralString` of type variable `T` for parameter `value`",
       "line": 133,
       "name": "bad-specialization",
       "severity": "error",
