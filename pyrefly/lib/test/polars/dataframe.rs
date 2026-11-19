@@ -269,6 +269,18 @@ reveal_type(pl.read_csv("data.csv", columns=["a", "b", "c"], schema_overrides=[p
 );
 
 polars_testcase!(
+    test_read_csv_columns_without_valid_overrides,
+    r#"
+import polars as pl
+from typing import reveal_type
+
+reveal_type(pl.read_csv("data.csv", columns=["a"]))  # E: revealed type: DataFrame[a: Unknown]
+reveal_type(pl.read_csv("data.csv", columns=["a"], schema_overrides={}))  # E: revealed type: DataFrame[a: Unknown]
+reveal_type(pl.read_csv("data.csv", columns=["a"], schema_overrides={"z": pl.Int64}))  # E: revealed type: DataFrame[a: Unknown]
+"#,
+);
+
+polars_testcase!(
     test_csv_unresolvable_override_dtypes_keep_schema,
     r#"
 import polars as pl

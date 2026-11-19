@@ -1560,9 +1560,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let CsvColumnSelection::Names(names) = selection else {
                     return None;
                 };
-                if matches!(overrides, CsvDtypeOverrides::Unchanged) {
-                    return None;
-                }
                 let mut columns: Vec<(Name, PolarsDType)> = names
                     .into_iter()
                     .map(|name| (name, PolarsDType::Unknown))
