@@ -1,5 +1,5 @@
 ---
-title: SCIP Indexing
+title: Indexing
 description: Generate a SCIP code-navigation index with Pyrefly.
 ---
 
@@ -10,7 +10,11 @@ description: Generate a SCIP code-navigation index with Pyrefly.
  * LICENSE file in the root directory of this source tree.
  */}
 
-# SCIP Indexing
+# Indexing
+
+:::warning Experimental
+This feature is experimental and under active development. The output and command-line options may change in future releases.
+:::
 
 Pyrefly can generate a [SCIP](https://github.com/scip-code/scip) index for code-navigation
 tools that consume this format. The index records definitions, references, hover documentation,
@@ -22,11 +26,14 @@ From the project root, run:
 pyrefly check --report-scip index.scip
 ```
 
-Pyrefly uses its normal configuration and import resolution. Install the project's dependencies
-in the Python environment you use for indexing so that references to external packages can be
-resolved. The index contains documents for the files being checked, with paths relative to the
+Pyrefly uses its normal configuration and import resolution. The index contains documents for the files being checked, with paths relative to the
 current directory. Use `--relative-to path/to/project` to select a different project root.
 In either case, only files under the project root become documents.
+
+Type errors are still reported normally and can make the command return a nonzero exit status
+even when it writes an index.
+
+Symbols in statically unreachable branches (based on platform/Python version or the `@no_type_check` decorator) are not analyzed.
 
 ## Package identity
 
@@ -39,20 +46,21 @@ pyrefly check --report-scip index.scip \
   --report-scip-project-version 1.0.0
 ```
 
-A missing name or version is represented as `.` in SCIP symbols. External package identities
-come from installed distribution metadata; bundled standard-library stubs use the Python version
+External package identities come from installed distribution metadata, and bundled standard-library stubs use the Python version
 configured for the project.
 
 ## Compatibility
 
-The output is a binary SCIP index, not JSON. It uses the `scip-python` symbol scheme for
-compatibility with existing consumers, but its output is not identical to Sourcegraph's
-[scip-python](https://github.com/sourcegraph/scip-python) indexer.
+:::tip
+If your tools need [LSIF](https://microsoft.github.io/language-server-protocol/specifications/lsif/0.6.0/specification/)
+instead, convert the index with the [`scip` CLI](https://github.com/scip-code/scip):
 
-Type errors are still reported normally and can make the command return a nonzero exit status
-even when it writes an index.
+```sh
+scip convert --from index.scip --to dump.lsif
+```
 
-SCIP reporting supports one-shot checks, not `--watch`: incremental checks do not rewrite
-unchanged documents. It also conflicts with `--debug-info`, `--report-binding-memory`,
-`--report-glean`, `--report-pysa`, `--report-trace`, `--report-demand-tree`, and `--report-cinderx`:
-those reports need state that streaming SCIP releases.
+:::
+
+Pyrefly's output is close to Sourcegraph's [scip-python](https://github.com/sourcegraph/scip-python)
+indexer and uses the same symbol naming format, but outputs are not identical.
+

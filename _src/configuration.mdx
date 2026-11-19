@@ -843,6 +843,10 @@ configuration error if its version does not satisfy the requirement. When this
 error stops `pyrefly check`, it exits with code 4. This can keep local CLI runs,
 editor integrations, and CI on compatible versions.
 
+Without `required-version`, if the project's Python environment has a different
+version of the `pyrefly` package installed than the Pyrefly that runs, Pyrefly
+prints a warning. Set `required-version` to allow other versions.
+
 ```toml
 # pyrefly.toml
 required-version = ">=1.2.0,<2.0.0"
@@ -921,7 +925,7 @@ The default Pyrefly configuration. Equivalent to having no preset at all.
 Enables additional error codes on top of the default for stricter checking.
 
 - Sets [`strict-callable-subtyping`](#strict-callable-subtyping) `= true`
-- Enables (as errors): [`direct-abstract-base-instantiation`](./error-kinds.mdx#direct-abstract-base-instantiation), [`implicit-any`](./error-kinds.mdx#implicit-any) (covers every implicit-`Any` sub-kind), [`instance-var-assign`](./error-kinds.mdx#instance-var-assign), [`method-assign`](./error-kinds.mdx#method-assign), [`missing-override-decorator`](./error-kinds.mdx#missing-override-decorator), [`open-unpacking`](./error-kinds.mdx#open-unpacking), [`possibly-uninitialized-attribute`](./error-kinds.mdx#possibly-uninitialized-attribute), [`potential-bad-keyword-argument`](./error-kinds.mdx#potential-bad-keyword-argument), [`unused-ignore`](./error-kinds.mdx#unused-ignore)
+- Enables (as errors): [`direct-abstract-base-instantiation`](./error-kinds.mdx#direct-abstract-base-instantiation), [`implicit-any`](./error-kinds.mdx#implicit-any) (covers every implicit-`Any` sub-kind), [`instance-var-assign`](./error-kinds.mdx#instance-var-assign), [`method-assign`](./error-kinds.mdx#method-assign), [`missing-override-decorator`](./error-kinds.mdx#missing-override-decorator), [`open-unpacking`](./error-kinds.mdx#open-unpacking), [`possibly-uninitialized-attribute`](./error-kinds.mdx#possibly-uninitialized-attribute), [`potential-bad-keyword-argument`](./error-kinds.mdx#potential-bad-keyword-argument), [`property-type-mismatch`](./error-kinds.mdx#property-type-mismatch), [`unused-ignore`](./error-kinds.mdx#unused-ignore)
 
 #### Preset: `all`
 
@@ -1192,9 +1196,9 @@ in per-file `pyrefly check`; for per-file `check`,
 Controls whether Pyrefly enforces strict parameter compatibility when checking
 callable subtyping for signatures with `*args: Any, **kwargs: Any`.
 
-When set to `false` (the default), callables with `*args: Any, **kwargs: Any`
-are treated as a gradual type — assignability checks in both directions succeed
-when they otherwise wouldn't, similar to how `...` (ellipsis) parameters behave.
+When set to `false` (the default), `*args: Any, **kwargs: Any` in a signature
+is treated as gradual, like `...` (ellipsis): it is compatible with any
+parameters, while the other parameters in the signature are still checked.
 This is a pragmatic default because many real-world stubs and decorators use
 `*args: Any, **kwargs: Any` as a wildcard signature.
 

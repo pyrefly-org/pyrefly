@@ -39,7 +39,7 @@
 - [Python Typing 101](/en/docs/python-typing-for-beginners/): A gentle, example‑driven introduction to static type hints in Python.
 - [LSP Queries](/en/docs/query/): Query Python types, references, and calls from the command line.
 - [Coverage](/en/docs/report/): Measure and enforce type coverage in your Python codebase with Pyrefly.
-- [SCIP Indexing](/en/docs/scip/): Generate a SCIP code-navigation index with Pyrefly.
+- [Indexing](/en/docs/scip/): Generate a SCIP code-navigation index with Pyrefly.
 - [Shell completion](/en/docs/shell-completion/): How to enable shell completion for Pyrefly
 - [Stub Generation](/en/docs/stubgen/): Generate .pyi stub files from Python source files with Pyrefly stubgen.
 - [Tensor Shapes](/en/docs/tensor-shapes/): An overview of Pyrefly's type system for statically checking array and tensor shapes.

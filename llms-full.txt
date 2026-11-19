@@ -2924,6 +2924,10 @@ configuration error if its version does not satisfy the requirement. When this
 error stops `pyrefly check`, it exits with code 4. This can keep local CLI runs,
 editor integrations, and CI on compatible versions.
 
+Without `required-version`, if the project's Python environment has a different
+version of the `pyrefly` package installed than the Pyrefly that runs, Pyrefly
+prints a warning. Set `required-version` to allow other versions.
+
 ```toml
 # pyrefly.toml
 required-version = ">=1.2.0,<2.0.0"
@@ -3002,7 +3006,7 @@ The default Pyrefly configuration. Equivalent to having no preset at all.
 Enables additional error codes on top of the default for stricter checking.
 
 - Sets [`strict-callable-subtyping`](#strict-callable-subtyping) `= true`
-- Enables (as errors): [`direct-abstract-base-instantiation`](./error-kinds.mdx#direct-abstract-base-instantiation), [`implicit-any`](./error-kinds.mdx#implicit-any) (covers every implicit-`Any` sub-kind), [`instance-var-assign`](./error-kinds.mdx#instance-var-assign), [`method-assign`](./error-kinds.mdx#method-assign), [`missing-override-decorator`](./error-kinds.mdx#missing-override-decorator), [`open-unpacking`](./error-kinds.mdx#open-unpacking), [`possibly-uninitialized-attribute`](./error-kinds.mdx#possibly-uninitialized-attribute), [`potential-bad-keyword-argument`](./error-kinds.mdx#potential-bad-keyword-argument), [`unused-ignore`](./error-kinds.mdx#unused-ignore)
+- Enables (as errors): [`direct-abstract-base-instantiation`](./error-kinds.mdx#direct-abstract-base-instantiation), [`implicit-any`](./error-kinds.mdx#implicit-any) (covers every implicit-`Any` sub-kind), [`instance-var-assign`](./error-kinds.mdx#instance-var-assign), [`method-assign`](./error-kinds.mdx#method-assign), [`missing-override-decorator`](./error-kinds.mdx#missing-override-decorator), [`open-unpacking`](./error-kinds.mdx#open-unpacking), [`possibly-uninitialized-attribute`](./error-kinds.mdx#possibly-uninitialized-attribute), [`potential-bad-keyword-argument`](./error-kinds.mdx#potential-bad-keyword-argument), [`property-type-mismatch`](./error-kinds.mdx#property-type-mismatch), [`unused-ignore`](./error-kinds.mdx#unused-ignore)
 
 #### Preset: `all`
 
@@ -3273,9 +3277,9 @@ in per-file `pyrefly check`; for per-file `check`,
 Controls whether Pyrefly enforces strict parameter compatibility when checking
 callable subtyping for signatures with `*args: Any, **kwargs: Any`.
 
-When set to `false` (the default), callables with `*args: Any, **kwargs: Any`
-are treated as a gradual type — assignability checks in both directions succeed
-when they otherwise wouldn't, similar to how `...` (ellipsis) parameters behave.
+When set to `false` (the default), `*args: Any, **kwargs: Any` in a signature
+is treated as gradual, like `...` (ellipsis): it is compatible with any
+parameters, while the other parameters in the signature are still checked.
 This is a pragmatic default because many real-world stubs and decorators use
 `*args: Any, **kwargs: Any` as a wildcard signature.
 
@@ -7086,6 +7090,25 @@ opts: Options = {}
 f(name="test", **opts)  # E: Multiple values for argument `name`
 ```
 
+## property-type-mismatch
+
+Default severity: `ignore`
+
+The `strict` preset enables this check as an error.
+
+Pyrefly reports a property setter whose value type cannot overlap the getter's return type.
+Such a property is type safe, but reading it back never returns a value of the type that was assigned, which is usually a mistake.
+A setter that accepts a wider or narrower type than the getter returns is not reported.
+
+```python
+class Config:
+    @property
+    def port(self) -> int: ...
+
+    @port.setter
+    def port(self, value: str) -> None: ...  # property-type-mismatch
+```
+
 ## protected-access
 
 Default severity: `ignore`
@@ -7327,11 +7350,35 @@ class MyProto(Protocol):
     x: int | None = None
 ```
 
+## unannotated-public-return
+
+Default severity: `ignore`
+
+A public function is missing a return annotation. Here, public means a name without a leading underscore (or a dunder name), with only public classes as enclosing scopes. Functions nested inside functions are excluded. This is a name-based check: it does not follow `__all__`, re-exports, or module visibility. As with [unannotated-return](#unannotated-return), `__init__` methods and `@no_type_check` functions are exempt.
+
+To require return annotations only on public functions:
+
+```toml
+[errors]
+unannotated-return = "ignore"
+unannotated-public-return = "error"
+```
+
+```python
+def calculate_sum(x: int, y: int):  # error: missing a return annotation
+    return x + y
+
+def _helper():  # private: return type is inferred
+    return 1
+```
+
+This is a sub-kind of `unannotated-return`: it inherits that code's configured severity unless overridden explicitly. Suppressing `unannotated-return` also suppresses this code.
+
 ## unannotated-return
 
 Default severity: `ignore`
 
-This error is raised when a function is missing a return type annotation. This helps enforce fully-typed codebases by ensuring all functions declare their return types explicitly. To fix it, add a return type annotation to the function.
+This error is raised when a function is missing a return type annotation. This helps enforce fully-typed codebases by ensuring all functions declare their return types explicitly. Public functions are reported under the [unannotated-public-return](#unannotated-public-return) sub-kind. To fix it, add a return type annotation to the function.
 
 ```python
 def calculate_sum(x: int, y: int):  # error: `calculate_sum` is missing a return annotation
@@ -7917,11 +7964,6 @@ This warning suggests covariance or contravariance for an invariant protocol
 only returns `T`, the warning suggests declaring `T` as covariant. Incorrect usage
 of an explicitly covariant or contravariant `TypeVar` is reported as
 [`invalid-variance`](#invalid-variance) instead.
-
-Constrained `TypeVar`s, such as `TypeVar("T", str, bytes)`, are exempt from this
-warning. Constraints commonly describe a fixed set of unrelated alternatives, so
-invariance is often sufficient and narrower-variance suggestions are noisy.
-Bounded `TypeVar`s, such as `TypeVar("T", bound=float)`, are still checked.
 
 ```python
 from typing import Protocol, TypeVar
@@ -12425,7 +12467,7 @@ pyrefly coverage report path/to/directory/ | jq .summary.strict_coverage
 ---
 
 ---
-title: SCIP Indexing
+title: Indexing
 description: Generate a SCIP code-navigation index with Pyrefly.
 ---
 
@@ -12436,7 +12478,11 @@ description: Generate a SCIP code-navigation index with Pyrefly.
  * LICENSE file in the root directory of this source tree.
  */}
 
-# SCIP Indexing
+# Indexing
+
+:::warning Experimental
+This feature is experimental and under active development. The output and command-line options may change in future releases.
+:::
 
 Pyrefly can generate a [SCIP](https://github.com/scip-code/scip) index for code-navigation
 tools that consume this format. The index records definitions, references, hover documentation,
@@ -12448,11 +12494,14 @@ From the project root, run:
 pyrefly check --report-scip index.scip
 ```
 
-Pyrefly uses its normal configuration and import resolution. Install the project's dependencies
-in the Python environment you use for indexing so that references to external packages can be
-resolved. The index contains documents for the files being checked, with paths relative to the
+Pyrefly uses its normal configuration and import resolution. The index contains documents for the files being checked, with paths relative to the
 current directory. Use `--relative-to path/to/project` to select a different project root.
 In either case, only files under the project root become documents.
+
+Type errors are still reported normally and can make the command return a nonzero exit status
+even when it writes an index.
+
+Symbols in statically unreachable branches (based on platform/Python version or the `@no_type_check` decorator) are not analyzed.
 
 ## Package identity
 
@@ -12465,23 +12514,24 @@ pyrefly check --report-scip index.scip \
   --report-scip-project-version 1.0.0
 ```
 
-A missing name or version is represented as `.` in SCIP symbols. External package identities
-come from installed distribution metadata; bundled standard-library stubs use the Python version
+External package identities come from installed distribution metadata, and bundled standard-library stubs use the Python version
 configured for the project.
 
 ## Compatibility
 
-The output is a binary SCIP index, not JSON. It uses the `scip-python` symbol scheme for
-compatibility with existing consumers, but its output is not identical to Sourcegraph's
-[scip-python](https://github.com/sourcegraph/scip-python) indexer.
+:::tip
+If your tools need [LSIF](https://microsoft.github.io/language-server-protocol/specifications/lsif/0.6.0/specification/)
+instead, convert the index with the [`scip` CLI](https://github.com/scip-code/scip):
 
-Type errors are still reported normally and can make the command return a nonzero exit status
-even when it writes an index.
+```sh
+scip convert --from index.scip --to dump.lsif
+```
 
-SCIP reporting supports one-shot checks, not `--watch`: incremental checks do not rewrite
-unchanged documents. It also conflicts with `--debug-info`, `--report-binding-memory`,
-`--report-glean`, `--report-pysa`, `--report-trace`, `--report-demand-tree`, and `--report-cinderx`:
-those reports need state that streaming SCIP releases.
+:::
+
+Pyrefly's output is close to Sourcegraph's [scip-python](https://github.com/sourcegraph/scip-python)
+indexer and uses the same symbol naming format, but outputs are not identical.
+
 
 
 ---
