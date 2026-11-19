@@ -24,6 +24,37 @@ assert_type(Data, type[Data])
 );
 
 testcase!(
+    test_dataclass_default_solves_type_var,
+    r#"
+from dataclasses import dataclass, field
+from typing import assert_type
+
+class Explicit[T]:
+    def __init__(self, x: T = 5) -> None:
+        self.x = x
+
+@dataclass
+class Generated[T]:
+    x: T = 5  # E: `Literal[5]` is not assignable to `T`
+
+@dataclass
+class FromField[T]:
+    x: T = field(default=5)  # E: `int` is not assignable to `T`
+
+@dataclass
+class FromFactory[T]:
+    x: T = field(default_factory=lambda: 5)  # E: `int` is not assignable to `T`
+
+assert_type(Explicit(), Explicit[int])
+assert_type(Generated(), Generated[int])
+assert_type(Generated(5), Generated[int])
+assert_type(Generated("a"), Generated[str])
+assert_type(FromField(), FromField[int])
+assert_type(FromFactory(), FromFactory[int])
+    "#,
+);
+
+testcase!(
     test_enum_dataclass_rejected,
     r#"
 from dataclasses import dataclass

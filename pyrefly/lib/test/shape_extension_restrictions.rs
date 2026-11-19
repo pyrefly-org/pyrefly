@@ -1330,3 +1330,23 @@ def check(a: FixedArr) -> None:
     assert_type(a.shape, IntTuple[2, 3])
 "#,
 );
+
+testcase!(
+    test_dataclass_intvar_default_does_not_pin_call,
+    shape_extension_env(),
+    r#"
+from dataclasses import dataclass
+from shape_extensions import Int, IntVar
+from typing import assert_type
+
+@dataclass
+class Config[N: IntVar]:
+    x: Int[N] = 256  # E: `Literal[256]` is not assignable to `Int[N]`
+
+def build[N: IntVar](config: Config[N] | None = None) -> Config[N]:
+    if config is None:
+        config = Config()
+    assert_type(config, Config[N])
+    return config
+"#,
+);

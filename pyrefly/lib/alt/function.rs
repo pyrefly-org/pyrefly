@@ -101,6 +101,7 @@ use crate::types::function::Function;
 use crate::types::function::FunctionKind;
 use crate::types::function::PropertyMetadata;
 use crate::types::function::PropertyRole;
+use crate::types::keywords::DataclassFieldDefault;
 use crate::types::keywords::DataclassTransformMetadata;
 use crate::types::types::CalleeKind;
 use crate::types::types::Forall;
@@ -306,6 +307,14 @@ impl DecoratorParamHints {
             Some(ty)
         }
     }
+}
+
+fn contains_int_var(ty: &Type) -> bool {
+    let mut quantifieds = SmallSet::new();
+    ty.collect_quantifieds(&mut quantifieds);
+    quantifieds
+        .iter()
+        .any(|quantified| quantified.kind() == QuantifiedKind::IntVar)
 }
 
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
@@ -1489,43 +1498,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Some(default) => {
                 let display =
                     default_display_for_expr(default, self.module().code_at(default.range()));
-                let ty = match check {
-                    Some((expected_ty, tcc)) => {
-                        let mut qs = SmallSet::new();
-                        expected_ty.collect_quantifieds(&mut qs);
-                        if qs.is_empty() {
-                            self.expr_check(default, check, errors)
-                        } else {
-                            let owner = Owner::new();
-                            let upper_mp = qs
-                                .iter()
-                                .map(|q| (*q, owner.push(q.upper_bound(self, self.heap))))
-                                .collect();
-                            let upper_ty = expected_ty.clone().subst(&upper_mp);
-                            // Check if the default is compatible with the parameter type.
-                            let default_errors = self.error_collector();
-                            self.expr_check(default, Some((&upper_ty, tcc)), &default_errors);
-                            if !default_errors.has_hard() {
-                                // The default is compatible; re-infer using the original expected
-                                // type so that Quantifieds (which will be freshened on each call)
-                                // end up in the default.
-                                self.expr_infer_with_hint(
-                                    default,
-                                    Some(HintRef::soft(expected_ty)),
-                                    errors,
-                                )
-                            } else {
-                                errors.extend(default_errors);
-                                // The default is not compatible; use the parameter type to avoid
-                                // cascading errors on calls.
-                                expected_ty.clone()
-                            }
-                        }
-                    }
-                    None => self.expr_check(default, None, errors),
-                };
-                // Mark literals as explicit so we don't promote them.
-                let ty = ty.with_literal_style(LitStyle::Explicit);
+                let ty = self.infer_checked_default(default, check, errors);
                 Required::Optional(Some(match display {
                     Some(d) => DefaultValue::with_display(ty, d),
                     None => DefaultValue::new(ty),
@@ -1535,7 +1508,114 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    /// Determine the type and required-ness of a parameter.
+    /// Infer a default expression against an optional expected type.
+    ///
+    /// When the expected type contains a type variable, the default is checked
+    /// against that variable's upper bound. A compatible default is inferred again
+    /// with the original type as a hint, so the variable can appear in the result.
+    /// An incompatible default is reported and replaced with the expected type, so
+    /// later calls do not repeat the error. Literals stay explicit.
+    pub(crate) fn infer_checked_default(
+        &self,
+        default: &Expr,
+        check: Option<(&Type, &dyn Fn() -> TypeCheckContext)>,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let ty = match check {
+            Some((expected_ty, tcc)) => {
+                let mut qs = SmallSet::new();
+                expected_ty.collect_quantifieds(&mut qs);
+                if qs.is_empty() {
+                    self.expr_check(default, check, errors)
+                } else {
+                    let owner = Owner::new();
+                    let upper_mp = qs
+                        .iter()
+                        .map(|q| (*q, owner.push(q.upper_bound(self, self.heap))))
+                        .collect();
+                    let upper_ty = expected_ty.clone().subst(&upper_mp);
+                    let default_errors = self.error_collector();
+                    self.expr_check(default, Some((&upper_ty, tcc)), &default_errors);
+                    if !default_errors.has_hard() {
+                        self.expr_infer_with_hint(default, Some(HintRef::soft(expected_ty)), errors)
+                    } else {
+                        errors.extend(default_errors);
+                        expected_ty.clone()
+                    }
+                }
+            }
+            None => self.expr_check(default, None, errors),
+        };
+        ty.with_literal_style(LitStyle::Explicit)
+    }
+
+    /// Record a field default expression for the synthesized constructor.
+    ///
+    /// Uses [`Self::infer_checked_default`] when the annotation contains a type
+    /// variable. Other defaults keep the inferred type so callers such as
+    /// Pydantic range checks can still see it.
+    pub(crate) fn field_default_for_expr(
+        &self,
+        value: &Expr,
+        annotated: Option<&Type>,
+        errors: &ErrorCollector,
+    ) -> DataclassFieldDefault {
+        let has_type_var = annotated.is_some_and(|ty| {
+            let mut qs = SmallSet::new();
+            ty.collect_quantifieds(&mut qs);
+            !qs.is_empty()
+        });
+        // A literal default of a shape dimension is not a solution of that
+        // dimension, so the synthesized constructor does not solve from it.
+        if annotated.is_some_and(contains_int_var) {
+            return DataclassFieldDefault::Unknown;
+        }
+        let ty = if has_type_var {
+            let tcc = || {
+                TypeCheckContext::of_kind(TypeCheckKind::FunctionParameterDefault(
+                    Name::new_static("default"),
+                ))
+            };
+            self.infer_checked_default(value, annotated.map(|ty| (ty, &tcc as _)), errors)
+        } else {
+            self.expr_infer(value, errors)
+        };
+        // `infer_checked_default` already applied the upper-bound fallback.
+        // A second assignability check would reject a default that still
+        // contains the annotation's type variable, such as `list[T] = []`.
+        DataclassFieldDefault::from_type(ty)
+    }
+
+    /// Record an already-inferred default type, including a `default_factory` return.
+    ///
+    /// A type that is not assignable to the annotation's upper bounds is stored
+    /// as unknown, so constructing the class does not repeat that error.
+    pub(crate) fn field_default_for_type(
+        &self,
+        ty: Type,
+        annotated: Option<&Type>,
+    ) -> DataclassFieldDefault {
+        if ty.is_any() || annotated.is_some_and(contains_int_var) {
+            return DataclassFieldDefault::Unknown;
+        }
+        if let Some(expected) = annotated {
+            let mut qs = SmallSet::new();
+            expected.collect_quantifieds(&mut qs);
+            if !qs.is_empty() {
+                let owner = Owner::new();
+                let upper_mp = qs
+                    .iter()
+                    .map(|q| (*q, owner.push(q.upper_bound(self, self.heap))))
+                    .collect();
+                let upper_ty = expected.clone().subst(&upper_mp);
+                if !self.is_subset_eq(&ty, &upper_ty) {
+                    return DataclassFieldDefault::Unknown;
+                }
+            }
+        }
+        DataclassFieldDefault::Known(ty.with_literal_style(LitStyle::Explicit))
+    }
+
     fn get_param_type_and_requiredness(
         &self,
         name: &Identifier,
