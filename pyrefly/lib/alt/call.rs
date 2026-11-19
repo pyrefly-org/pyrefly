@@ -3108,14 +3108,32 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             };
         call_errors.extend(chosen_call_errors);
         arg_errors.extend(chosen_arg_errors);
+        let is_constructor = ctor_targs.is_some();
         if let Some(targs) = ctor_targs
             && let Some(chosen_targs) = chosen_ctor_targs
         {
             *targs = chosen_targs;
         }
         let (ty, specialization_errors, return_type_errors, argmap, _, overload_table) = chosen_res;
-        if let Ok(errors) = Vec1::try_from_vec(specialization_errors) {
-            self.add_specialization_errors(errors, arguments_range, call_errors, context);
+        for error in specialization_errors {
+            let parameter = if is_constructor
+                && let TypeVarSpecializationError::BadBoundSpecialization {
+                    argument: Some(argument),
+                    ..
+                } = &error
+                && let Some(parameter) = argmap.arg_to_param.get(argument)
+                && parameter.arg_ty.is_some()
+            {
+                parameter.name.as_ref()
+            } else {
+                None
+            };
+            let kind = error.error_kind();
+            let mut message = error.to_error_msg(self);
+            if let Some(name) = parameter {
+                message.push_str(&format!(" for parameter `{name}`"));
+            }
+            self.error_with_context(call_errors, arguments_range, kind, message, context);
         }
         self.add_return_type_resolution_errors(
             return_type_errors,
