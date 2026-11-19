@@ -209,9 +209,9 @@ Enable Pyrefly's Run/Test CodeLens actions for Python files.
 
 **Type:** boolean &nbsp; **Default:** `false`
 
-Show reference counts above Python classes, functions, and methods. Select a count to show its references.
-This setting requires indexing and a supported client. Notebook cells are excluded from these counts.
-It is separate from `runnableCodeLens` and does not affect Run/Test actions.
+Show best-effort reference counts above Python definitions. Select a count to show references.
+Counts can be incomplete. Indexing and a supported client are required. Notebook cells are excluded.
+Run/Test actions remain controlled by `runnableCodeLens`.
 
 #### `python.analysis.showHoverGoToLinks`
 

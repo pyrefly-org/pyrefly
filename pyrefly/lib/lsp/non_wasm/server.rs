@@ -1168,6 +1168,8 @@ pub struct Server {
     find_reference_queue: HeavyTaskQueue,
     /// A slow lens search must not block interactive reference searches or renames.
     code_lens_queue: HeavyTaskQueue,
+    /// Serializes lens reader creation with commits. Tokens stay in `cancellation_handles`.
+    reference_code_lens_request: Mutex<Option<RequestId>>,
     sourcedb_queue: HeavyTaskQueue,
     /// Any configs whose find cache should be invalidated.
     invalidated_source_dbs: Mutex<SmallSet<ArcId<Box<dyn SourceDatabase + 'static>>>>,
@@ -3145,6 +3147,7 @@ impl Server {
             recheck_queue: HeavyTaskQueue::new(QueueName::RecheckQueue),
             find_reference_queue: HeavyTaskQueue::new(QueueName::FindReferenceQueue),
             code_lens_queue: HeavyTaskQueue::new(QueueName::CodeLensQueue),
+            reference_code_lens_request: Mutex::new(None),
             sourcedb_queue: HeavyTaskQueue::new(QueueName::SourceDbQueue),
             invalidated_source_dbs: Mutex::new(SmallSet::new()),
             build_system_status: Mutex::new(None),
@@ -3675,7 +3678,10 @@ impl Server {
             self.validate_in_memory_for_transaction(transaction, telemetry, custom_thread_pool);
         match possibly_committable_transaction {
             Ok(transaction) => {
-                self.state.commit_transaction(transaction, Some(telemetry));
+                {
+                    let _lens_pause = self.pause_reference_code_lenses();
+                    self.state.commit_transaction(transaction, Some(telemetry));
+                }
                 *self.currently_streaming_diagnostics_for_handles.write() = None;
                 let state_lock_blocked_start = Instant::now();
                 // In the case where we can commit transactions, `State` already has latest updates.
@@ -3884,13 +3890,16 @@ impl Server {
         }
 
         // we have to run, not just commit to process updates
-        server.state.run_with_committing_transaction(
-            transaction,
-            &[],
-            Require::Everything,
-            Some(telemetry_event),
-            None,
-        );
+        {
+            let _lens_pause = server.pause_reference_code_lenses();
+            server.state.run_with_committing_transaction(
+                transaction,
+                &[],
+                Require::Everything,
+                Some(telemetry_event),
+                None,
+            );
+        }
 
         *server.currently_streaming_diagnostics_for_handles.write() = None;
     }
@@ -3970,7 +3979,10 @@ impl Server {
         let validate_start = Instant::now();
         transaction.as_mut().run(&handles, Require::Indexing, None);
         telemetry.set_validate_duration(validate_start.elapsed());
-        self.state.commit_transaction(transaction, Some(telemetry));
+        {
+            let _lens_pause = self.pause_reference_code_lenses();
+            self.state.commit_transaction(transaction, Some(telemetry));
+        }
 
         // After committing project population, send RecheckFinished to
         // the main event loop of the server. As a result, the server can do a revalidation of
@@ -4015,7 +4027,10 @@ impl Server {
             let validate_start = Instant::now();
             transaction.as_mut().run(&handles, Require::Indexing, None);
             telemetry.set_validate_duration(validate_start.elapsed());
-            self.state.commit_transaction(transaction, Some(telemetry));
+            {
+                let _lens_pause = self.pause_reference_code_lenses();
+                self.state.commit_transaction(transaction, Some(telemetry));
+            }
             // After we finished a recheck asynchronously, we immediately send `RecheckFinished` to
             // the main event loop of the server. As a result, the server can do a revalidation of
             // all the in-memory files based on the fresh main State as soon as possible.
@@ -4823,9 +4838,12 @@ impl Server {
                     telemetry_event,
                     None,
                 );
-                server
-                    .state
-                    .commit_transaction(transaction, Some(telemetry_event));
+                {
+                    let _lens_pause = server.pause_reference_code_lenses();
+                    server
+                        .state
+                        .commit_transaction(transaction, Some(telemetry_event));
+                }
                 if server.workspaces.diagnostic_mode(&path) == DiagnosticMode::Workspace
                     && path
                         .extension()
@@ -5193,7 +5211,7 @@ impl Server {
             },
             activity_key,
             ReferenceTaskKind::Interactive,
-            move |transaction, handle, definition, _telemetry, _telemetry_event| {
+            move |mut transaction, handle, definition, _telemetry, _telemetry_event| {
                 let FindDefinitionItemWithDocstring {
                     metadata: _,
                     definition_range,
@@ -5660,8 +5678,7 @@ impl Server {
     /// function that will send a response to the LSP client once the results are found and
     /// transformed by `transform_result`.
     ///
-    /// The `find_fn` closure is called with the cancellable transaction, handle, and definition
-    /// information, and should return a generic result type `T`.
+    /// The `find_fn` closure owns the transaction so it can release state locks before external waits.
     ///
     /// The `transform_result` closure transforms the result of type `T` into the final response
     /// type `V` that will be sent to the LSP client.
@@ -5676,7 +5693,7 @@ impl Server {
         activity_key: Option<ActivityKey>,
         task_kind: ReferenceTaskKind,
         find_fn: impl FnOnce(
-            &mut CancellableTransaction,
+            CancellableTransaction,
             &Handle,
             FindDefinitionItemWithDocstring,
             &dyn Telemetry,
@@ -5723,15 +5740,23 @@ impl Server {
             Box::new(move |server, telemetry, telemetry_event| {
                 server.set_file_stats(uri_for_telemetry, telemetry_event);
                 telemetry_event.set_activity_key(activity_key);
+                let mut lens_request = source_version
+                    .as_ref()
+                    .map(|_| server.reference_code_lens_request.lock());
                 let mut transaction = server.state.cancellable_transaction();
+                let cancellation = transaction.get_cancellation_handle();
                 let result = (|| {
                     {
                         let mut handles = server.cancellation_handles.lock();
                         if queued_cancellation.is_cancelled() {
                             return Err(RequestError::Cancelled);
                         }
-                        handles.insert(request_id.clone(), transaction.get_cancellation_handle());
+                        handles.insert(request_id.clone(), cancellation.dupe());
                     }
+                    if let Some(active) = lens_request.as_mut() {
+                        **active = Some(request_id.clone());
+                    }
+                    drop(lens_request);
                     if source_version
                         .as_ref()
                         .is_some_and(|(uri, version)| server.text_document_version(uri) != *version)
@@ -5743,14 +5768,9 @@ impl Server {
                         telemetry_event,
                         None,
                     );
-                    let result = find_fn(
-                        &mut transaction,
-                        &handle,
-                        definition,
-                        telemetry,
-                        telemetry_event,
-                    )?;
-                    if transaction.get_cancellation_handle().is_cancelled()
+                    let result =
+                        find_fn(transaction, &handle, definition, telemetry, telemetry_event)?;
+                    if cancellation.is_cancelled()
                         || source_version.as_ref().is_some_and(|(uri, version)| {
                             server.text_document_version(uri) != *version
                         })
@@ -5759,6 +5779,9 @@ impl Server {
                     }
                     Ok(result)
                 })();
+                if source_version.is_some() {
+                    *server.reference_code_lens_request.lock() = None;
+                }
                 server.cancellation_handles.lock().remove(&request_id);
                 match result {
                     Ok(results) => {
@@ -5825,7 +5848,7 @@ impl Server {
             find_preference,
             activity_key,
             kind,
-            move |transaction, handle, definition, telemetry, telemetry_event| {
+            move |mut transaction, handle, definition, telemetry, telemetry_event| {
                 let qualified_name =
                     compute_qualified_name(transaction.as_ref(), handle, &definition);
 
@@ -5859,7 +5882,8 @@ impl Server {
                         TextRangeWithModule::new(module, definition_range),
                         options,
                     );
-
+                    // External providers can block. No state reader may survive this wait.
+                    drop(transaction);
                     let external_results = ext_handle.and_then(|h| h.join().ok());
                     (local_results, external_results)
                 });
@@ -7059,7 +7083,7 @@ impl Server {
             FindPreference::default(),
             activity_key,
             ReferenceTaskKind::Interactive,
-            move |transaction, handle, definition, telemetry, telemetry_event| {
+            move |mut transaction, handle, definition, telemetry, telemetry_event| {
                 let qualified_name =
                     compute_qualified_name(transaction.as_ref(), handle, &definition);
 
@@ -7088,7 +7112,7 @@ impl Server {
                             definition.metadata.clone(),
                             &target_def,
                         );
-
+                    drop(transaction);
                     let external_calls = ext_handle.and_then(|h| h.join().ok());
                     (local_results, external_calls)
                 });
@@ -7152,7 +7176,7 @@ impl Server {
             FindPreference::default(),
             activity_key,
             ReferenceTaskKind::Interactive,
-            move |transaction, handle, definition, _telemetry, _telemetry_event| {
+            move |mut transaction, handle, definition, _telemetry, _telemetry_event| {
                 // find_global_outgoing_calls_from_function_definition expects a position
                 let position = definition.definition_range.start();
 
@@ -7411,11 +7435,13 @@ impl Server {
             FindPreference::default(),
             activity_key,
             ReferenceTaskKind::Interactive,
-            move |transaction, handle, definition, _telemetry, _telemetry_event| {
+            move |mut transaction, handle, definition, _telemetry, _telemetry_event| {
                 transaction.run(&[handle.dupe()], Require::Everything, None)?;
-                let Some(target) =
-                    Self::type_hierarchy_target_from_definition(transaction, handle, &definition)
-                else {
+                let Some(target) = Self::type_hierarchy_target_from_definition(
+                    &mut transaction,
+                    handle,
+                    &definition,
+                ) else {
                     return Ok(Vec::new());
                 };
                 let Some(solutions) = transaction.as_ref().get_solutions(handle) else {
@@ -7468,22 +7494,24 @@ impl Server {
             FindPreference::default(),
             activity_key,
             ReferenceTaskKind::Interactive,
-            move |transaction, handle, definition, _telemetry, _telemetry_event| {
+            move |mut transaction, handle, definition, _telemetry, _telemetry_event| {
                 transaction.run(&[handle.dupe()], Require::Everything, None)?;
-                let Some(target) =
-                    Self::type_hierarchy_target_from_definition(transaction, handle, &definition)
-                else {
+                let Some(target) = Self::type_hierarchy_target_from_definition(
+                    &mut transaction,
+                    handle,
+                    &definition,
+                ) else {
                     return Ok(Vec::new());
                 };
                 let handles = Self::type_hierarchy_candidate_handles(
-                    transaction,
+                    &mut transaction,
                     handle,
                     &definition,
                     &target,
                 )?;
                 transaction.run(&handles, Require::Everything, None)?;
                 Ok(Self::type_hierarchy_subtype_items(
-                    transaction,
+                    &transaction,
                     &target,
                     handles,
                     path_remapper.as_ref(),
@@ -7543,6 +7571,7 @@ impl Server {
                         // `commit_transaction_downgrade` holds the state lock
                         // across the commit, so what it hands back is the state
                         // validated and solved just above.
+                        let _lens_pause = self.pause_reference_code_lenses();
                         (
                             self.state.commit_transaction_downgrade(
                                 committable,

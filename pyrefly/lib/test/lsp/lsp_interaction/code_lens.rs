@@ -717,6 +717,10 @@ fn test_code_lens_shows_reference_counts() {
             .clone();
         let lens = resolve_code_lens(&interaction, lens);
         assert!(has_reference_lens(&lens, line, title, count));
+        assert_eq!(
+            lens.command.unwrap().tooltip.as_deref(),
+            Some("Reference counts use the current index and can be incomplete."),
+        );
     }
 
     interaction.shutdown().unwrap();
@@ -736,6 +740,58 @@ fn test_reference_code_lens_request_from_notebook_is_empty() {
     assert!(lenses.is_empty());
 
     interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_reference_code_lens_preserves_notebook_runnable_lenses() {
+    let root = get_test_files_root();
+    for (indexing_mode, enabled) in [
+        (IndexingMode::None, false),
+        (IndexingMode::LazyBlocking, true),
+    ] {
+        let mut interaction = LspInteraction::new_with_args(LspInteractionArgs {
+            args: LspArgs {
+                indexing_mode,
+                ..LspInteractionArgs::default().args
+            },
+            ..Default::default()
+        });
+        interaction.set_root(root.path().to_path_buf());
+        interaction
+            .initialize(InitializeSettings {
+                initialization_options: Some(json!({"pyrefly": {
+                    "runnableCodeLens": true,
+                    "referencesCodeLens": enabled,
+                    "supportsReferencesCodeLens": enabled
+                }})),
+                ..Default::default()
+            })
+            .unwrap();
+        for notebook in ["runnables.py", "runnables.ipynb"] {
+            interaction.open_notebook(
+                notebook,
+                vec![
+                    "def test_first():\n    pass",
+                    "def test_second():\n    pass",
+                ],
+            );
+            for (cell, name) in [("cell1", "test_first"), ("cell2", "test_second")] {
+                let lenses =
+                    request_code_lenses(&interaction, interaction.cell_uri(notebook, cell));
+                if notebook.ends_with(".ipynb") {
+                    assert!(lenses.is_empty());
+                } else {
+                    assert_eq!(lenses.len(), 1);
+                    let command = lenses[0].command.as_ref().unwrap();
+                    assert_eq!(command.title, "Test");
+                    assert_eq!(command.command, "pyrefly.runTest");
+                    assert_eq!(command.arguments.as_ref().unwrap()[0]["testName"], name);
+                    assert!(lenses[0].data.is_none());
+                }
+            }
+        }
+        interaction.shutdown().unwrap();
+    }
 }
 
 #[test]
@@ -1149,6 +1205,86 @@ fn test_reference_code_lens_does_not_block_interactive_references() {
     })
     .unwrap();
     assert!(calls.is_empty());
+    interaction.shutdown().unwrap();
+}
+
+#[test]
+fn test_reference_code_lens_does_not_block_edits() {
+    let root = get_test_files_root();
+    let root_path = root.path().join("code_lens_references");
+    let (calls_tx, calls) = crossbeam_channel::unbounded();
+    let (release, release_rx) = crossbeam_channel::bounded(1);
+    let telemetry = TestTelemetry::new();
+    let events = telemetry.subscribe();
+    let mut interaction = LspInteraction::new_with_external_references(
+        LspInteractionArgs {
+            args: LspArgs {
+                indexing_mode: IndexingMode::LazyBlocking,
+                ..LspInteractionArgs::default().args
+            },
+            telemetry: Box::new(telemetry),
+            ..Default::default()
+        },
+        Arc::new(BlockingReferences {
+            calls: calls_tx,
+            release: release_rx,
+            first: AtomicBool::new(true),
+            uri: Uri::from_file_path(root_path.join("external.py")).unwrap(),
+        }),
+    );
+    interaction.set_root(root_path.clone());
+    interaction
+        .initialize(InitializeSettings {
+            initialization_options: Some(json!({"pyrefly": {
+                "supportsReferencesCodeLens": true,
+                "referencesCodeLens": true
+            }})),
+            ..Default::default()
+        })
+        .unwrap();
+    interaction.client.did_open("symbols.py");
+    interaction.client.did_open("usage.py");
+    let lenses = request_code_lenses(
+        &interaction,
+        Uri::from_file_path(root_path.join("symbols.py")).unwrap(),
+    );
+    let search = interaction
+        .client
+        .send_request::<CodeLensResolveRequest>(json!(lenses[0]));
+    assert_eq!(
+        calls.recv_timeout(Duration::from_secs(10)).unwrap(),
+        "symbols.Greeter",
+    );
+    interaction
+        .client
+        .did_change("usage.py", "# All uses were removed.\n");
+    let barrier = interaction.client.send_request::<CodeLensRequest>(json!({
+        "textDocument": {"uri": Uri::from_file_path(root_path.join("usage.py")).unwrap()}
+    }));
+    let id = barrier.id().to_string();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let dispatched = loop {
+        let Ok(event) = events.recv_deadline(deadline) else {
+            break false;
+        };
+        if event.event.request_id.as_ref() == Some(&id)
+            && matches!(&event.event.kind, TelemetryEventKind::LspEvent(name) if name.starts_with("LspRequest("))
+        {
+            break true;
+        }
+    };
+    // Release the provider even when dispatch stalled, so a failing test can shut down.
+    release.send(()).unwrap();
+    assert!(
+        dispatched,
+        "The edit must commit before the external search finishes"
+    );
+    barrier
+        .expect_response_with(|lenses| lenses.is_some_and(|lenses| lenses.is_empty()))
+        .unwrap();
+    search
+        .expect_response_error_code(ErrorCode::RequestCanceled as i32)
+        .unwrap();
     interaction.shutdown().unwrap();
 }
 

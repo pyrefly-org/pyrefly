@@ -110,7 +110,7 @@ pub(super) fn resolve_code_lens(
                 .expect("Position should serialize for code lens"),
             serde_json::to_value(&locations).expect("Locations should serialize for code lens"),
         ]),
-        tooltip: None,
+        tooltip: Some("Reference counts use the current index and can be incomplete.".to_owned()),
     });
     lens.data = None;
     lens

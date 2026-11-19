@@ -11,6 +11,7 @@ mod reference_count;
 mod runnable;
 
 use std::collections::HashSet;
+use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
 
 use lsp_server::ErrorCode;
@@ -95,6 +96,17 @@ impl CodeLensError {
 }
 
 impl Server {
+    /// Cancel the active lens and prevent new lens readers until the guard is dropped.
+    pub(super) fn pause_reference_code_lenses(&self) -> MutexGuard<'_, Option<RequestId>> {
+        let active = self.reference_code_lens_request.lock();
+        if let Some(id) = active.as_ref()
+            && let Some(cancellation) = self.cancellation_handles.lock().get(id)
+        {
+            cancellation.cancel();
+        }
+        active
+    }
+
     /// Request new counts after validation or a configuration change.
     pub(super) fn refresh_reference_code_lenses(&self) {
         let enabled = self.workspaces.references_code_lens_enabled();
@@ -123,12 +135,11 @@ impl Server {
         params: CodeLensParams,
     ) -> Result<Option<Vec<CodeLens>>, EmptyResponseReason> {
         let uri = &params.text_document.uri;
-        if self.open_notebook_cells.read().contains_key(uri) {
-            return Ok(Some(Vec::new()));
-        }
         let handle = self.make_handle_if_enabled(uri, Some(CodeLensRequest::METHOD.as_str()))?;
         let mut lenses = runnable::code_lenses(self, transaction, &handle, uri)?;
-        if self.references_code_lens_enabled(uri) {
+        if !self.open_notebook_cells.read().contains_key(uri)
+            && self.references_code_lens_enabled(uri)
+        {
             let version = self.text_document_version(uri);
             lenses.extend(reference_count::unresolved_code_lenses(
                 transaction,

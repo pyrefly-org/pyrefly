@@ -5675,6 +5675,7 @@ fn reduce_symbol_matches(results: &mut Vec<SymbolMatch>, memory_paths: &HashSet<
 }
 
 trait RdepTransaction {
+    fn is_cancelled(&self) -> bool;
     fn has_memory(&self, path: &Path) -> bool;
     fn solutions_index(&self, handle: &Handle) -> Option<Arc<Mutex<Index>>>;
     fn bindings_metadata(&self, handle: &Handle) -> Option<Arc<BindingsMetadata>>;
@@ -5697,6 +5698,10 @@ trait RdepTransaction {
 }
 
 impl<'a> RdepTransaction for Transaction<'a> {
+    fn is_cancelled(&self) -> bool {
+        self.get_cancellation_handle().is_cancelled()
+    }
+
     fn has_memory(&self, path: &Path) -> bool {
         Transaction::has_memory(self, path)
     }
@@ -5744,6 +5749,10 @@ impl<'a> RdepTransaction for Transaction<'a> {
 }
 
 impl<'a> RdepTransaction for CancellableTransaction<'a> {
+    fn is_cancelled(&self) -> bool {
+        self.get_cancellation_handle().is_cancelled()
+    }
+
     fn has_memory(&self, path: &Path) -> bool {
         self.as_ref().has_memory(path)
     }
@@ -5832,6 +5841,9 @@ fn compute_transitive_rdeps_for_definition_impl<T: RdepTransaction>(
     sys_info: SysInfo,
     definition: &TextRangeWithModule,
 ) -> Result<Vec<Handle>, Cancelled> {
+    if transaction.is_cancelled() {
+        return Err(Cancelled);
+    }
     let mut transitive_rdeps = match definition.module.path().details() {
         ModulePathDetails::Memory(path_buf) => {
             let handle_of_filesystem_counterpart = Handle::new(
@@ -5935,12 +5947,12 @@ fn process_rdeps_with_definition_impl<T: RdepTransaction, R>(
     let candidate_handles =
         compute_transitive_rdeps_for_definition_impl(transaction, sys_info, definition)?;
 
-    Ok(process_candidate_handles_with_definition_impl(
+    process_candidate_handles_with_definition_impl(
         transaction,
         candidate_handles,
         definition,
         process_fn,
-    ))
+    )
 }
 
 fn process_candidate_handles_with_definition_impl<T: RdepTransaction, R>(
@@ -5948,16 +5960,19 @@ fn process_candidate_handles_with_definition_impl<T: RdepTransaction, R>(
     candidate_handles: Vec<Handle>,
     definition: &TextRangeWithModule,
     mut process_fn: impl FnMut(&mut T, &Handle, &TextRangeWithModule) -> Option<R>,
-) -> Vec<R> {
+) -> Result<Vec<R>, Cancelled> {
     let mut results = Vec::new();
     for handle in candidate_handles {
+        if transaction.is_cancelled() {
+            return Err(Cancelled);
+        }
         let patched_definition = patch_definition_for_handle_impl(transaction, &handle, definition);
         if let Some(result) = process_fn(transaction, &handle, &patched_definition) {
             results.push(result);
         }
     }
 
-    results
+    Ok(results)
 }
 
 fn find_global_references_from_definition_impl<T: RdepTransaction>(
@@ -6034,7 +6049,7 @@ fn find_global_references_from_definition_impl<T: RdepTransaction>(
                     Some(module_refs)
                 }
             },
-        ));
+        )?);
     }
 
     let mut global_references: Vec<(Module, Vec<TextRange>)> = Vec::new();

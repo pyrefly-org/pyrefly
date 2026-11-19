@@ -28,6 +28,44 @@ use crate::test::util::TestEnv;
 use crate::test::util::code_frame_of_source_at_range;
 use crate::test::util::get_batched_lsp_operations_report;
 
+/// Cached reference searches must honor cancellation without another validation run.
+#[test]
+fn canceled_reference_search_stops_scanning_candidates() {
+    for cancel_before_search in [true, false] {
+        let mut env = TestEnv::new().with_default_require_level(Require::Everything);
+        env.add("main", "def target(): pass\ntarget()\n");
+        env.add("usage", "from main import target\ntarget()\n");
+        let (state, handle) = env.to_state();
+        let handle = handle("main");
+        let mut transaction = state.cancellable_transaction();
+        let definition = transaction
+            .as_ref()
+            .find_definition(&handle, TextSize::new(4), FindPreference::default())
+            .unwrap()
+            .first()
+            .clone();
+        let cancellation = transaction.get_cancellation_handle();
+        if cancel_before_search {
+            cancellation.cancel();
+        }
+        let mut visited = 0;
+        assert!(
+            transaction
+                .process_rdeps_with_definition(
+                    *handle.sys_info(),
+                    &TextRangeWithModule::new(definition.module, definition.definition_range),
+                    |_, _, _| {
+                        visited += 1;
+                        cancellation.cancel();
+                        Some(())
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(visited, usize::from(!cancel_before_search));
+    }
+}
+
 /// Reference searches and rename must not use disk contents after an editor removes an import.
 #[test]
 fn references_ignore_removed_imports_in_unsaved_files() {
