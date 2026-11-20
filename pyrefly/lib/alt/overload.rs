@@ -543,6 +543,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 self.add_specialization_errors(
                     specialization_errors,
+                    Some(&closest_overload.argmap),
                     arguments_range,
                     call_errors,
                     None,
@@ -566,6 +567,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 self.add_specialization_errors(
                     specialization_errors,
+                    Some(&closest_overload.argmap),
                     arguments_range,
                     &closest_overload.call_errors,
                     None,
