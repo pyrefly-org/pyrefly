@@ -71,9 +71,9 @@ kind does not make every diagnostic identical to mypy's.
 | `typeddict-item`                  | `bad-typed-dict` or `bad-typed-dict-key`                                    | Manual           | Related       |                                                                                                                                                            |
 | `typeddict-unknown-key`           | `bad-typed-dict-key`                                                        | Automatic        | Direct        |                                                                                                                                                            |
 | `has-type`                        | No direct equivalent                                                        | Not mapped       | None          | Pyrefly reports a more specific inference or definition error instead.                                                                                     |
-| `import`                          | `missing-import`                                                            | Automatic        | Broad         | Mypy's umbrella import code also covers missing stubs; Pyrefly separates `missing-import` and `untyped-import`.                                            |
+| `import`                          | `missing-import`                                                            | Automatic        | Broad         | Mypy's umbrella import code also covers missing stubs; Pyrefly separates missing modules from both untyped-import kinds.                                            |
 | `import-not-found`                | `missing-import`                                                            | Automatic        | Direct        |                                                                                                                                                            |
-| `import-untyped`                  | `untyped-import`                                                            | Automatic        | Direct-ish    |                                                                                                                                                            |
+| `import-untyped`                  | `untyped-import`, `untyped-import-no-stubs`                                  | Automatic        | Split         |                                                                                                                                                            |
 | `no-redef`                        | `redefinition`                                                              | Manual           | Direct-ish    | The converter does not translate `no-redef`.                                                                                                               |
 | `func-returns-value`              | Usually `bad-assignment` or `bad-return`                                    | Manual           | No stable 1:1 |                                                                                                                                                            |
 | `abstract`                        | `bad-instantiation`                                                         | Automatic        | Direct-ish    |                                                                                                                                                            |
@@ -144,6 +144,7 @@ A reviewed Pyrefly equivalent is:
 missing-override-decorator = "error"
 unbound-name = "error"
 untyped-import = "ignore"
+untyped-import-no-stubs = "ignore"
 ```
 
 `explicit-override` is not in the converter's code map even though Pyrefly has a

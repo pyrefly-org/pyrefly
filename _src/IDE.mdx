@@ -205,6 +205,14 @@ If true, Pyrefly will sync notebook documents with the language server. Set to `
 
 Enable Pyrefly's Run/Test CodeLens actions for Python files.
 
+#### `python.pyrefly.referencesCodeLens`
+
+**Type:** boolean &nbsp; **Default:** `false`
+
+Show best-effort reference counts above Python definitions. Select a count to show references.
+Counts can be incomplete. Indexing and a supported client are required. Notebook cells are excluded.
+Run/Test actions remain controlled by `runnableCodeLens`.
+
 #### `python.analysis.showHoverGoToLinks`
 
 **Type:** boolean &nbsp; **Default:** `true`
@@ -299,6 +307,7 @@ Below is an example showing every supported key at its default value:
     "streamDiagnostics": true,
     "syncNotebooks": true,
     "runnableCodeLens": false,
+    "referencesCodeLens": false,
     "disabledLanguageServices": {
       "hover": false,
       "documentSymbol": false,

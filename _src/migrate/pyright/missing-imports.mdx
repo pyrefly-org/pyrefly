@@ -58,7 +58,7 @@ resolves to.
 | `pythonPlatform`            | `python-platform`                             |
 | `reportMissingImports`      | `missing-import`                              |
 | `reportMissingModuleSource` | `missing-source` + `missing-source-for-stubs` |
-| `reportMissingTypeStubs`    | `untyped-import`                              |
+| `reportMissingTypeStubs`     | `untyped-import` + `untyped-import-no-stubs`     |
 
 ## Optional dependencies
 
@@ -77,8 +77,9 @@ globally, which also hides genuinely broken imports.
 Pyright distinguishes three situations: the module is missing entirely, stubs
 are found but the runtime source is missing, and source is found but type stubs
 are missing. Pyrefly keeps the same distinction across `missing-import`,
-`missing-source`, `missing-source-for-stubs`, and `untyped-import`. Preserve
-those separate severities rather than collapsing them into a single ignore.
+`missing-source`, `missing-source-for-stubs`, `untyped-import`, and
+`untyped-import-no-stubs`. Preserve those separate severities rather than
+collapsing them into a single ignore.
 
 ## Related guides
 

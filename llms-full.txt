@@ -777,6 +777,14 @@ If true, Pyrefly will sync notebook documents with the language server. Set to `
 
 Enable Pyrefly's Run/Test CodeLens actions for Python files.
 
+#### `python.pyrefly.referencesCodeLens`
+
+**Type:** boolean &nbsp; **Default:** `false`
+
+Show best-effort reference counts above Python definitions. Select a count to show references.
+Counts can be incomplete. Indexing and a supported client are required. Notebook cells are excluded.
+Run/Test actions remain controlled by `runnableCodeLens`.
+
 #### `python.analysis.showHoverGoToLinks`
 
 **Type:** boolean &nbsp; **Default:** `true`
@@ -871,6 +879,7 @@ Below is an example showing every supported key at its default value:
     "streamDiagnostics": true,
     "syncNotebooks": true,
     "runnableCodeLens": false,
+    "referencesCodeLens": false,
     "disabledLanguageServices": {
       "hover": false,
       "documentSymbol": false,
@@ -2980,7 +2989,7 @@ Silences every error kind. Other settings (scalar flags, behavior settings) are 
 
 A minimal-checking preset used when automatic configuration selection finds no migratable mypy/pyright configuration (or migration fails). It can also be selected explicitly with `preset = "basic"`, `--preset basic`, or the IDE's `"basic"` type-checking mode. It enables parse errors plus a small set of high-confidence, locally-fixable checks. Stricter checks like override validation, annotation completeness, and broader call-shape or assignment validation are disabled.
 
-- Sets [`check-unannotated-defs`](#check-unannotated-defs) `= false`, [`infer-return-types`](#infer-return-types) `= "never"`, [`infer-with-first-use`](#infer-with-first-use) `= false`, and [`enabled-ignores`](#enabled-ignores) to every tool (equivalent to [`permissive-ignores`](#permissive-ignores) `= true`)
+- Sets [`check-unannotated-defs`](#check-unannotated-defs) `= false`, [`infer-return-types`](#infer-return-types) `= "never"`, [`infer-with-first-use`](#infer-with-first-use) `= false`, [`class-decorator-behavior`](#class-decorator-behavior) `= "ignore"`, and [`enabled-ignores`](#enabled-ignores) to every tool (equivalent to [`permissive-ignores`](#permissive-ignores) `= true`)
 - Enables (as errors): [`bad-class-definition`](./error-kinds.mdx#bad-class-definition), [`bad-instantiation`](./error-kinds.mdx#bad-instantiation), [`bad-keyword-argument`](./error-kinds.mdx#bad-keyword-argument), [`bad-raise`](./error-kinds.mdx#bad-raise), [`bad-unpacking`](./error-kinds.mdx#bad-unpacking), [`division-by-zero`](./error-kinds.mdx#division-by-zero), [`invalid-annotation`](./error-kinds.mdx#invalid-annotation), [`invalid-literal`](./error-kinds.mdx#invalid-literal), [`invalid-super-call`](./error-kinds.mdx#invalid-super-call), [`invalid-syntax`](./error-kinds.mdx#invalid-syntax), [`missing-import`](./error-kinds.mdx#missing-import), [`not-async`](./error-kinds.mdx#not-async), [`parse-error`](./error-kinds.mdx#parse-error), [`unexpected-keyword`](./error-kinds.mdx#unexpected-keyword), [`unexpected-positional-argument`](./error-kinds.mdx#unexpected-positional-argument), [`unknown-name`](./error-kinds.mdx#unknown-name), [`unused-coroutine`](./error-kinds.mdx#unused-coroutine)
 - Enables (as warnings): [`fallback-search-path-relative-import`](./error-kinds.mdx#fallback-search-path-relative-import)
 - Keeps as hints: [`inactive-code`](./error-kinds.mdx#inactive-code), [`unused-import`](./error-kinds.mdx#unused-import), [`unused-parameter`](./error-kinds.mdx#unused-parameter), [`unused-variable`](./error-kinds.mdx#unused-variable)
@@ -2991,7 +3000,7 @@ A minimal-checking preset used when automatic configuration selection finds no m
 
 A looser, less-strict preset intended for codebases migrating from mypy. This is the preset `pyrefly init` writes when it detects an existing mypy configuration. Pyrefly does not aim to mimic mypy precisely, but the preset preserves selected defaults that would otherwise produce new migration errors.
 
-- Sets [`check-unannotated-defs`](#check-unannotated-defs) `= false`, [`infer-return-types`](#infer-return-types) `= "never"`, [`legacy-overload-expansion`](#legacy-overload-expansion) `= true`, [`replace-untyped-imports-with-any`](#replace-untyped-imports-with-any) `= ["*"]`
+- Sets [`check-unannotated-defs`](#check-unannotated-defs) `= false`, [`infer-return-types`](#infer-return-types) `= "never"`, [`legacy-overload-expansion`](#legacy-overload-expansion) `= true`, [`replace-untyped-imports-with-any`](#replace-untyped-imports-with-any) `= ["*"]`, [`class-decorator-behavior`](#class-decorator-behavior) `= "ignore"`
 - Sets [`type-ignore-unknown-tag-behavior`](#type-ignore-unknown-tag-behavior) `= "suppress"` so existing mypy-coded ignores retain their legacy blanket-suppression behavior.
 - Disables: [`bad-override-mutable-attribute`](./error-kinds.mdx#bad-override-mutable-attribute), [`bad-override-param-name`](./error-kinds.mdx#bad-override-param-name), [`unbound-name`](./error-kinds.mdx#unbound-name). When both the parent and child members are plain read-write attributes, widening or incompatible types report plain `bad-override`, which this preset leaves enabled. Some overrides involving properties, including incompatible property getters, still report `bad-override-mutable-attribute` and are suppressed by this preset.
 
@@ -3271,6 +3280,29 @@ in per-file `pyrefly check`; for per-file `check`,
 - Type: `bool`
 - Default: `true`
 - Flag equivalent: `--use-shape-comments-and-stubs=false` to opt out
+
+### `class-decorator-behavior`
+
+Controls whether class decorators change the type bound to a class name.
+
+- `"ignore"`: Keep the class type. A decorator with an explicit `type[Any]`
+  return annotation still erases the class interface. This is the default for
+  the `basic` and `legacy` presets.
+- `"typed-only"`: Apply decorators whose results are fully typed, and keep the
+  class type when a result is partly unknown or an explicit `Any`. As with
+  `"ignore"`, an explicit `type[Any]` return annotation erases the class
+  interface. This is the default for every other preset.
+
+For example, with `"typed-only"`, a class decorated with
+`def to_int(cls: type) -> int` has type `int`.
+
+```toml
+class-decorator-behavior = "ignore"
+```
+
+- Type: one of `"ignore"`, `"typed-only"`
+- Default: `"ignore"` for `basic` and `legacy`, `"typed-only"` otherwise
+- Flag equivalent: `--class-decorator-behavior`
 
 ### `strict-callable-subtyping`
 
@@ -3875,6 +3907,7 @@ We currently allow the following config options to be overridden in a SubConfig:
 - `replace-untyped-imports-with-any`
 - `check-unannotated-defs`
 - `infer-return-types`
+- `class-decorator-behavior`
 - `ignore-errors-in-generated-code`
 - `permissive-ignores`
 - `enabled-ignores`
@@ -4506,13 +4539,15 @@ the plain `DataFrame` annotation that other tools accept.
 
 The previous section declares a schema for data you already hold in memory.
 This section covers the same idea for data read from a file. Pyrefly never
-inspects file contents, so a CSV reader gets a schema only when you declare one
-inline at the call site.
+inspects file contents, so a CSV reader infers a schema only when enough
+information is provided inline at the call site.
 
 Pyrefly infers complete schemas for `pl.read_csv` and `pl.scan_csv` when
 `schema=` is an inline dictionary or inline `pl.Schema`. `read_csv` produces a
 typed DataFrame, and `scan_csv` produces a typed LazyFrame whose schema survives
-`collect()`.
+`collect()`. If `schema` is not provided but `columns=` is a static name list,
+`read_csv` infers those columns with dtypes from `schema_overrides=` if
+provided, or `Unknown` otherwise.
 
 ```python
 reveal_type(
@@ -4522,6 +4557,14 @@ reveal_type(
         columns=["name"],
     )
 )  # DataFrame[name: String]
+
+reveal_type(
+    pl.read_csv(
+        "data.csv",
+        columns=["id", "name", "notes"],
+        schema_overrides={"id": pl.Int64, "name": pl.String},
+    )
+)  # DataFrame[id: Int64, name: String, notes: Unknown]
 
 lazy = pl.scan_csv(
     "data.csv",
@@ -6164,6 +6207,19 @@ project(f, 1)  # Overload type was not compatible with solved type variables: S 
 Deprecated: this error code has been renamed to [incompatible-overload-argument](#incompatible-overload-argument).
 The old name is still accepted in suppression comments and configuration for backwards compatibility.
 
+## inconsistent-constructor
+
+`__new__` and `__init__` have no common argument list. This check detects incompatible
+argument counts and required keyword-only names; parameter types are not compared.
+
+```python
+from typing import Self
+
+class C:
+    def __new__(cls, value: int) -> Self: ...
+    def __init__(self) -> None: ...  # error: no common argument list
+```
+
 ## inconsistent-inheritance
 
 When a class inherits from multiple base classes, the inherited fields must be consistent.
@@ -6208,6 +6264,18 @@ def f(x: Literal[True] = ...) -> None: ...  # error, `x` has default `False`, wh
 def f(x: Literal[False]) -> int: ...
 def f(x: bool = False) -> int | None:
     return 0 if x else None
+```
+
+## ineffective-final
+
+Default severity: `warn`
+
+`final` was called directly on a class. Only `@final` used as a decorator marks a class as
+final, so subclasses of the result are not reported.
+
+```python
+from typing import final
+MyClass = final(type("MyClass", (), {}))  # error, calling `final` on a class has no effect
 ```
 
 ## instance-var-assign
@@ -7071,6 +7139,25 @@ A path that raises, or ends in a call to a `Never` or `NoReturn` function, does 
 A bare class-body annotation is checked against the methods that assign it.
 If no initialization method assigns it, [`uninitialized-instance-variable`](#uninitialized-instance-variable) reports it instead.
 
+## possibly-unsolved-type-var
+
+Default severity: `warn`
+
+In a stub, or any function whose body is `...` (such as an overload), a `...` default does not
+give the parameter a value. If only such parameters mention a type variable in the return type, a
+call that omits them leaves the type variable unsolved, and the call returns `Unknown`. Type
+variables with defaults are not reported.
+
+```python
+def first[T](items: list[T] = ...) -> T: ...  # possibly-unsolved-type-var
+
+first()  # Unknown
+```
+
+To fix it, add an overload for calls that omit the argument, or give the type variable a default.
+
+This is a sub-kind of [invalid-type-var](#invalid-type-var): suppressing `invalid-type-var` also suppresses this error.
+
 ## potential-bad-keyword-argument
 
 Default severity: `ignore`
@@ -7264,7 +7351,7 @@ s = typing.cast(str, obj)  # No warning - this is a valid cast
 
 Default severity: `warn`
 
-This error is used to indicate a type that's equivalent to True or False is used as a boolean condition (e.g. an uncalled function)
+This warning flags predictably true or false conditions (e.g. an uncalled function) and nonempty tuple assertions.
 
 ```python
 def f() -> bool:
@@ -7276,6 +7363,20 @@ if f:
 # This is likely a mistake, as it's equivalent to `if True`.
 if "abc":
   ...
+```
+
+## redundant-type-check
+
+Default severity: `ignore`
+
+This warning flags `isinstance` and `issubclass` conditions whose result is determined by the inferred types. Only named callees and values, with named classes or flat tuples of class names, are checked. Gradual types, protocols and custom metaclasses represented in typing metadata, and numeric promotion are excluded; direct assertions are exempt.
+
+Intentional runtime validation can be redundant under annotations. Enable this warning with `pyrefly check --warn=redundant-type-check example.py`; its severity is independent of `redundant-condition`.
+
+```python
+def check(value: int) -> None:
+    if isinstance(value, int):  # redundant-type-check
+        print(value)
 ```
 
 ## regex
@@ -7613,8 +7714,7 @@ a, b = untyped(1)  # the types of `a` and `b` are unknown
 
 Default severity: `warn`
 
-This warning is raised when an identity comparison (`is` or `is not`) is made between
-literals whose comparison result is statically known.
+This warning flags identity or builtin membership comparisons whose result is statically known.
 
 ```python
 def test0() -> None:
@@ -7646,6 +7746,21 @@ This warning is raised when a builtin type constructor (`str`, `int`, `float`, `
 def f(x: str) -> None:
     y = str(x)  # unnecessary-type-conversion: `x` is already of type `str`
 ```
+
+## unnecessary-type-var
+
+Default severity: `ignore`
+
+A function-scoped type variable that appears only once in the function's signature relates no
+types, so its bound (or `object`) can be used instead. Nested uses such as `list[T]` are not
+reported, because `list[T]` accepts lists that `list[object]` does not.
+
+```python
+def log[T](value: T) -> None:  # unnecessary-type-var: use `object` instead
+    print(value)
+```
+
+This is a sub-kind of [invalid-type-var](#invalid-type-var): suppressing `invalid-type-var` also suppresses this error.
 
 ## unreachable
 
@@ -7729,6 +7844,22 @@ __all__ = generate_all()
 # `__all__` could not be statically analyzed [unresolvable-dunder-all]
 ```
 
+## unsafe-multiple-inheritance
+
+Default severity: `ignore`
+
+A class inherits from multiple base classes that define `__init__`. Only one of them is called directly when the class is instantiated, and whether the others are called depends on cooperative `super()` calls and the method resolution order, so there is no way to guarantee that they are called with the correct arguments, or at all. This matches basedpyright's `reportUnsafeMultipleInheritance`.
+
+```python
+class A:
+    def __init__(self) -> None: ...
+
+class B:
+    def __init__(self) -> None: ...
+
+class C(A, B): ...  # unsafe-multiple-inheritance: `B.__init__` may not get called
+```
+
 ## unsafe-overlap
 
 Protocols decorated with `@runtime_checkable` may be used in `isinstance` and `issubclass` checks, but the runtime will only check that all the required attributes are present, without looking at their types.
@@ -7790,14 +7921,14 @@ x = 1 + "oops"  # `+` is not supported between `int` and `str` [unsupported-oper
 
 Default severity: `ignore`
 
-A class decorator may modify the class in unexpected ways, either because the decorator's own type is `Any` or because it returns an unknown type. This mirrors pyright's `reportUntypedClassDecorator`, except that fully unannotated decorators are also reported. A decorator annotated to return an explicit `Any` is treated as intentional and is not reported.
+A class decorator may modify the class in unexpected ways, either because the decorator's own type is `Any` or because it returns an unknown type. Under [`class-decorator-behavior = "typed-only"`](../configuration#class-decorator-behavior), a partly unknown result, such as `list[Unknown]`, is also reported. Pyrefly keeps the class's type in all of these cases. This mirrors pyright's `reportUntypedClassDecorator`, except that fully unannotated decorators are also reported. A decorator annotated to return an explicit `Any` is treated as intentional and is not reported.
 
 ```python
 from typing import Any
 
 my_decorator: Any = lambda cls: cls
 
-@my_decorator  # `my_decorator` is `Any`, so the type of `A` is lost [untyped-class-decorator]
+@my_decorator  # `my_decorator` is `Any`, so it may change `A` [untyped-class-decorator]
 class A: ...
 
 def unannotated(cls):  # returns an implicit `Any`
@@ -7839,6 +7970,22 @@ library's source code. This error is emitted when we detect that a library is be
 the recommended stubs package being installed. It only applies to libraries found on the site package
 path that do not ship a `py.typed` file; modules found on the search path, such as local stubs in a
 `typings/` directory or your own code, are never reported.
+
+## untyped-import-no-stubs
+
+Default severity: `ignore`
+
+An installed third-party module has no applicable `.pyi` stub file or `py.typed` marker,
+and Pyrefly has no separately distributed stubs package to recommend for it, including modules omitted by
+partial stubs. Enable this rule with
+`untyped-import-no-stubs = "error"` in `[errors]` to identify libraries that need
+custom stubs. Modules on the search path or in editable installations are not reported;
+known stubs packages are covered by `untyped-import`.
+
+```python
+# With pymsteams installed without stubs or py.typed:
+from pymsteams import TeamsWebhookException  # untyped-import-no-stubs
+```
 
 ## untyped-namedtuple
 
@@ -9156,6 +9303,7 @@ support only:
 - `replace-imports-with-any`;
 - `check-unannotated-defs`;
 - `infer-return-types`;
+- `class-decorator-behavior`;
 - `ignore-errors-in-generated-code`.
 
 Example:
@@ -9283,9 +9431,9 @@ kind does not make every diagnostic identical to mypy's.
 | `typeddict-item`                  | `bad-typed-dict` or `bad-typed-dict-key`                                    | Manual           | Related       |                                                                                                                                                            |
 | `typeddict-unknown-key`           | `bad-typed-dict-key`                                                        | Automatic        | Direct        |                                                                                                                                                            |
 | `has-type`                        | No direct equivalent                                                        | Not mapped       | None          | Pyrefly reports a more specific inference or definition error instead.                                                                                     |
-| `import`                          | `missing-import`                                                            | Automatic        | Broad         | Mypy's umbrella import code also covers missing stubs; Pyrefly separates `missing-import` and `untyped-import`.                                            |
+| `import`                          | `missing-import`                                                            | Automatic        | Broad         | Mypy's umbrella import code also covers missing stubs; Pyrefly separates missing modules from both untyped-import kinds.                                            |
 | `import-not-found`                | `missing-import`                                                            | Automatic        | Direct        |                                                                                                                                                            |
-| `import-untyped`                  | `untyped-import`                                                            | Automatic        | Direct-ish    |                                                                                                                                                            |
+| `import-untyped`                  | `untyped-import`, `untyped-import-no-stubs`                                  | Automatic        | Split         |                                                                                                                                                            |
 | `no-redef`                        | `redefinition`                                                              | Manual           | Direct-ish    | The converter does not translate `no-redef`.                                                                                                               |
 | `func-returns-value`              | Usually `bad-assignment` or `bad-return`                                    | Manual           | No stable 1:1 |                                                                                                                                                            |
 | `abstract`                        | `bad-instantiation`                                                         | Automatic        | Direct-ish    |                                                                                                                                                            |
@@ -9356,6 +9504,7 @@ A reviewed Pyrefly equivalent is:
 missing-override-decorator = "error"
 unbound-name = "error"
 untyped-import = "ignore"
+untyped-import-no-stubs = "ignore"
 ```
 
 `explicit-override` is not in the converter's code map even though Pyrefly has a
@@ -10322,7 +10471,7 @@ several kinds.
 | `reportMissingImports`                | `missing-import`                                                                                                                                                                                   | Automatic        | Direct       |                                                                                                                     |
 | `reportMissingModuleSource`           | `missing-source`, `missing-source-for-stubs`                                                                                                                                                       | Automatic        | Split        |                                                                                                                     |
 | `reportInvalidTypeForm`               | `invalid-annotation`, `invalid-literal`, `invalid-type-alias`, `not-a-type`                                                                                                                        | Automatic        | Split        | Pyrefly uses more specific error kinds.                                                                             |
-| `reportMissingTypeStubs`              | `untyped-import`                                                                                                                                                                                   | Automatic        | Direct-ish   |                                                                                                                     |
+| `reportMissingTypeStubs`              | `untyped-import`, `untyped-import-no-stubs`                                                                                                                                                        | Automatic        | Split        |                                                                                                                     |
 | `reportImportCycles`                  | No direct equivalent                                                                                                                                                                               | Not mapped       | None         | Use architecture tooling or a dedicated import-cycle linter.                                                        |
 | `reportUnusedImport`                  | No type-checker equivalent                                                                                                                                                                         | Not mapped       | Lint         | Use Ruff `F401` or another linter.                                                                                  |
 | `reportUnusedClass`                   | No type-checker equivalent                                                                                                                                                                         | Not mapped       | Lint         | Use dead-code analysis where needed.                                                                                |
@@ -10374,13 +10523,13 @@ several kinds.
 | `reportUnknownMemberType`             | `unknown-attribute-access`, `unknown-attribute-type`, `unknown-from-error`                                                                                                                                                     | Automatic        | Direct-ish   |                                                                                                                     |
 | `reportMissingParameterType`          | `implicit-any-parameter`                                                                                                                                                                           | Automatic        | Direct-ish   |                                                                                                                     |
 | `reportMissingTypeArgument`           | `implicit-any-type-argument`                                                                                                                                                                       | Automatic        | Direct-ish   |                                                                                                                     |
-| `reportInvalidTypeVarUse`             | `invalid-type-var`                                                                                                                                                                                 | Automatic        | Broad        | Some variance-specific cases use `invalid-variance` or `variance-mismatch`.                                         |
+| `reportInvalidTypeVarUse`             | `invalid-type-var`                                                                                                                                                                                 | Automatic        | Broad        | Some variance-specific cases use `invalid-variance` or `variance-mismatch`. Single-use and possibly unsolved type variables use the `invalid-type-var` sub-kinds `unnecessary-type-var` and `possibly-unsolved-type-var`. |
 | `reportCallInDefaultInitializer`      | No type-checker equivalent                                                                                                                                                                         | Not mapped       | Lint         | Use Ruff `B006` or another linter.                                                                                  |
-| `reportUnnecessaryIsInstance`         | `redundant-condition`                                                                                                                                                                              | Automatic        | Related      |                                                                                                                     |
+| `reportUnnecessaryIsInstance`         | `redundant-type-check`                                                                                                                                                                              | Automatic        | Related      |                                                                                                                     |
 | `reportUnnecessaryCast`               | `redundant-cast`                                                                                                                                                                                   | Automatic        | Direct       |                                                                                                                     |
 | `reportUnnecessaryComparison`         | `incompatible-comparison`, `unnecessary-comparison`                                                                                                                                                | Automatic        | Split        |                                                                                                                     |
-| `reportUnnecessaryContains`           | No direct equivalent                                                                                                                                                                               | Not mapped       | None         |                                                                                                                     |
-| `reportAssertAlwaysTrue`              | `redundant-condition`                                                                                                                                                                              | Manual           | Related      | No dedicated tuple-assert rule.                                                                                     |
+| `reportUnnecessaryContains`           | `unnecessary-comparison`                                                                                                                                                                           | Manual           | Related      | Builtin lists, sets, dictionaries and tuples; incompatible elements or empty tuples.                                |
+| `reportAssertAlwaysTrue`              | `redundant-condition`                                                                                                                                                                              | Manual           | Related      | Fixed nonempty tuple assertions.                                                                                    |
 | `reportSelfClsParameterName`          | No type-checker equivalent                                                                                                                                                                         | Not mapped       | Lint         | Use Ruff `N804` / `N805`.                                                                                           |
 | `reportImplicitStringConcatenation`   | No type-checker equivalent                                                                                                                                                                         | Not mapped       | Lint         | Use Ruff `ISC001` or another linter.                                                                                |
 | `reportUndefinedVariable`             | `unknown-name`                                                                                                                                                                                     | Automatic        | Direct       |                                                                                                                     |
@@ -10730,7 +10879,7 @@ resolves to.
 | `pythonPlatform`            | `python-platform`                             |
 | `reportMissingImports`      | `missing-import`                              |
 | `reportMissingModuleSource` | `missing-source` + `missing-source-for-stubs` |
-| `reportMissingTypeStubs`    | `untyped-import`                              |
+| `reportMissingTypeStubs`     | `untyped-import` + `untyped-import-no-stubs`     |
 
 ## Optional dependencies
 
@@ -10749,8 +10898,9 @@ globally, which also hides genuinely broken imports.
 Pyright distinguishes three situations: the module is missing entirely, stubs
 are found but the runtime source is missing, and source is found but type stubs
 are missing. Pyrefly keeps the same distinction across `missing-import`,
-`missing-source`, `missing-source-for-stubs`, and `untyped-import`. Preserve
-those separate severities rather than collapsing them into a single ignore.
+`missing-source`, `missing-source-for-stubs`, `untyped-import`, and
+`untyped-import-no-stubs`. Preserve those separate severities rather than
+collapsing them into a single ignore.
 
 ## Related guides
 

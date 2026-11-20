@@ -969,6 +969,19 @@ project(f, 1)  # Overload type was not compatible with solved type variables: S 
 Deprecated: this error code has been renamed to [incompatible-overload-argument](#incompatible-overload-argument).
 The old name is still accepted in suppression comments and configuration for backwards compatibility.
 
+## inconsistent-constructor
+
+`__new__` and `__init__` have no common argument list. This check detects incompatible
+argument counts and required keyword-only names; parameter types are not compared.
+
+```python
+from typing import Self
+
+class C:
+    def __new__(cls, value: int) -> Self: ...
+    def __init__(self) -> None: ...  # error: no common argument list
+```
+
 ## inconsistent-inheritance
 
 When a class inherits from multiple base classes, the inherited fields must be consistent.
@@ -1013,6 +1026,18 @@ def f(x: Literal[True] = ...) -> None: ...  # error, `x` has default `False`, wh
 def f(x: Literal[False]) -> int: ...
 def f(x: bool = False) -> int | None:
     return 0 if x else None
+```
+
+## ineffective-final
+
+Default severity: `warn`
+
+`final` was called directly on a class. Only `@final` used as a decorator marks a class as
+final, so subclasses of the result are not reported.
+
+```python
+from typing import final
+MyClass = final(type("MyClass", (), {}))  # error, calling `final` on a class has no effect
 ```
 
 ## instance-var-assign
@@ -1876,6 +1901,25 @@ A path that raises, or ends in a call to a `Never` or `NoReturn` function, does 
 A bare class-body annotation is checked against the methods that assign it.
 If no initialization method assigns it, [`uninitialized-instance-variable`](#uninitialized-instance-variable) reports it instead.
 
+## possibly-unsolved-type-var
+
+Default severity: `warn`
+
+In a stub, or any function whose body is `...` (such as an overload), a `...` default does not
+give the parameter a value. If only such parameters mention a type variable in the return type, a
+call that omits them leaves the type variable unsolved, and the call returns `Unknown`. Type
+variables with defaults are not reported.
+
+```python
+def first[T](items: list[T] = ...) -> T: ...  # possibly-unsolved-type-var
+
+first()  # Unknown
+```
+
+To fix it, add an overload for calls that omit the argument, or give the type variable a default.
+
+This is a sub-kind of [invalid-type-var](#invalid-type-var): suppressing `invalid-type-var` also suppresses this error.
+
 ## potential-bad-keyword-argument
 
 Default severity: `ignore`
@@ -2069,7 +2113,7 @@ s = typing.cast(str, obj)  # No warning - this is a valid cast
 
 Default severity: `warn`
 
-This error is used to indicate a type that's equivalent to True or False is used as a boolean condition (e.g. an uncalled function)
+This warning flags predictably true or false conditions (e.g. an uncalled function) and nonempty tuple assertions.
 
 ```python
 def f() -> bool:
@@ -2081,6 +2125,20 @@ if f:
 # This is likely a mistake, as it's equivalent to `if True`.
 if "abc":
   ...
+```
+
+## redundant-type-check
+
+Default severity: `ignore`
+
+This warning flags `isinstance` and `issubclass` conditions whose result is determined by the inferred types. Only named callees and values, with named classes or flat tuples of class names, are checked. Gradual types, protocols and custom metaclasses represented in typing metadata, and numeric promotion are excluded; direct assertions are exempt.
+
+Intentional runtime validation can be redundant under annotations. Enable this warning with `pyrefly check --warn=redundant-type-check example.py`; its severity is independent of `redundant-condition`.
+
+```python
+def check(value: int) -> None:
+    if isinstance(value, int):  # redundant-type-check
+        print(value)
 ```
 
 ## regex
@@ -2418,8 +2476,7 @@ a, b = untyped(1)  # the types of `a` and `b` are unknown
 
 Default severity: `warn`
 
-This warning is raised when an identity comparison (`is` or `is not`) is made between
-literals whose comparison result is statically known.
+This warning flags identity or builtin membership comparisons whose result is statically known.
 
 ```python
 def test0() -> None:
@@ -2451,6 +2508,21 @@ This warning is raised when a builtin type constructor (`str`, `int`, `float`, `
 def f(x: str) -> None:
     y = str(x)  # unnecessary-type-conversion: `x` is already of type `str`
 ```
+
+## unnecessary-type-var
+
+Default severity: `ignore`
+
+A function-scoped type variable that appears only once in the function's signature relates no
+types, so its bound (or `object`) can be used instead. Nested uses such as `list[T]` are not
+reported, because `list[T]` accepts lists that `list[object]` does not.
+
+```python
+def log[T](value: T) -> None:  # unnecessary-type-var: use `object` instead
+    print(value)
+```
+
+This is a sub-kind of [invalid-type-var](#invalid-type-var): suppressing `invalid-type-var` also suppresses this error.
 
 ## unreachable
 
@@ -2534,6 +2606,22 @@ __all__ = generate_all()
 # `__all__` could not be statically analyzed [unresolvable-dunder-all]
 ```
 
+## unsafe-multiple-inheritance
+
+Default severity: `ignore`
+
+A class inherits from multiple base classes that define `__init__`. Only one of them is called directly when the class is instantiated, and whether the others are called depends on cooperative `super()` calls and the method resolution order, so there is no way to guarantee that they are called with the correct arguments, or at all. This matches basedpyright's `reportUnsafeMultipleInheritance`.
+
+```python
+class A:
+    def __init__(self) -> None: ...
+
+class B:
+    def __init__(self) -> None: ...
+
+class C(A, B): ...  # unsafe-multiple-inheritance: `B.__init__` may not get called
+```
+
 ## unsafe-overlap
 
 Protocols decorated with `@runtime_checkable` may be used in `isinstance` and `issubclass` checks, but the runtime will only check that all the required attributes are present, without looking at their types.
@@ -2595,14 +2683,14 @@ x = 1 + "oops"  # `+` is not supported between `int` and `str` [unsupported-oper
 
 Default severity: `ignore`
 
-A class decorator may modify the class in unexpected ways, either because the decorator's own type is `Any` or because it returns an unknown type. This mirrors pyright's `reportUntypedClassDecorator`, except that fully unannotated decorators are also reported. A decorator annotated to return an explicit `Any` is treated as intentional and is not reported.
+A class decorator may modify the class in unexpected ways, either because the decorator's own type is `Any` or because it returns an unknown type. Under [`class-decorator-behavior = "typed-only"`](../configuration#class-decorator-behavior), a partly unknown result, such as `list[Unknown]`, is also reported. Pyrefly keeps the class's type in all of these cases. This mirrors pyright's `reportUntypedClassDecorator`, except that fully unannotated decorators are also reported. A decorator annotated to return an explicit `Any` is treated as intentional and is not reported.
 
 ```python
 from typing import Any
 
 my_decorator: Any = lambda cls: cls
 
-@my_decorator  # `my_decorator` is `Any`, so the type of `A` is lost [untyped-class-decorator]
+@my_decorator  # `my_decorator` is `Any`, so it may change `A` [untyped-class-decorator]
 class A: ...
 
 def unannotated(cls):  # returns an implicit `Any`
@@ -2644,6 +2732,22 @@ library's source code. This error is emitted when we detect that a library is be
 the recommended stubs package being installed. It only applies to libraries found on the site package
 path that do not ship a `py.typed` file; modules found on the search path, such as local stubs in a
 `typings/` directory or your own code, are never reported.
+
+## untyped-import-no-stubs
+
+Default severity: `ignore`
+
+An installed third-party module has no applicable `.pyi` stub file or `py.typed` marker,
+and Pyrefly has no separately distributed stubs package to recommend for it, including modules omitted by
+partial stubs. Enable this rule with
+`untyped-import-no-stubs = "error"` in `[errors]` to identify libraries that need
+custom stubs. Modules on the search path or in editable installations are not reported;
+known stubs packages are covered by `untyped-import`.
+
+```python
+# With pymsteams installed without stubs or py.typed:
+from pymsteams import TeamsWebhookException  # untyped-import-no-stubs
+```
 
 ## untyped-namedtuple
 
