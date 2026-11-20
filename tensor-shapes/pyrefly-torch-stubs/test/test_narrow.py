@@ -81,7 +81,7 @@ if TYPE_CHECKING:
     def check_invalid_length_type[T, S: str](
         x: Tensor[[4, 32]], unconstrained: T, string: S
     ) -> None:
-        # E: `T` is not assignable to upper bound `Int[int]` of type variable `Length`
+        # E: Argument `T` is not assignable to parameter `length` with type variable `Length` (upper bound `Int[int]`)
         torch.narrow(x, 1, 0, unconstrained)
-        # E: `S` is not assignable to upper bound `Int[int]` of type variable `Length`
+        # E: Argument `S` is not assignable to parameter `length` with type variable `Length` (upper bound `Int[int]`)
         torch.narrow(x, 1, 0, string)
