@@ -51,5 +51,6 @@ if TYPE_CHECKING:
         assert_type(torch.tile(concrete, open_repeats), Tensor[IntTuple])
 
     def check_invalid_argument_types(x: Tensor[[2, 3]]) -> None:
-        torch.tile(x, [2, 3])  # E: is not assignable to parameter `dims` with type variable `Repeats` (upper bound `IntTuple`)
+        # E: is not assignable to parameter `dims` with type variable `Repeats` (upper bound `IntTuple`)
+        torch.tile(x, [2, 3])
         x.tile((2, 3.0))  # E: is not assignable to parameter `dims`
