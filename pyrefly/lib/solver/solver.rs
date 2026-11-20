@@ -5024,11 +5024,14 @@ mod tests {
                     ty: Type::None,
                     frozen: false,
                     restricted: Some(Box::new(RestrictedAnswer {
-                        error: Some(TypeVarSpecializationError::BadBoundSpecialization {
-                            name: param.name().clone(),
-                            got: Type::None,
-                            want: Type::Var(inner),
-                        }),
+                        error: Some(TypeVarSpecializationError::new(
+                            TypeVarSpecializationErrorKind::BadBoundSpecialization {
+                                name: param.name().clone(),
+                                got: Type::None,
+                                want: Type::Var(inner),
+                            },
+                            None,
+                        )),
                         param,
                     })),
                 },
