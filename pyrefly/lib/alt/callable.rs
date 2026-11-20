@@ -922,6 +922,7 @@ impl MatchedParam {
 #[derive(Debug, Clone)]
 pub struct ArgMap {
     pub arg_to_param: HashMap<ArgumentKey, MatchedParam>,
+    ambiguous_arguments: SmallSet<ArgumentKey>,
     /// Required parameters that were left unmatched
     pub unmatched_params: SmallSet<Option<Name>>,
     /// Positional slots skipped before the first exposed source argument.
@@ -933,6 +934,7 @@ impl ArgMap {
     pub fn new() -> Self {
         Self {
             arg_to_param: HashMap::new(),
+            ambiguous_arguments: SmallSet::new(),
             unmatched_params: SmallSet::new(),
             positional_offset: 0,
         }
@@ -956,6 +958,13 @@ impl ArgMap {
         self
     }
 
+    pub(crate) fn parameter_name(&self, argument: ArgumentKey) -> Option<&Name> {
+        if self.ambiguous_arguments.contains(&argument) {
+            return None;
+        }
+        self.arg_to_param.get(&argument)?.name.as_ref()
+    }
+
     fn insert(
         &mut self,
         argument: ArgumentKey,
@@ -963,6 +972,14 @@ impl ArgMap {
         name: Option<Name>,
         arg_ty: Option<Type>,
     ) -> Option<MatchedParam> {
+        // A splat can match multiple parameters under the same argument key.
+        if self
+            .arg_to_param
+            .get(&argument)
+            .is_some_and(|param| param.name != name)
+        {
+            self.ambiguous_arguments.insert(argument);
+        }
         self.arg_to_param
             .insert(argument, MatchedParam::new(ty, name, arg_ty))
     }
@@ -1509,7 +1526,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let specialization_errors =
                     self.finish_quantified(self_qs, self.solver().config.infer_with_first_use);
                 if let Err(errors) = specialization_errors {
-                    self.add_specialization_errors(errors, arg.range(), call_errors, context);
+                    self.add_specialization_errors(
+                        errors,
+                        Some(&argmap),
+                        arg.range(),
+                        call_errors,
+                        context,
+                    );
                 }
             }
         }

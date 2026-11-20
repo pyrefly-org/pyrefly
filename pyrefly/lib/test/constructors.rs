@@ -1381,8 +1381,13 @@ class Holder[T: int]:
     def __init__(self, value: T, fallback: T) -> None: ...
 
 Holder(1, 2)
-Holder(1, "bad fallback")  # E: `str` is not assignable to upper bound `int` of type variable `T` for parameter `fallback`
-Holder(1, fallback="bad fallback")  # E: `str` is not assignable to upper bound `int` of type variable `T` for parameter `fallback`
+Holder(1, "bad fallback")  # E: Argument `str` is not assignable to parameter `fallback` with type variable `T` (upper bound `int`)
+Holder(1, fallback="bad fallback")  # E: Argument `str` is not assignable to parameter `fallback` with type variable `T` (upper bound `int`)
+
+class FromNew[T: int]:
+    def __new__(cls, first: T, second: T) -> "FromNew[T]": ...
+
+FromNew(1, "bad second")  # E: Argument `str` is not assignable to parameter `second` with type variable `T` (upper bound `int`)
 "#,
 );
 
@@ -1473,7 +1478,7 @@ from typing import Self
 class A:
     def __new__(cls: type[Self]): ...
 A.__new__(A)  # OK
-A.__new__(int) # E: `int` is not assignable to upper bound `A` of type variable `Self@A`
+A.__new__(int) # E: Argument `int` is not assignable to parameter `cls` with type variable `Self@A` (upper bound `A`)
     "#,
 );
 
@@ -1483,7 +1488,7 @@ testcase!(
 class A:
     def __new__(cls): ...
 A.__new__(A)  # OK
-A.__new__(int)  # E: `int` is not assignable to upper bound `A` of type variable `Self@A`
+A.__new__(int)  # E: Argument `int` is not assignable to parameter `cls` with type variable `Self@A` (upper bound `A`)
     "#,
 );
 
@@ -1847,7 +1852,7 @@ class A(Generic[T]):
     def __new__(cls, x: T) -> A[T]: ...
 
 assert_type(A(0), A[int])
-A("oops")  # E: `str` is not assignable to upper bound `int` of type variable `T`
+A("oops")  # E: Argument `str` is not assignable to parameter `x` with type variable `T` (upper bound `int`)
     "#,
 );
 

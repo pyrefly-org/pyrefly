@@ -256,8 +256,8 @@ class Bar:
     x: int
 
 def f(obj: Union[Foo, Bar]):
-    replace(obj, x=0)  # E: `Bar` is not assignable to upper bound `DataclassInstance`
-    replace(obj, x="oops")  # E: `Bar` is not assignable to upper bound `DataclassInstance`  # E: Argument `Literal['oops']` is not assignable to parameter `x` with type `int`
+    replace(obj, x=0)  # E: Argument `Bar` is not assignable to parameter `obj` with type variable `_DataclassT` (upper bound `DataclassInstance`)
+    replace(obj, x="oops")  # E: Argument `Bar` is not assignable to parameter `obj` with type variable `_DataclassT` (upper bound `DataclassInstance`)  # E: Argument `Literal['oops']` is not assignable to parameter `x` with type `int`
     "#,
 );
 

@@ -299,7 +299,12 @@ impl TypeCheckKind {
                     overload_sig.display_with(env),
                 )
             }
-            Self::TypeVarSpecialization(name) => {
+            Self::TypeVarSpecialization(name, Some(parameter)) => format!(
+                "Argument `{}` is not assignable to parameter `{parameter}` with type variable `{name}` (upper bound `{}`)",
+                ctx.display(got),
+                ctx.display(want)
+            ),
+            Self::TypeVarSpecialization(name, None) => {
                 format!(
                     "`{}` is not assignable to upper bound `{}` of type variable `{name}`",
                     ctx.display(got),
