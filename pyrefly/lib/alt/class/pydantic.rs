@@ -154,13 +154,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         cls: &Class,
         root_model_type: Type,
         has_strict: bool,
+        model_strict: bool,
     ) -> ClassSynthesizedField {
         let is_any_or_quantified =
             root_model_type.is_any() || matches!(root_model_type, Type::Quantified(_));
-        let has_default = matches!(
-            self.get_dataclass_member(cls, &ROOT),
-            DataclassMember::Field(_, keywords) if keywords.default.is_some()
-        );
+        let (has_default, field_strict) = match self.get_dataclass_member(cls, &ROOT) {
+            DataclassMember::Field(_, keywords) => (keywords.default.is_some(), keywords.strict),
+            _ => (false, None),
+        };
+        let has_strict = has_strict || field_strict.unwrap_or(model_strict);
         let root_requiredness = if is_any_or_quantified || has_default {
             Required::Optional(None)
         } else {
@@ -252,7 +254,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let tparam = tparams.iter().next()?;
         let root_model_type = self.heap.mk_quantified(tparam.clone());
         Some(
-            self.get_pydantic_root_model_init(cls, root_model_type, false)
+            self.get_pydantic_root_model_init(cls, root_model_type, false, false)
                 .inner
                 .ty(),
         )

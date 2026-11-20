@@ -681,3 +681,37 @@ reveal_type(Model1.__init__)  # E: revealed type: (self: Model1, *, t: type[LaxI
 
     "#,
 );
+
+pydantic_testcase!(
+    test_root_model_field_strict_overrides_config,
+    r#"
+from pydantic import ConfigDict, Field, RootModel, StrictStr
+
+class Model(RootModel[str]):
+    model_config = ConfigDict(strict=True)
+    root: str = Field(strict=False)
+
+class Model1(RootModel[str]):
+    root: str = Field(strict=True)
+
+class Model2(RootModel[str]):
+    root: str = Field(strict=False)
+
+class Model3(Model2):
+    model_config = ConfigDict(strict=True)
+
+class Model4(Model2):
+    model_config = ConfigDict(strict=True)
+    root: str
+
+class Model5(RootModel[StrictStr]):
+    root: StrictStr = Field(strict=False)
+
+Model(b"hello")
+Model1(b"hello") # E: Argument `Literal[b'hello']` is not assignable to parameter `root` with type `str`
+Model2(b"hello")
+Model3(b"hello")
+Model4(b"hello") # E: Argument `Literal[b'hello']` is not assignable to parameter `root` with type `str`
+Model5(b"hello") # E: Argument `Literal[b'hello']` is not assignable to parameter `root` with type `str`
+"#,
+);

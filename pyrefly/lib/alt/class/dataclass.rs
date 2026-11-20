@@ -158,7 +158,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 self.get_pydantic_root_model_init(
                     cls,
                     root_model_type,
-                    has_strict || dataclass.kws.strict,
+                    has_strict,
+                    dataclass.kws.strict,
                 )
             } else if metadata.is_pydantic_model() {
                 // Pydantic models with RootModel fields need type expansion
