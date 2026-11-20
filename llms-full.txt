@@ -5313,6 +5313,22 @@ class Base(ABC):
         raise NotImplementedError  # OK: canonical abstract placeholder
 ```
 
+## any-function-decorator
+
+Default severity: `ignore`
+
+A function or method decorator obscures the function's type because the decorator itself has an explicit `Any` type or applying it produces a top-level explicit `Any`, including a union member. Implicit unknowns are reported separately by [`untyped-function-decorator`](#untyped-function-decorator).
+
+```python
+from typing import Any
+
+def dec(value: Any) -> Any:
+    return value
+
+@dec  # the type of `fn` is lost [any-function-decorator]
+def fn(value: int) -> None: ...
+```
+
 ## assert-type
 
 An `assert-type` error is raised when a `typing.assert_type()` call fails.
@@ -7942,17 +7958,9 @@ class B: ...
 
 Default severity: `ignore`
 
-A function or method decorator obscures the decorated function's type, either because the decorator's own type is `Any` or because applying it produces an unknown type. This mirrors pyright's `reportUntypedFunctionDecorator`, except that fully unannotated decorators are also reported. A decorator annotated to return an explicit `Any` is treated as intentional and is not reported.
+A function or method decorator obscures the decorated function's type because the decorator's own type or its result is an implicit `Any` (unknown). Fully unannotated decorators are also reported. Explicit `Any` is covered separately by [`any-function-decorator`](#any-function-decorator).
 
 ```python
-from typing import Any
-
-my_decorator: Any = lambda f: f
-
-@my_decorator  # `my_decorator` is `Any`, so the type of `g` is lost [untyped-function-decorator]
-def g() -> int:
-    return 1
-
 def unannotated(f):  # returns an implicit `Any`
     return f
 
@@ -10574,7 +10582,7 @@ of them:
 
 | BasedPyright rule                       | Pyrefly                                       |
 | --------------------------------------- | --------------------------------------------- |
-| `reportAny`                             | `explicit-any-use`                            |
+| `reportAny`                             | `explicit-any-use`, `any-function-decorator`  |
 | `reportExplicitAny`                     | `explicit-any`                                |
 | `reportImplicitRelativeImport`          | `fallback-search-path-relative-import`, `missing-import` |
 | `reportIncompatibleUnannotatedOverride` | `bad-override-mutable-attribute`              |
