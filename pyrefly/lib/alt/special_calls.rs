@@ -868,7 +868,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             }
                             if let Err(specialization_errors) = self.finish_quantified(vs, false) {
                                 for e in specialization_errors {
-                                    unsafe_overlap_errors.push(e.to_error_msg(self))
+                                    unsafe_overlap_errors.push(e.to_error_msg(self, None))
                                 }
                             }
                             if all_runtime_members_present && !unsafe_overlap_errors.is_empty() {

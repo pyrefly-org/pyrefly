@@ -302,6 +302,7 @@ impl ConstructedInstance {
         if let Some(specialization_errors) = self.specialization_errors {
             answers.add_specialization_errors(
                 specialization_errors,
+                None,
                 arguments_range,
                 errors,
                 context,
@@ -1173,14 +1174,24 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
     pub fn add_specialization_errors(
         &self,
-        specialization_errors: Vec1<TypeVarSpecializationError>,
+        specialization_errors: impl IntoIterator<Item = TypeVarSpecializationError>,
+        argmap: Option<&ArgMap>,
         range: TextRange,
         errors: &ErrorCollector,
         context: Option<&dyn Fn() -> ErrorContext>,
     ) {
         for e in specialization_errors {
             let kind = e.error_kind();
-            self.error_with_context(errors, range, kind, e.to_error_msg(self), context);
+            let parameter = e
+                .argument
+                .and_then(|argument| argmap?.parameter_name(argument));
+            self.error_with_context(
+                errors,
+                range,
+                kind,
+                e.to_error_msg(self, parameter),
+                context,
+            );
         }
     }
 
@@ -2769,33 +2780,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             };
         call_errors.extend(chosen_call_errors);
         arg_errors.extend(chosen_arg_errors);
-        let is_constructor = ctor_targs.is_some();
         if let Some(targs) = ctor_targs
             && let Some(chosen_targs) = chosen_ctor_targs
         {
             *targs = chosen_targs;
         }
         let (ty, specialization_errors, return_type_errors, argmap, _, overload_table) = chosen_res;
-        for error in specialization_errors {
-            let parameter = if is_constructor
-                && let TypeVarSpecializationError::BadBoundSpecialization {
-                    argument: Some(argument),
-                    ..
-                } = &error
-                && let Some(parameter) = argmap.arg_to_param.get(argument)
-                && parameter.arg_ty.is_some()
-            {
-                parameter.name.as_ref()
-            } else {
-                None
-            };
-            let kind = error.error_kind();
-            let mut message = error.to_error_msg(self);
-            if let Some(name) = parameter {
-                message.push_str(&format!(" for parameter `{name}`"));
-            }
-            self.error_with_context(call_errors, arguments_range, kind, message, context);
-        }
+        self.add_specialization_errors(
+            specialization_errors,
+            Some(&argmap),
+            arguments_range,
+            call_errors,
+            context,
+        );
         self.add_return_type_resolution_errors(
             return_type_errors,
             arguments_range,

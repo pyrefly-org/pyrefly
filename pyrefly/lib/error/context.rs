@@ -222,7 +222,7 @@ pub enum TypeCheckKind {
     /// Consistency check for overload defaults, as (parameter name).
     OverloadDefault(Name),
     /// Check that the type a TypeVar is specialized with is compatible with its type restriction.
-    TypeVarSpecialization(Name),
+    TypeVarSpecialization(Name, Option<Name>),
     /// An `x in y` check
     Container,
 }

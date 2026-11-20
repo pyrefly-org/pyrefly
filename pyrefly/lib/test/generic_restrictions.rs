@@ -9,6 +9,19 @@ use crate::test::util::TestEnv;
 use crate::testcase;
 
 testcase!(
+    test_specialization_identifies_call_parameter,
+    r#"
+def bounded[T: int](first: T, second: T) -> None: ...
+def constrained[T: (int, str)](value: T) -> None: ...
+
+bounded(1, "bad second")  # E: Argument `str` is not assignable to parameter `second` with type variable `T` (upper bound `int`)
+bounded(1, *("bad second",))  # E: Argument `str` is not assignable to parameter `second` with type variable `T` (upper bound `int`)
+bounded(*("bad first", 1))  # E: `str` is not assignable to upper bound `int` of type variable `T`
+constrained(1.5)  # E: Argument `float` is not assignable to parameter `value` with type variable `T` (expected one of `int`, `str`)
+"#,
+);
+
+testcase!(
     test_quantified_subtyping_no_constraint,
     r#"
 def test[T](x: T) -> None:
@@ -76,7 +89,7 @@ def test[T: B](x: T) -> None:
     b: B = x  # OK
     c: C = x  # E: `T` is not assignable to `C`
 
-test(A())  # E: `A` is not assignable to upper bound `B` of type variable `T`
+test(A())  # E: Argument `A` is not assignable to parameter `x` with type variable `T` (upper bound `B`)
 test(B())
 test(C())
  "#,
@@ -96,13 +109,13 @@ class Container[T: B]:
     def __init__(self, x: T) -> None: ...
 
 def bare(x: A) -> Container:  # implicitly Container[Any]
-    return Container(x)  # E: `A` is not assignable to upper bound `B` of type variable `T`
+    return Container(x)  # E: Argument `A` is not assignable to parameter `x` with type variable `T` (upper bound `B`)
 
 def explicit_any(x: A) -> Container[Any]:
-    return Container(x)  # E: `A` is not assignable to upper bound `B` of type variable `T`
+    return Container(x)  # E: Argument `A` is not assignable to parameter `x` with type variable `T` (upper bound `B`)
 
 def unrelated(x: str) -> Container[Any]:
-    return Container(x)  # E: `str` is not assignable to upper bound `B` of type variable `T`
+    return Container(x)  # E: Argument `str` is not assignable to parameter `x` with type variable `T` (upper bound `B`)
  "#,
 );
 
@@ -157,10 +170,10 @@ class Container[T: (int, str)]:
     def __init__(self, x: T) -> None: ...
 
 def returned(x: float) -> Container[Any]:
-    return Container(x)  # E: `float` is not assignable to any of constraints `int`, `str`
+    return Container(x)  # E: Argument `float` is not assignable to parameter `x` with type variable `T` (expected one of `int`, `str`)
 
 def assigned(x: float) -> None:
-    y: Container[Any] = Container(x)  # E: `float` is not assignable to any of constraints `int`, `str`
+    y: Container[Any] = Container(x)  # E: Argument `float` is not assignable to parameter `x` with type variable `T` (expected one of `int`, `str`)
 
 def valid(x: int) -> Container[Any]:
     assert_type(Container(x), Container[int])
@@ -268,10 +281,10 @@ class Pair[T: (int, str)]:
     def __init__(self, left: T, right: T) -> None: ...
 
 def unhinted(left: int | str, right: int | str | bytes) -> None:
-    Pair(left, right)  # E: `int | str` is not assignable to any of constraints `int`, `str`  # E: Argument `bytes | int | str` is not assignable to parameter `right`
+    Pair(left, right)  # E: Argument `int | str` is not assignable to parameter `left` with type variable `T` (expected one of `int`, `str`)  # E: Argument `bytes | int | str` is not assignable to parameter `right`
 
 def hinted(left: int | str, right: int | str | bytes) -> Pair[Any]:
-    return Pair(left, right)  # E: `int | str` is not assignable to any of constraints `int`, `str`  # E: Argument `bytes | int | str` is not assignable to parameter `right`
+    return Pair(left, right)  # E: Argument `int | str` is not assignable to parameter `left` with type variable `T` (expected one of `int`, `str`)  # E: Argument `bytes | int | str` is not assignable to parameter `right`
  "#,
 );
 
@@ -289,7 +302,7 @@ class Box[S: int]:
     def __new__(cls, data: S, extra: int = 0) -> Self: ...
 
 def hinted() -> Box:
-    return Box("s")  # E: `str` is not assignable to upper bound `int` of type variable `S`
+    return Box("s")  # E: Argument `str` is not assignable to parameter `data` with type variable `S` (upper bound `int`)
  "#,
 );
 
@@ -368,7 +381,7 @@ def test[T: (B, C)](x: T) -> None:
     c: C = x  # E: `T` is not assignable to `C`
     d: B | C = x  # OK
 
-test(A())  # E: `A` is not assignable to any of constraints `B`, `C` of type variable `T`
+test(A())  # E: Argument `A` is not assignable to parameter `x` with type variable `T` (expected one of `B`, `C`)
 test(B())
 test(C())
 test(D())
@@ -1019,7 +1032,7 @@ def f[T: Literal["foo"]](x: T) -> T: ...
 def g[T: LiteralString](x: T) -> T: ...
 
 assert_type(f("foo"), Literal["foo"])
-assert_type(f("bar"), str) # E: `str` is not assignable to upper bound `Literal['foo']`
+assert_type(f("bar"), str) # E: Argument `str` is not assignable to parameter `x` with type variable `T` (upper bound `Literal['foo']`)
 
 assert_type(g("foo"), Literal["foo"])
 assert_type(g("bar"), Literal["bar"])
@@ -1089,7 +1102,7 @@ class X: ...
 def f[T: (int, str)](x: T) -> T: ...
 
 # X is not assignable to int or str, so this should error.
-f(X())  # E: `X` is not assignable to any of constraints `int`, `str` of type variable `T`
+f(X())  # E: Argument `X` is not assignable to parameter `x` with type variable `T` (expected one of `int`, `str`)
     "#,
 );
 
@@ -1203,7 +1216,7 @@ testcase!(
 from typing import Callable, Iterable
 def reduce[_S](function: Callable[[_S, _S], _S], iterable: Iterable[_S]) -> _S: ...
 def f[_T: str](arg1: _T, arg2: _T) -> _T: ...
-reduce(f, [1])  # E: `int` is not assignable to upper bound `str` of type variable `_T`
+reduce(f, [1])  # E: Argument `int` is not assignable to parameter `iterable` with type variable `_T` (upper bound `str`)
 reduce(f, ["ok"])
     "#,
 );
@@ -1557,12 +1570,12 @@ def go() -> None:
 
     # Case 2: Only got (first) has restriction
     # bounded_str returns T: str, matched against unbounded U from outer unbounded()
-    bounded_str(1)  # E: `int` is not assignable to upper bound `str` of type variable `T`
-    unbounded("1", bounded_str(1))  # E: `int` is not assignable to upper bound `str` of type variable `T`
+    bounded_str(1)  # E: Argument `int` is not assignable to parameter `x` with type variable `T` (upper bound `str`)
+    unbounded("1", bounded_str(1))  # E: Argument `int` is not assignable to parameter `x` with type variable `T` (upper bound `str`)
 
     # Case 3: Only want (second) has restriction
     # unbounded returns unbounded T, but when passed to bounded_str, must satisfy str bound
-    bounded_str(unbounded(1, 2))  # E: `int` is not assignable to upper bound `str` of type variable `T`
+    bounded_str(unbounded(1, 2))  # E: Argument `int` is not assignable to parameter `a` with type variable `T` (upper bound `str`)
 
     # Case 4a: Both have restrictions, compatible (int <: object, str <: object)
     # When bounded_str's T: str is unified with bounded_int's T: int in a context,
@@ -1577,7 +1590,7 @@ def go() -> None:
     # Case 4c: Both have restrictions, incompatible (str and int are not subtypes of each other)
     # bounded_str returns T: str, which must match U: int from apply_both_bounded
     # The bounds str and int are incompatible, so hint matching fails and error is reported
-    apply_both_bounded("a", bounded_str("ok"))  # E: `str` is not assignable to upper bound `int` of type variable `U`
+    apply_both_bounded("a", bounded_str("ok"))  # E: Argument `str` is not assignable to parameter `g` with type variable `U` (upper bound `int`)
     "#,
 );
 
@@ -1596,7 +1609,7 @@ def bounded_str[T: str](x: T) -> T:
     return x
 
 def go() -> None:
-    bounded_str(unbounded(1, 2))  # E: `int` is not assignable to upper bound `str` of type variable `T`
+    bounded_str(unbounded(1, 2))  # E: Argument `int` is not assignable to parameter `a` with type variable `T` (upper bound `str`)
     "#,
 );
 
@@ -1717,7 +1730,7 @@ testcase!(
     test_multiple_bad_specialization,
     r#"
 def f[T: int](x: T, y: T): ...
-f("oops", None)  # E: `None` is not assignable to upper bound `int`
+f("oops", None)  # E: Argument `None` is not assignable to parameter `y` with type variable `T` (upper bound `int`)
     "#,
 );
 
@@ -1732,7 +1745,7 @@ FrameType = TypeVar("FrameType", bound="DataFrame")
 def main(left: DataFrame, right: DataFrame) -> None:
     def func(*a: Iterable[FrameType]) -> None:
         return None
-    func(left, right)  # E: `Series` is not assignable to upper bound `DataFrame`
+    func(left, right)  # E: Argument `Series` is not assignable to parameter `a` with type variable `FrameType` (upper bound `DataFrame`)
     "#,
 );
 
@@ -1934,7 +1947,7 @@ testcase!(
 def f[T: (int, str)](x: T) -> T:
     return x
 def g(x: int | str):
-    f(x)  # E: `int | str` is not assignable to any of constraints `int`, `str` of type variable `T`
+    f(x)  # E: Argument `int | str` is not assignable to parameter `x` with type variable `T` (expected one of `int`, `str`)
     "#,
 );
 
@@ -1947,7 +1960,7 @@ def f[T: (bool, int)](x: T) -> T:
 def g[T: bool](x: T) -> T:
     return f(x)
 def h[S: str](x: S) -> S:
-    return f(x)  # E: `S` is not assignable to any of constraints `bool`, `int` of type variable `T`
+    return f(x)  # E: Argument `S` is not assignable to parameter `x` with type variable `T` (expected one of `bool`, `int`)
     "#,
 );
 
@@ -2068,7 +2081,7 @@ class Nested[T: list[str]]:
     def __init__(self, value: T) -> None: ...
 
 def bad(v: list[int]) -> None:
-    x: Nested[list[Any]] = Nested(v)  # E: `list[int]` is not assignable to upper bound `list[str]` of type variable `T`
+    x: Nested[list[Any]] = Nested(v)  # E: Argument `list[int]` is not assignable to parameter `value` with type variable `T` (upper bound `list[str]`)
 
 def good(v: list[str]) -> None:
     y: Nested[list[Any]] = Nested(v)
