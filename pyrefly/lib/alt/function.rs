@@ -2975,7 +2975,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ),
                 );
                 for e in specialization_errors {
-                    builder = builder.with_detail(e.to_error_msg(self));
+                    builder = builder.with_detail(e.to_error_msg(self, None));
                 }
                 builder.emit();
             }
