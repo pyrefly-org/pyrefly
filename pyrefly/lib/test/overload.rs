@@ -3462,8 +3462,8 @@ class D[T]:
     def m(self, other: object) -> object: ...
 
 def f(d: D[Any]):
-    add(g, 1)  # E: `str` is not assignable to upper bound `int` of type variable `B`
-    add(d.m, 1)  # E: `str` is not assignable to upper bound `int` of type variable `B`
+    add(g, 1)  # E: Argument `str` is not assignable to parameter `f` with type variable `B` (upper bound `int`)
+    add(d.m, 1)  # E: Argument `str` is not assignable to parameter `f` with type variable `B` (upper bound `int`)
     "#,
 );
 
@@ -3530,8 +3530,8 @@ class D[T]:
     def __radd__(self, other: object) -> object: ...
 
 def f(c: C, d: D[Any]):
-    add(c, 1)  # E: `str` is not assignable to upper bound `int` of type variable `B`
-    add(d, 1)  # E: `str` is not assignable to upper bound `int` of type variable `B`
+    add(c, 1)  # E: Argument `str` is not assignable to parameter `x` with type variable `B` (upper bound `int`)
+    add(d, 1)  # E: Argument `str` is not assignable to parameter `x` with type variable `B` (upper bound `int`)
     "#,
 );
 
