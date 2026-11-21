@@ -721,11 +721,11 @@ Legacy mapping onto the new model:
 - `default` resets both new settings to their unset values (`typeCheckingMode = "auto"`, `disableTypeErrors = false`). Use it to clear a previous `force-on` / `force-off` setting.
 - `error-missing-imports` was removed in v0.64.0 and now behaves identically to `default`.
 
-#### `python.pyrefly.diagnosticMode`
+#### `python.analysis.diagnosticMode`
 
 **Type:** enum (`openFilesOnly`, `workspace`) &nbsp; **Default:** `"openFilesOnly"`
 
-Controls the scope of Pyrefly's diagnostic analysis. When set to `'openFilesOnly'`, diagnostics are only computed for files currently open in the editor. When set to `'workspace'`, Pyrefly publishes diagnostics for all files in a project once any file from that project is opened. Projects are identified through pyrefly config files (`pyrefly.toml` or `pyproject.toml` with `[tool.pyrefly]`) discovered by the normal upward config search. Files not covered by any explicit pyrefly config are not included.
+Controls diagnostic scope. `openFilesOnly` checks open files. `workspace` publishes diagnostics for configured projects once a project file opens. Projects require `pyrefly.toml` or `[tool.pyrefly]` in `pyproject.toml`. Files outside configured projects are excluded from workspace analysis. Existing `python.pyrefly.diagnosticMode` settings remain supported and take precedence.
 
 #### `python.pyrefly.disableLanguageServices`
 
@@ -847,7 +847,7 @@ The keys are the VSCode setting names with the leading `python.` stripped, so `p
 
 Two exceptions: `commentFoldingRanges` sits at the top level rather than under `pyrefly`, and `pyrefly.pyreflyExecutable` / `pyrefly.lspPath` / `pyrefly.lspArguments` / `pyrefly.trace.server` have no `initializationOptions` equivalent at all — they tell the VSCode extension how to launch the server, which your client already does itself.
 
-Below is an example showing every supported key at its default value:
+The example shows the main settings and their default values:
 ```json
 {
   "pythonPath": "/usr/bin/python3",
@@ -872,7 +872,6 @@ Below is an example showing every supported key at its default value:
     "displayTypeErrors": "default",
     "typeErrorDisplayStatusVersion": "v1",
     "disableLanguageServices": false,
-    "diagnosticMode": "openFilesOnly",
     "extraSearchPaths": [],
     "extraProjectExcludes": [],
     "configPath": "",
@@ -931,7 +930,7 @@ Renamed to [`extraSearchPaths`](#pyreflyextrasearchpaths). Still accepted for ba
 
 **Type:** array of strings &nbsp; **Default:** `[]`
 
-Globs to exclude from the project, appended to the [`project-excludes`](../configuration#project-excludes) of whatever config Pyrefly resolves for a file. Files matching them are not type checked: no diagnostics are published for them, and they are skipped when [`diagnosticMode`](#pythonpyreflydiagnosticmode) is `workspace`.
+Globs to exclude from the project, appended to the [`project-excludes`](../configuration#project-excludes) of whatever config Pyrefly resolves for a file. Files matching them are not type checked: no diagnostics are published for them, and they are skipped when [`diagnosticMode`](#pythonanalysisdiagnosticmode) is `workspace`.
 
 Use this to map an editor's own notion of excluded directories (for example PyCharm's "Excluded" content roots) onto Pyrefly without writing a `pyrefly.toml`. Relative globs are resolved against the workspace folder the setting is scoped to; patterns use `/` as the separator on every platform.
 
@@ -957,7 +956,7 @@ Opt in to the [`pyrefly/typeErrorDisplayStatusChanged`](#custom-notification-pyr
 
 **Type:** enum (`openFilesOnly`, `workspace`) &nbsp; **Default:** `"openFilesOnly"`
 
-Same meaning as [`pyrefly.diagnosticMode`](#pythonpyreflydiagnosticmode), and read only as a fallback when that is unset. Exists so that a client already forwarding Pylance's `python.analysis.diagnosticMode` gets the expected behavior for free.
+Controls [diagnostic scope](#pythonanalysisdiagnosticmode). The legacy `pyrefly.diagnosticMode` key remains supported and takes precedence when both are present.
 
 ##### `analysis.importFormat`
 
