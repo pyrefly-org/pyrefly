@@ -6,6 +6,7 @@
  */
 
 use std::borrow::Cow;
+use std::env;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fmt::Display;
@@ -15,6 +16,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Once;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -64,6 +66,7 @@ use toml::Table;
 use toml::Value;
 use tracing::debug;
 use tracing::error;
+use tracing::warn;
 #[cfg(not(target_arch = "wasm32"))]
 use uv_pep440::Version;
 #[cfg(not(target_arch = "wasm32"))]
@@ -653,6 +656,10 @@ pub struct ConfigFile {
     #[serde(default, skip_serializing_if = "crate::util::skip_default_false")]
     pub disable_project_excludes_heuristics: bool,
 
+    /// Should we skip warning that `PYTHONPATH` is set when we query an interpreter?
+    #[serde(default, skip_serializing_if = "crate::util::skip_default_false")]
+    pub disable_pythonpath_warning: bool,
+
     #[serde(skip)]
     pub search_path_from_args: Vec<PathBuf>,
 
@@ -876,6 +883,7 @@ impl Default for ConfigFile {
             disable_search_path_heuristics: false,
             enable_fallback_search_path: false,
             disable_project_excludes_heuristics: false,
+            disable_pythonpath_warning: false,
             import_root: None,
             fallback_search_path: Default::default(),
             python_environment: Default::default(),
@@ -1812,6 +1820,23 @@ impl ConfigFile {
         self.configure_at(None)
     }
 
+    /// Warns that `PYTHONPATH` is set, unless `disable-pythonpath-warning` is set. A queried
+    /// interpreter's `sys.path` includes the `PYTHONPATH` entries, so checks in other
+    /// environments may not find the same imports. `PYTHONPATH` is fixed for the lifetime of
+    /// the process, so the warning is emitted at most once.
+    pub fn warn_if_pythonpath_set(&self) {
+        static WARNED: Once = Once::new();
+        if !self.disable_pythonpath_warning
+            && let Ok(pythonpath) = env::var("PYTHONPATH")
+        {
+            WARNED.call_once(|| {
+                warn!(
+                    "PYTHONPATH environment variable is set to `{pythonpath}`. Checks in other environments may not include these paths. Set the `disable-pythonpath-warning` config option or pass `--disable-pythonpath-warning` to silence this warning."
+                )
+            });
+        }
+    }
+
     /// Configures this file using `project_root` for project-local discovery when its
     /// [`ConfigSource`] does not identify an on-disk root.
     ///
@@ -1866,6 +1891,7 @@ impl ConfigFile {
         } else {
             match self.interpreters.find_interpreter(project_root.as_deref()) {
                 Ok(interpreter) => {
+                    self.warn_if_pythonpath_set();
                     let (env, error) = PythonEnvironment::get_interpreter_env(&interpreter);
                     self.python_environment.override_empty(env);
                     if let Some(error) = error {
@@ -2892,6 +2918,7 @@ mod tests {
                 disable_search_path_heuristics: false,
                 enable_fallback_search_path: false,
                 disable_project_excludes_heuristics: false,
+                disable_pythonpath_warning: false,
                 import_root: None,
                 build_system: Default::default(),
                 use_ignore_files: true,
@@ -3317,6 +3344,7 @@ mod tests {
             disable_search_path_heuristics: false,
             enable_fallback_search_path: false,
             disable_project_excludes_heuristics: false,
+            disable_pythonpath_warning: false,
             import_root: None,
             use_ignore_files: true,
             script_command: None,
@@ -3412,6 +3440,7 @@ mod tests {
             disable_search_path_heuristics: false,
             enable_fallback_search_path: false,
             disable_project_excludes_heuristics: false,
+            disable_pythonpath_warning: false,
             use_ignore_files: true,
             script_command: None,
             output_format: Some(OutputFormat::Json),

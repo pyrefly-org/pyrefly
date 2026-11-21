@@ -242,6 +242,11 @@
           "type": "boolean",
           "default": false
         },
+        "disable-pythonpath-warning": {
+          "description": "Don't warn that the PYTHONPATH environment variable is set when querying a Python interpreter.",
+          "type": "boolean",
+          "default": false
+        },
         "typeshed-path": {
           "description": "Override the version of typeshed that's being used for type checking. The provided path should point to the root of typeshed.",
           "type": "string"

@@ -16,7 +16,6 @@ use pyrefly_python::sys_info::PythonPlatform;
 use pyrefly_python::sys_info::PythonVersion;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::warn;
 use url::Url;
 
 use crate::environment::environment::PythonEnvironment;
@@ -92,13 +91,6 @@ struct QueryOutput {
 /// version, platform, and site package path. Return an error in the case of failure during
 /// execution, parsing, or deserializing.
 pub fn query(interpreter: &Path) -> anyhow::Result<PythonEnvironment> {
-    if let Ok(pythonpath) = std::env::var("PYTHONPATH") {
-        warn!(
-            "PYTHONPATH environment variable is set to `{}`. Checks in other environments may not include these paths.",
-            pythonpath
-        );
-    }
-
     let mut command = Command::new(interpreter);
     command.arg("-c");
     command.arg(QUERY_SCRIPT);

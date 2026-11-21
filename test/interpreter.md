@@ -183,3 +183,39 @@ $ VENV_PROJECT=$(mktemp -d -p /tmp venv.XXXXXX) && \
  INFO 0 errors* (glob)
 [0]
 ```
+
+## We warn when `PYTHONPATH` is set
+
+```scrut {output_stream: stderr}
+$ mkdir $TMPDIR/pythonpath && echo "x = 1" > $TMPDIR/pythonpath/test.py && \
+> touch $TMPDIR/pythonpath/pyrefly.toml && \
+> PYTHONPATH=$TMPDIR/pythonpath/extra $PYREFLY check -c $TMPDIR/pythonpath/pyrefly.toml
+ WARN PYTHONPATH environment variable is set to `*/pythonpath/extra`* (glob)
+ INFO Checking project configured at `*/pyrefly.toml` (glob)
+ INFO 0 errors* (glob)
+[0]
+```
+
+## `--disable-pythonpath-warning` silences the `PYTHONPATH` warning
+
+<!-- Reusing pythonpath dir set up in "We warn when `PYTHONPATH` is set" -->
+
+```scrut {output_stream: stderr}
+$ PYTHONPATH=$TMPDIR/pythonpath/extra $PYREFLY check -c $TMPDIR/pythonpath/pyrefly.toml \
+> --disable-pythonpath-warning
+ INFO Checking project configured at `*/pyrefly.toml` (glob)
+ INFO 0 errors* (glob)
+[0]
+```
+
+## `disable-pythonpath-warning` silences the `PYTHONPATH` warning
+
+<!-- Reusing pythonpath dir set up in "We warn when `PYTHONPATH` is set" -->
+
+```scrut {output_stream: stderr}
+$ echo "disable-pythonpath-warning = true" > $TMPDIR/pythonpath/pyrefly.toml && \
+> PYTHONPATH=$TMPDIR/pythonpath/extra $PYREFLY check -c $TMPDIR/pythonpath/pyrefly.toml
+ INFO Checking project configured at `*/pyrefly.toml` (glob)
+ INFO 0 errors* (glob)
+[0]
+```

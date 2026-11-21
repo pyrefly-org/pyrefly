@@ -136,6 +136,16 @@ pub struct EnvironmentArgs {
     #[arg(long, group = "env_source")]
     pub(crate) skip_interpreter_query: bool,
 
+    /// Don't warn that the `PYTHONPATH` environment variable is set when querying
+    /// a Python interpreter.
+    #[arg(
+        long,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1,
+    )]
+    pub(crate) disable_pythonpath_warning: Option<bool>,
+
     /// Override the bundled typeshed with a custom path.
     #[arg(long, value_parser = absolute_path_parser)]
     pub(crate) typeshed_path: Option<PathBuf>,
@@ -167,6 +177,7 @@ impl EnvironmentArgs {
             python_interpreter_path,
             fallback_python_interpreter_name,
             skip_interpreter_query,
+            disable_pythonpath_warning,
             typeshed_path,
             module_names,
             loaded_module_names: _,
@@ -184,6 +195,7 @@ impl EnvironmentArgs {
             || python_interpreter_path.is_some()
             || fallback_python_interpreter_name.is_some()
             || *skip_interpreter_query
+            || disable_pythonpath_warning.is_some()
             || typeshed_path.is_some()
             || module_names.is_some()
     }
@@ -253,6 +265,9 @@ impl EnvironmentArgs {
         }
         if let Some(x) = &self.site_package_path {
             config.python_environment.site_package_path = Some(x.clone());
+        }
+        if let Some(x) = &self.disable_pythonpath_warning {
+            config.disable_pythonpath_warning = *x;
         }
         if self.skip_interpreter_query || config.interpreters.skip_interpreter_query {
             config.interpreters.skip_interpreter_query = true;
@@ -846,6 +861,28 @@ mod tests {
             let (config, errors) = args.override_config(config);
             assert!(errors.is_empty());
             assert_eq!(config.use_shape_comments_and_stubs(), enabled);
+        }
+    }
+
+    #[test]
+    fn disable_pythonpath_warning_flag() {
+        for (flag, disabled) in [
+            ("--disable-pythonpath-warning=false", false),
+            ("--disable-pythonpath-warning=true", true),
+            ("--disable-pythonpath-warning", true),
+        ] {
+            let args =
+                ConfigOverrideArgs::parse_from(["pyrefly", "--skip-interpreter-query", flag]);
+            assert!(args.has_overrides());
+            let config = ConfigFile::parse_config(&format!(
+                "disable-pythonpath-warning = {}
+",
+                !disabled
+            ))
+            .unwrap();
+            let (config, errors) = args.override_config(config);
+            assert!(errors.is_empty());
+            assert_eq!(config.disable_pythonpath_warning, disabled);
         }
     }
 

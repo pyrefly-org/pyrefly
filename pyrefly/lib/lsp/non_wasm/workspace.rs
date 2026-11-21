@@ -162,6 +162,7 @@ impl ConfigConfigurer for WorkspaceConfigConfigurer {
                     && config.interpreters.is_empty()
                     && !config.interpreters.skip_interpreter_query
                 {
+                    config.warn_if_pythonpath_set();
                     let (env, query_error) = PythonEnvironment::get_interpreter_env(&interpreter);
                     if let Some(error) = query_error {
                         error!("{error}");

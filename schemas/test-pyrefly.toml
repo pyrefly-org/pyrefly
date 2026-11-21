@@ -24,6 +24,7 @@ site-packages-path = ["venv/lib/python3.12/site-packages"]
 python-platform = "linux"
 python-version = "3.12.0"
 skip-interpreter-query = false
+disable-pythonpath-warning = false
 python-interpreter-path = "venv/bin/python3"
 python-interpreter-find-command = ["poetry", "env", "info", "-e"]
 conda-environment = "myenv"
