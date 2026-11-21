@@ -1107,7 +1107,6 @@ impl Bindings {
         infer_param_types_from_docstring: bool,
         use_shape_comments_and_stubs: bool,
     ) -> Self {
-        let module_range = x.range;
         let dunder_all_entries = exports
             .dunder_all_names()
             .filter_map(|(_, name, content_range)| {
@@ -1284,7 +1283,9 @@ impl Bindings {
         let module_deletes = scope_trace.module_deletes().clone();
         let functools_wrapper_mutation = bind_functools_wrapper_mutation(
             &mut builder.table,
-            module_range,
+            // An empty range keeps the literal's type trace from shadowing an expression that
+            // spans the whole module
+            TextRange::default(),
             builder.has_functools_wrapper_mutation,
         );
         builder.table.insert(

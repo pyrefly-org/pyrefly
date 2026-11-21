@@ -375,6 +375,18 @@ fn test_get_computed_type_list_is_class() {
 }
 
 #[test]
+fn test_get_computed_type_expression_spanning_whole_module() {
+    // Without a trailing newline, the expression's range equals the module's range.
+    let (mut tsp, file_uri, snapshot) = setup_project("[1, 2, 3]");
+
+    let result = get_computed_type_range_ok(&mut tsp, &file_uri, 0, 0, 0, 9, snapshot);
+    let name = result.pointer("/declaration/name").and_then(|v| v.as_str());
+    assert_eq!(name, Some("list"), "Expected class name 'list'");
+
+    tsp.shutdown();
+}
+
+#[test]
 fn test_get_computed_type_function_is_function_type() {
     // A function definition should produce a FunctionType with CALLABLE flag
     let (mut tsp, file_uri, snapshot) =
