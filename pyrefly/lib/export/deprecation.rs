@@ -23,10 +23,7 @@ fn extract_message(call: &ExprCall) -> Option<String> {
 }
 
 /// Parse a decorator using a custom resolver for SpecialExport::Deprecated.
-pub fn parse_deprecation(
-    e: &Expr,
-    is_deprecated: impl Fn(&Expr) -> bool,
-) -> Option<Deprecation> {
+pub fn parse_deprecation(e: &Expr, is_deprecated: impl Fn(&Expr) -> bool) -> Option<Deprecation> {
     let call = e.as_call_expr()?;
     if !is_deprecated(&call.func) {
         return None;

@@ -7867,7 +7867,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let mut ty = self.expr_infer(&x.expr, errors);
         self.pin_all_placeholder_types(&mut ty, true, x.expr.range(), errors);
         self.expand_mut(&mut ty);
-        let deprecation = parse_deprecation(&x.expr, |func| self.is_deprecated_decorator(func, errors));
+        let deprecation =
+            parse_deprecation(&x.expr, |func| self.is_deprecated_decorator(func, errors));
         Decorator { ty, deprecation }
     }
 
