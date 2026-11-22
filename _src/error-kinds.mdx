@@ -929,6 +929,31 @@ class C:
         self.y = 0  # error, `y` may be undefined if `f` does not execute
 ```
 
+## import-cycle
+
+Default severity: `ignore`
+
+A module imports itself through a chain of other first-party modules. For each
+group of modules that import each other, Pyrefly reports one shortest cycle, at
+an import in the module of the group whose name sorts first. Every import
+statement counts, including imports inside functions and under
+`if TYPE_CHECKING:`, and importing `a.b` also imports the package `a`. Imports
+of stub files and installed packages are not followed. Which imports count
+matches basedpyright's `reportImportCycles`, which can report several cycles
+for the same group.
+
+```python
+# a.py
+from b import g  # import-cycle: Import cycle: `a` -> `b` -> `a`
+
+def f() -> None: ...
+
+# b.py
+from a import f
+
+def g() -> None: ...
+```
+
 ## inactive-code
 
 Default severity: `hint`
@@ -2314,6 +2339,18 @@ def takes_kwonly(*, x: int) -> int:
   ...
 
 takes_kwonly(1)  # should be `takes_kwonly(x=1)`!
+```
+
+## unhashable
+
+Default severity: `warn`
+
+A set element or dictionary key has a type that is not hashable, so building the
+set or dictionary raises `TypeError` at runtime.
+
+```python
+{[1, 2]}  # unhashable
+{[1, 2]: "a"}  # unhashable
 ```
 
 ## unimported-directive

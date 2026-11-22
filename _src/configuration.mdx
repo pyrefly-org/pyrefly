@@ -561,6 +561,17 @@ these to match the environment you'll be running in.
 - Default: `false`
 - Flag equivalent: `--skip-interpreter-query`
 
+### `disable-pythonpath-warning`
+
+Don't warn that the `PYTHONPATH` environment variable is set when Pyrefly queries a
+Python interpreter during [Environment Autoconfiguration](#environment-autoconfiguration).
+The interpreter's `sys.path` includes the `PYTHONPATH` entries, so Pyrefly warns by default
+because checks in other environments may not include these paths.
+
+- Type: bool
+- Default: `false`
+- Flag equivalent: `--disable-pythonpath-warning`
+
 ### `typeshed-path`
 
 Override the version of typeshed that's being used for type checking. The provided
@@ -1994,6 +2005,8 @@ python-version = "3.13"
 # is Pyrefly disallowed from querying for an interpreter to automatically determine your
 # `python-platform`, `python-version`, and extra entries to `site-packages-path`?
 skip-interpreter-query = false
+# don't warn when `PYTHONPATH` is set while querying an interpreter
+disable-pythonpath-warning = false
 # query the default Python interpreter on your system, if installed and `python_platform`,
 # `python-version`, or `site-packages-path` are unset.
 # python-interpreter-path = null # this is commented out because there are no `null` values in TOML

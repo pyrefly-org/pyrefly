@@ -2650,6 +2650,17 @@ these to match the environment you'll be running in.
 - Default: `false`
 - Flag equivalent: `--skip-interpreter-query`
 
+### `disable-pythonpath-warning`
+
+Don't warn that the `PYTHONPATH` environment variable is set when Pyrefly queries a
+Python interpreter during [Environment Autoconfiguration](#environment-autoconfiguration).
+The interpreter's `sys.path` includes the `PYTHONPATH` entries, so Pyrefly warns by default
+because checks in other environments may not include these paths.
+
+- Type: bool
+- Default: `false`
+- Flag equivalent: `--disable-pythonpath-warning`
+
 ### `typeshed-path`
 
 Override the version of typeshed that's being used for type checking. The provided
@@ -4083,6 +4094,8 @@ python-version = "3.13"
 # is Pyrefly disallowed from querying for an interpreter to automatically determine your
 # `python-platform`, `python-version`, and extra entries to `site-packages-path`?
 skip-interpreter-query = false
+# don't warn when `PYTHONPATH` is set while querying an interpreter
+disable-pythonpath-warning = false
 # query the default Python interpreter on your system, if installed and `python_platform`,
 # `python-version`, or `site-packages-path` are unset.
 # python-interpreter-path = null # this is commented out because there are no `null` values in TOML
@@ -6166,6 +6179,31 @@ class C:
         self.y = 0  # error, `y` may be undefined if `f` does not execute
 ```
 
+## import-cycle
+
+Default severity: `ignore`
+
+A module imports itself through a chain of other first-party modules. For each
+group of modules that import each other, Pyrefly reports one shortest cycle, at
+an import in the module of the group whose name sorts first. Every import
+statement counts, including imports inside functions and under
+`if TYPE_CHECKING:`, and importing `a.b` also imports the package `a`. Imports
+of stub files and installed packages are not followed. Which imports count
+matches basedpyright's `reportImportCycles`, which can report several cycles
+for the same group.
+
+```python
+# a.py
+from b import g  # import-cycle: Import cycle: `a` -> `b` -> `a`
+
+def f() -> None: ...
+
+# b.py
+from a import f
+
+def g() -> None: ...
+```
+
 ## inactive-code
 
 Default severity: `hint`
@@ -7551,6 +7589,18 @@ def takes_kwonly(*, x: int) -> int:
   ...
 
 takes_kwonly(1)  # should be `takes_kwonly(x=1)`!
+```
+
+## unhashable
+
+Default severity: `warn`
+
+A set element or dictionary key has a type that is not hashable, so building the
+set or dictionary raises `TypeError` at runtime.
+
+```python
+{[1, 2]}  # unhashable
+{[1, 2]: "a"}  # unhashable
 ```
 
 ## unimported-directive
@@ -10215,7 +10265,7 @@ message's page in the Pylint documentation.
 | `E1139` `invalid-metaclass`                         | [`invalid-inheritance`](../error-kinds.mdx#invalid-inheritance)                                                                                          | `default`         |                                                                                                                                                                                                                                                          |
 | `E1141` `dict-iter-missing-items`                   | None                                                                                                                                                     |                   | Pyrefly only reports this when the dictionary's key type cannot be unpacked, for example `not-iterable` for `int` keys. String keys are iterable.                                                                                                        |
 | `E1142` `await-outside-async`                       | [`invalid-syntax`](../error-kinds.mdx#invalid-syntax)                                                                                                    | `basic`           |                                                                                                                                                                                                                                                          |
-| `E1143` `unhashable-member`                         | None                                                                                                                                                     |                   | Pyrefly does not check that dictionary keys and set members are hashable. It reports `bad-index` if the key does not match the dictionary's key type.                                                                                                    |
+| `E1143` `unhashable-member`                         | [`unhashable`](../error-kinds.mdx#unhashable)                                                                                                            | `default`         | Pyrefly reports `bad-index` for a dictionary subscript whose key does not match the dictionary's key type.                                                                                                                                               |
 | `E1144` `invalid-slice-step`                        | [`bad-index`](../error-kinds.mdx#bad-index)                                                                                                              | `default`         |                                                                                                                                                                                                                                                          |
 | `W1113` `keyword-arg-before-vararg`                 | None                                                                                                                                                     |                   | This is a style check, and the signature is valid.                                                                                                                                                                                                       |
 | `W1114` `arguments-out-of-order`                    | None                                                                                                                                                     |                   | This is a heuristic based on argument names, and the call is valid.                                                                                                                                                                                      |
@@ -10541,7 +10591,7 @@ several kinds.
 | `reportImplicitStringConcatenation`   | No type-checker equivalent                                                                                                                                                                         | Not mapped       | Lint         | Use Ruff `ISC001` or another linter.                                                                                |
 | `reportUndefinedVariable`             | `unknown-name`                                                                                                                                                                                     | Automatic        | Direct       |                                                                                                                     |
 | `reportUnboundVariable`               | `unbound-name`                                                                                                                                                                                     | Automatic        | Direct       |                                                                                                                     |
-| `reportUnhashable`                    | No direct equivalent                                                                                                                                                                               | Not mapped       | None         |                                                                                                                     |
+| `reportUnhashable`                    | `unhashable`                                                                                                                                                                                       | Automatic        | Direct       |                                                                                                                     |
 | `reportInvalidStubStatement`          | No type-checker equivalent                                                                                                                                                                         | Not mapped       | Lint         | Use Ruff's PYI rules where applicable.                                                                              |
 | `reportIncompleteStub`                | No direct equivalent                                                                                                                                                                               | Not mapped       | None         |                                                                                                                     |
 | `reportUnsupportedDunderAll`          | `bad-dunder-all`, `unresolvable-dunder-all`                                                                                                                                                        | Automatic        | Split        |                                                                                                                     |
