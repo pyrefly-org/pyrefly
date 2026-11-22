@@ -1559,6 +1559,24 @@ def access(c: C) -> None:
 "#,
 );
 
+// An `async def` returns `Coroutine[Any, Any, T]`, as typeshed writes it. The yield and send types
+// are not unknown, so a coroutine function with a known return type is not partially unknown.
+testcase!(
+    test_coroutine_function_is_not_partially_unknown,
+    TestEnv::new().enable_partially_unknown_type_error(),
+    r#"
+class C:
+    async def annotated(self) -> int:
+        return 1
+    async def inferred(self):
+        return 1
+
+async def f(c: C) -> None:
+    await c.annotated()
+    await c.inferred()
+"#,
+);
+
 // A partially unknown value is reported when returned from an unannotated function and from a
 // lambda body. The lambda's target is annotated so only the lambda return, not the variable, fires.
 testcase!(

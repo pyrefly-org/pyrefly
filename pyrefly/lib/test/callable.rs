@@ -1096,7 +1096,7 @@ def test_corountine() -> Callable[[int], Coroutine[Any, Any, int]]:
 def test_awaitable() -> Callable[[int], Awaitable[int]]:
     return f
 def test_sync() -> Callable[[int], int]:
-    return f  # E: Returned type `(x: int) -> Coroutine[Unknown, Unknown, int]` is not assignable to declared return type `(int) -> int`
+    return f  # E: Returned type `(x: int) -> Coroutine[Any, Any, int]` is not assignable to declared return type `(int) -> int`
 "#,
 );
 

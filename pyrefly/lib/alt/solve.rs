@@ -4972,10 +4972,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ))
                     }
                 } else if x.is_async {
-                    let any_implicit = self.heap.mk_any_implicit();
+                    // As in `return_type_from_annotation`, the coroutine's `Any`s are explicit.
+                    let any_explicit = self.heap.mk_any_explicit();
                     self.heap.mk_class_type(self.stdlib.coroutine(
-                        any_implicit.clone(),
-                        any_implicit,
+                        any_explicit.clone(),
+                        any_explicit,
                         return_ty,
                     ))
                 } else {
@@ -7386,10 +7387,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         is_generator: bool,
     ) -> Type {
         if is_async && !is_generator {
-            let any_implicit = self.heap.mk_any_implicit();
+            // An `async def` returns `Coroutine[Any, Any, T]`, as typeshed writes it, so these
+            // `Any`s are explicit rather than unknown.
+            let any_explicit = self.heap.mk_any_explicit();
             self.heap.mk_class_type(self.stdlib.coroutine(
-                any_implicit.clone(),
-                any_implicit,
+                any_explicit.clone(),
+                any_explicit,
                 annotated_ty,
             ))
         } else {
