@@ -265,7 +265,12 @@ impl<'a> BindingsBuilder<'a> {
         let deprecation = x
             .decorator_list
             .iter()
-            .find_map(|decorator| parse_deprecation(&decorator.expression))
+            .find_map(|decorator| {
+                parse_deprecation(&decorator.expression, |func| {
+                    self.as_special_export(func) == Some(SpecialExport::Deprecated)
+                        || SpecialExport::from_syntax(func) == Some(SpecialExport::Deprecated)
+                })
+            })
             .map(Box::new);
         let mut pydantic_config_dict = PydanticConfigDict::default();
         let doc_ranges = class_doc_ranges(&x);

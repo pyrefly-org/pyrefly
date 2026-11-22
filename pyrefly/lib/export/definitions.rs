@@ -527,6 +527,45 @@ impl Definitions {
 }
 
 impl DefinitionsBuilder {
+    fn is_deprecated_decorator(&self, func: &Expr) -> bool {
+        if SpecialExport::from_syntax(func) == Some(SpecialExport::Deprecated) {
+            return true;
+        }
+        match func {
+            Expr::Name(name) => {
+                if let Some(def) = self.inner.definitions.get(&name.id) {
+                    match &def.style {
+                        DefinitionStyle::Import(m) => {
+                            (m == &ModuleName::warnings() || m == &ModuleName::typing_extensions())
+                                && name.id.as_str() == "deprecated"
+                        }
+                        DefinitionStyle::ImportAs(m, upstream_name) => {
+                            (m == &ModuleName::warnings() || m == &ModuleName::typing_extensions())
+                                && upstream_name.as_str() == "deprecated"
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            Expr::Attribute(ExprAttribute { value, attr, .. }) if attr.id.as_str() == "deprecated" => {
+                if let Expr::Name(base) = &**value
+                    && let Some(def) = self.inner.definitions.get(&base.id)
+                {
+                    match &def.style {
+                        DefinitionStyle::Import(m) | DefinitionStyle::ImportAs(m, _) => {
+                            m == &ModuleName::warnings() || m == &ModuleName::typing_extensions()
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
     fn stmts(&mut self, xs: &[Stmt]) {
         for x in xs {
             let previous = self.inner.last_finally_or_class;
@@ -759,7 +798,7 @@ impl DefinitionsBuilder {
                 for d in decorator_list {
                     self.named_in_expr(&d.expression);
                     if deprecated_decoration.is_none() {
-                        deprecated_decoration = parse_deprecation(&d.expression);
+                        deprecated_decoration = parse_deprecation(&d.expression, |func| self.is_deprecated_decorator(func));
                     }
                 }
                 if let Some(decoration) = deprecated_decoration {
@@ -1016,7 +1055,7 @@ impl DefinitionsBuilder {
                     self.named_in_expr(&d.expression);
                     is_overload = is_overload || is_overload_decorator(d);
                     if deprecated_decoration.is_none() {
-                        deprecated_decoration = parse_deprecation(&d.expression);
+                        deprecated_decoration = parse_deprecation(&d.expression, |func| self.is_deprecated_decorator(func));
                     }
                 }
                 // If the function is not an overload and decorated with

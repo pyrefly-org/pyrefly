@@ -1883,3 +1883,29 @@ schema.update(
 )
 "#,
 );
+
+testcase!(
+    test_deprecated_call_with_alias,
+    r#"
+from warnings import deprecated as _deprecated
+
+@_deprecated("Use new_func instead")
+def old_func() -> None:
+    pass
+
+old_func()  # E: `old_func` is deprecated
+    "#,
+);
+
+testcase!(
+    test_deprecated_call_with_module_alias,
+    r#"
+import warnings as w
+
+@w.deprecated("Use new_func instead")
+def old_func() -> None:
+    pass
+
+old_func()  # E: `old_func` is deprecated
+    "#,
+);
