@@ -398,7 +398,55 @@ That means everywhere that we call `Base.f` can safely call `Sub.f`.
 
 The opposite case, where `Base.f` takes `float` and `Sub.f` takes `int`, is an error because `Sub.f` cannot accept every `float` value.
 
-Note that bad overrides caused by inconsistent parameter names are separately reported as [bad-override-param-name](#bad-override-param-name), and some overrides involving mutable attributes are reported as [bad-override-mutable-attribute](#bad-override-mutable-attribute).
+Note that bad overrides caused by inconsistent parameter names are separately reported as [bad-override-param-name](#bad-override-param-name), some overrides involving mutable attributes are reported as [bad-override-mutable-attribute](#bad-override-mutable-attribute), and compatibility checks requested by `@override` on normally exempt members are reported as [bad-override-explicit](#bad-override-explicit).
+
+## bad-override-descriptor
+
+Default severity: `ignore`
+
+A descriptor override has an incompatible type when accessed through the class, even if instance access is compatible.
+
+```python
+from typing import overload
+
+class Descriptor:
+    @overload
+    def __get__(self, instance: None, owner: type) -> str: ...
+    @overload
+    def __get__(self, instance: object, owner: type) -> int: ...
+    def __get__(self, instance: object | None, owner: type) -> str | int: ...
+
+class Base:
+    value = Descriptor()
+
+class Child(Base):
+    value = 1  # Class access returns int rather than str
+```
+
+This check is ignored by default and enabled by the `strict` and `all` presets. Libraries that intentionally change class-access behavior can set `bad-override-descriptor = "ignore"` under `[errors]` without disabling instance override checks.
+It is a sub-kind of [bad-override](#bad-override): suppressing `bad-override` also suppresses this error.
+
+## bad-override-explicit
+
+Pyrefly normally allows incompatible overrides of `__init__`, `__new__`, `__init_subclass__`, and `__class__`.
+Adding `@override` explicitly requests compatibility checking for these members, including when the inherited definition comes from `object`.
+The same applies to `__call__` overrides of members inherited from non-Protocol classes; overrides of Protocol members are checked even without the decorator and use the ordinary override error codes.
+This error is enabled by default and covers both incompatible types and parameter names.
+
+```python
+from typing import override
+
+class Example:
+  @override
+  def __init_subclass__(cls, enabled: bool) -> None:  # Error
+    pass
+```
+
+Here, `object.__init_subclass__` accepts no `enabled` argument.
+Remove `@override` if you do not want to assert compatibility, or keep the decorator and suppress this check with `# pyrefly: ignore[bad-override-explicit]`.
+To disable it project-wide, set `bad-override-explicit = "ignore"` in the `[errors]` section of `pyrefly.toml`.
+Suppressing this error does not suppress other errors on the member, such as overriding a `@final` method.
+This is a sub-kind of [bad-override](#bad-override): suppressing `bad-override` also suppresses this error.
 
 ## bad-override-mutable-attribute
 
