@@ -56,6 +56,7 @@ from jax._src.lax.lax import (
     RoundingMethod as RoundingMethod,
     Tolerance as Tolerance,
 )
+from jax._src.lax.parallel import psum_scatter_start as psum_scatter_start
 from jax._src.lax.slicing import (
     GatherDimensionNumbers as GatherDimensionNumbers,
     GatherScatterMode as GatherScatterMode,
@@ -89,10 +90,13 @@ type _ShapedArrayLike[Shape: _Shape] = _Array[Shape] | np.ndarray[Shape]
 def abs[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def acos[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def acosh[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
+def acospi[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def asin[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def asinh[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
+def asinpi[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def atan[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def atanh[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
+def atanpi[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def bessel_i0e[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def bessel_i1e[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def bitwise_not[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
@@ -106,6 +110,7 @@ def cos[Shape: _Shape = []](
     x: _ArrayLike[Shape], *, accuracy: Any = None
 ) -> _Array[Shape]: ...
 def cosh[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
+def cospi[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def digamma[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def erf[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def erf_inv[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
@@ -116,6 +121,7 @@ def exp[Shape: _Shape = []](
 def exp2[Shape: _Shape = []](
     x: _ArrayLike[Shape], *, accuracy: Any = None
 ) -> _Array[Shape]: ...
+def exp2m1[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def expm1[Shape: _Shape = []](
     x: _ArrayLike[Shape], *, accuracy: Any = None
 ) -> _Array[Shape]: ...
@@ -133,6 +139,7 @@ def log1p[Shape: _Shape = []](
 def log2[Shape: _Shape = []](
     x: _ArrayLike[Shape], *, accuracy: Tolerance | AccuracyMode | None = None
 ) -> _Array[Shape]: ...
+def log2p1[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def logistic[Shape: _Shape = []](
     x: _ArrayLike[Shape], *, accuracy: Any = None
 ) -> _Array[Shape]: ...
@@ -152,6 +159,7 @@ def sin[Shape: _Shape = []](
     x: _ArrayLike[Shape], *, accuracy: Any = None
 ) -> _Array[Shape]: ...
 def sinh[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
+def sinpi[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 def sqrt[Shape: _Shape = []](
     x: _ArrayLike[Shape], *, accuracy: Any = None
 ) -> _Array[Shape]: ...
@@ -162,6 +170,7 @@ def tan[Shape: _Shape = []](
 def tanh[Shape: _Shape = []](
     x: _ArrayLike[Shape], *, accuracy: Any = None
 ) -> _Array[Shape]: ...
+def tanpi[Shape: _Shape = []](x: _ArrayLike[Shape]) -> _Array[Shape]: ...
 
 # Binary elementwise operators with strict rank-matching broadcasting
 def add[Shape1: _Shape = [], Shape2: _Shape = []](
@@ -169,6 +178,9 @@ def add[Shape1: _Shape = [], Shape2: _Shape = []](
 ) -> _Array[lax_broadcast(Shape1, Shape2)]: ...
 def atan2[Shape1: _Shape = [], Shape2: _Shape = []](
     x: _ArrayLike[Shape1], y: _ArrayLike[Shape2], /
+) -> _Array[lax_broadcast(Shape1, Shape2)]: ...
+def atan2pi[Shape1: _Shape = [], Shape2: _Shape = []](
+    x: _ArrayLike[Shape1], y: _ArrayLike[Shape2]
 ) -> _Array[lax_broadcast(Shape1, Shape2)]: ...
 def bitwise_and[Shape1: _Shape = [], Shape2: _Shape = []](
     x: _ArrayLike[Shape1], y: _ArrayLike[Shape2], /
@@ -272,6 +284,16 @@ def betainc[
     b: _ArrayLike[Shape2],
     x: _ArrayLike[Shape3],
     /,
+) -> _Array[lax_broadcast(lax_broadcast(Shape1, Shape2), Shape3)]: ...
+def fma[Shape1: _Shape = [], Shape2: _Shape = [], Shape3: _Shape = []](
+    a: _ArrayLike[Shape1],
+    b: _ArrayLike[Shape2],
+    c: _ArrayLike[Shape3],
+) -> _Array[lax_broadcast(lax_broadcast(Shape1, Shape2), Shape3)]: ...
+def fmuladd[Shape1: _Shape = [], Shape2: _Shape = [], Shape3: _Shape = []](
+    a: _ArrayLike[Shape1],
+    b: _ArrayLike[Shape2],
+    c: _ArrayLike[Shape3],
 ) -> _Array[lax_broadcast(lax_broadcast(Shape1, Shape2), Shape3)]: ...
 @overload
 def fft[
@@ -1825,6 +1847,7 @@ def with_sharding_constraint[T](x: T, shardings: Any) -> T: ...
 abs_p: _Primitive
 acos_p: _Primitive
 acosh_p: _Primitive
+acospi_p: _Primitive
 add_p: _Primitive
 after_all_p: _Primitive
 all_gather_p: _Primitive
@@ -1835,9 +1858,12 @@ argmax_p: _Primitive
 argmin_p: _Primitive
 asin_p: _Primitive
 asinh_p: _Primitive
+asinpi_p: _Primitive
 atan2_p: _Primitive
+atan2pi_p: _Primitive
 atan_p: _Primitive
 atanh_p: _Primitive
+atanpi_p: _Primitive
 axis_index_p: _Primitive
 bessel_i0e_p: _Primitive
 bessel_i1e_p: _Primitive
@@ -1856,6 +1882,7 @@ conv_general_dilated_p: _Primitive
 copy_p: _Primitive
 cos_p: _Primitive
 cosh_p: _Primitive
+cospi_p: _Primitive
 create_token_p: _Primitive
 cumlogsumexp_p: _Primitive
 cummax_p: _Primitive
@@ -1874,10 +1901,13 @@ erf_inv_p: _Primitive
 erf_p: _Primitive
 erfc_p: _Primitive
 exp2_p: _Primitive
+exp2m1_p: _Primitive
 exp_p: _Primitive
 expm1_p: _Primitive
 fft_p: _Primitive
 floor_p: _Primitive
+fma_p: _Primitive
+fmuladd_p: _Primitive
 gather_p: _Primitive
 ge_p: _Primitive
 gt_p: _Primitive
@@ -1894,6 +1924,7 @@ lgamma_p: _Primitive
 linear_solve_p: _Primitive
 log1p_p: _Primitive
 log2_p: _Primitive
+log2p1_p: _Primitive
 log_p: _Primitive
 logistic_p: _Primitive
 lt_p: _Primitive
@@ -1959,6 +1990,7 @@ shift_right_logical_p: _Primitive
 sign_p: _Primitive
 sin_p: _Primitive
 sinh_p: _Primitive
+sinpi_p: _Primitive
 slice_p: _Primitive
 sort_p: _Primitive
 split_p: _Primitive
@@ -1971,6 +2003,7 @@ stop_gradient_p: _Primitive
 sub_p: _Primitive
 tan_p: _Primitive
 tanh_p: _Primitive
+tanpi_p: _Primitive
 tile_p: _Primitive
 top_k_p: _Primitive
 transpose_p: _Primitive

@@ -41,8 +41,16 @@ def test_unary_elementwise() -> None:
     assert_shape(lax.one_minus_square(mat).shape, (2, 3))
     assert_shape(lax.sqrt(vec).shape, (4,))
     assert_shape(lax.sin(mat).shape, (2, 3))
+    assert_shape(lax.sinpi(mat).shape, (2, 3))
     assert_shape(lax.cos(tensor).shape, (2, 3, 4))
+    assert_shape(lax.cospi(tensor).shape, (2, 3, 4))
     assert_shape(lax.tan(vec).shape, (4,))
+    assert_shape(lax.tanpi(vec).shape, (4,))
+    assert_shape(lax.acospi(vec).shape, (4,))
+    assert_shape(lax.asinpi(vec).shape, (4,))
+    assert_shape(lax.atanpi(vec).shape, (4,))
+    assert_shape(lax.exp2m1(mat).shape, (2, 3))
+    assert_shape(lax.log2p1(mat).shape, (2, 3))
     assert_shape(lax.tanh(mat).shape, (2, 3))
     assert_shape(lax.ceil(vec).shape, (4,))
     assert_shape(lax.floor(mat).shape, (2, 3))
@@ -123,8 +131,15 @@ def test_binary_broadcasting_same_rank() -> None:
     assert_shape(lax.max(a3d, b3d).shape, (2, 3, 4))
     assert_shape(lax.min(a3d, b3d).shape, (2, 3, 4))
     assert_shape(lax.atan2(a3d, b3d).shape, (2, 3, 4))
+    assert_shape(lax.atan2pi(a3d, b3d).shape, (2, 3, 4))
     assert_shape(lax.pow(a3d, b3d).shape, (2, 3, 4))
     assert_shape(lax.rem(a3d, b3d).shape, (2, 3, 4))
+
+    c3d = jnp.ones((2, 3, 1))
+    assert_shape(lax.fma(a3d, b3d, c3d).shape, (2, 3, 4))
+    assert_shape(lax.fma(a3d, 2.0, c3d).shape, (2, 3, 4))
+    assert_shape(lax.fmuladd(a3d, b3d, c3d).shape, (2, 3, 4))
+    assert_shape(lax.fmuladd(2.0, b3d, 1.0).shape, (1, 3, 4))
 
 
 def test_binary_bitwise_and_comparison() -> None:
@@ -162,6 +177,16 @@ def test_binary_rejects_differing_non_scalar_ranks() -> None:
     else:
         raise AssertionError(
             "expected JAX to reject differing-rank non-scalar operands in lax.add"
+        )
+
+    try:
+        # E: Cannot evaluate type-level shape DSL call: arrays must have the same number of dimensions
+        lax.fma(row, mat, vec)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(
+            "expected JAX to reject differing-rank non-scalar operands in lax.fma"
         )
 
 
@@ -1396,6 +1421,9 @@ def test_compiler_and_misc() -> None:
     assert_shape(pd2.shape, (2, 3))
     assert_type(lax.abs_p, Primitive)
     assert isinstance(lax.abs_p, Primitive)
+    assert_type(lax.fma_p, Primitive)
+    assert isinstance(lax.fma_p, Primitive)
+    assert callable(lax.psum_scatter_start)
 
 
 def test_lax_linalg_arraylike() -> None:

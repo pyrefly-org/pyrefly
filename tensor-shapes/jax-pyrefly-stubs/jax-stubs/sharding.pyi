@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from jax._array import Array
+from jax._src.config import no_collectives as no_collectives
 from jax._src.core import ManualAxisType as ManualAxisType
 from jax._src.mesh import (
     AbstractDevice as AbstractDevice,
@@ -24,6 +25,7 @@ from jax._src.pjit import (
 from jax._src.sharding import Sharding as Sharding
 from jax._src.sharding_impls import (
     get_mesh as get_mesh,
+    is_single_device_sharding as is_single_device_sharding,
     make_single_device_sharding as make_single_device_sharding,
     NamedSharding as NamedSharding,
     set_mesh as set_mesh,

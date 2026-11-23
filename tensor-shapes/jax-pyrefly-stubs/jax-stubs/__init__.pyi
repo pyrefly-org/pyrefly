@@ -76,9 +76,10 @@ def jit[**P, R](
 def vmap(fun: Callable[..., Any], *args: Any, **kwargs: Any) -> Callable[..., Any]: ...
 
 # Remaining APIs mirror imports in jax/__init__.py,
-# generated here based on jax v0.11.2
+# generated here based on jax v0.12.1
 from jax import (
     api_util as api_util,
+    avals as avals,
     custom_batching as custom_batching,
     custom_derivatives as custom_derivatives,
     debug as debug,

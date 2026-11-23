@@ -52,8 +52,14 @@ def test_array_like() -> None:
 def test_dtype_like() -> None:
     accepts_dtype("float32")
     accepts_dtype(jnp.float32)
+    accepts_dtype(jnp.bcomplex32)
+    accepts_dtype(jnp.complex32)
     accepts_dtype(np.dtype("float32"))
     assert_shape(jnp.ones((2,), dtype=jnp.float32).shape, (2,))
+    assert jax.avals is not None
+    shd = jax.sharding.make_single_device_sharding(jax.devices()[0])
+    assert jax.sharding.is_single_device_sharding(shd) is True
+    assert jax.sharding.no_collectives is not None
 
 
 def test_scalar_type_protocol() -> None:

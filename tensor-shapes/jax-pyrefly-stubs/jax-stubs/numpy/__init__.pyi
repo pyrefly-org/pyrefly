@@ -3844,6 +3844,8 @@ double: _ScalarType
 csingle: _ScalarType
 cdouble: _ScalarType
 complex_: _ScalarType
+bcomplex32: _ScalarType
+complex32: _ScalarType
 complex64: _ScalarType
 complex128: _ScalarType
 float4_e2m1fn: _ScalarType
