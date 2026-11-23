@@ -21,7 +21,7 @@ class Tensor:
     shape: Size
     def item(self) -> int | float: ...
     def sum(self) -> "Tensor": ...
-    def to(self, device: device) -> "Tensor": ...
+    def to(self, device: object) -> "Tensor": ...
     def cuda(self) -> "Tensor": ...
 
 def zeros(*size: int, device: device | None = None) -> Tensor: ...
@@ -29,6 +29,8 @@ def ones(*size: int, device: device | None = None) -> Tensor: ...
 def empty(*size: int, device: device | None = None) -> Tensor: ...
 def randn(*size: int, device: device | None = None) -> Tensor: ...
 def rand(*size: int, device: device | None = None) -> Tensor: ...
+bool: object
+def randint(low: int, high: int, size: tuple[int, ...], *, dtype: object = ..., device: device | None = None) -> Tensor: ...
 def full(size: tuple[int, ...], fill_value: float, device: device | None = None) -> Tensor: ...
 def arange(start: float, end: float | None = None, step: float = 1, device: device | None = None) -> Tensor: ...
 "#,
@@ -258,6 +260,30 @@ import torch
 
 def f(device: torch.device) -> None:
     x = torch.randn(3, 4).to(device)  # E: `torch.randn(...).to(device)` creates the tensor on CPU first, then copies it
+"#,
+);
+
+testcase!(
+    test_redundant_to_on_randint,
+    env_with_lint(),
+    r#"
+import torch
+
+def f(device: torch.device) -> None:
+    x = torch.randint(0, 2, (2, 2, 1)).to(device)  # E: `torch.randint(...).to(device)` creates the tensor on CPU first, then copies it
+    y = torch.randint(0, 2, (2, 2, 1)).to(torch.bool)  # E: `torch.randint(...).to(device)` creates the tensor on CPU first, then copies it
+"#,
+);
+
+testcase!(
+    test_direct_randint_device_and_dtype_args_ok,
+    env_with_lint(),
+    r#"
+import torch
+
+def f(device: torch.device) -> None:
+    device_tensor = torch.randint(0, 2, (2, 2, 1), device=device)
+    bool_tensor = torch.randint(0, 2, (2, 2, 1), dtype=torch.bool)
 "#,
 );
 

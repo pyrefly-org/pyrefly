@@ -2081,6 +2081,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             "empty",
             "randn",
             "rand",
+            "randint",
             "full",
             "arange",
             "linspace",
