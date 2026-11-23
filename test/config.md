@@ -186,3 +186,31 @@ ERROR */empty_only.toml: a config with a value is required for `only` (glob)
 Fatal configuration error
 [1]
 ```
+
+## Relative imports work outside the import root (gh-5594)
+
+```scrut {output_stream: stderr}
+$ mkdir -p $TMPDIR/relimport5594/src/mypkg $TMPDIR/relimport5594/tests/sub && \
+> printf '[project]\nname = "mypkg"\nversion = "0"\n\n[tool.pyrefly]\nproject-includes = ["src", "tests"]\n' > $TMPDIR/relimport5594/pyproject.toml && \
+> touch $TMPDIR/relimport5594/src/mypkg/__init__.py $TMPDIR/relimport5594/tests/__init__.py $TMPDIR/relimport5594/tests/sub/__init__.py && \
+> echo 'X = 1' > $TMPDIR/relimport5594/tests/sub/helpers.py && \
+> echo 'from .helpers import X' > $TMPDIR/relimport5594/tests/sub/test_a.py && \
+> echo 'from .sub.helpers import X' > $TMPDIR/relimport5594/tests/test_b.py && \
+> cd $TMPDIR/relimport5594 && $PYREFLY check
+ INFO Checking project configured at `*/pyproject.toml` (glob)
+ INFO 0 errors
+[0]
+```
+
+## Relative imports outside the import root fully resolve (gh-5594)
+
+```scrut {output_stream: stdout}
+$ mkdir -p $TMPDIR/relimport5594_bad/src/mypkg $TMPDIR/relimport5594_bad/tests/sub && \
+> printf '[project]\nname = "mypkg"\nversion = "0"\n\n[tool.pyrefly]\nproject-includes = ["src", "tests"]\n' > $TMPDIR/relimport5594_bad/pyproject.toml && \
+> touch $TMPDIR/relimport5594_bad/src/mypkg/__init__.py $TMPDIR/relimport5594_bad/tests/__init__.py $TMPDIR/relimport5594_bad/tests/sub/__init__.py && \
+> echo 'X = 1' > $TMPDIR/relimport5594_bad/tests/sub/helpers.py && \
+> printf 'from .helpers import X\nbad: str = X\n' > $TMPDIR/relimport5594_bad/tests/sub/test_a.py && \
+> cd $TMPDIR/relimport5594_bad && $PYREFLY check --output-format=min-text
+ERROR *test_a.py* ?bad-assignment? (glob)
+[1]
+```

@@ -87,6 +87,10 @@ It is only constructed when
 [`disable-search-path-heuristics`](configuration.mdx#disable-search-path-heuristics)
 is not set.
 
+When a config file does mark the project root but no other fallback applies, the
+directory containing the config file acts as the fallback root, so files outside the
+import root (such as `tests/` next to `src/`) still resolve their imports.
+
 For an unknown project root, the fallback search path consists of each directory from
 the directory containing a given file to the root of your filesystem. For example, if
 you have the following setup:

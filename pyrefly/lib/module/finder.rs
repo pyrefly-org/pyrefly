@@ -792,8 +792,9 @@ pub(crate) fn find_import_with_mode(
         // Without a config file, the guessed fallback search path stands in for the project
         // root, which comes before site packages at runtime, so it is searched here. The
         // directory-relative fallback search path is a last resort and is searched at the
-        // very end instead.
-        && let FallbackSearchPath::Explicit(fallback_search_path) = &config.fallback_search_path
+        // very end instead. With a config file but no configured fallback, the config
+        // root acts as the fallback root, so files outside the import root resolve.
+        && let Some(fallback_search_path) = config.effective_explicit_fallback_paths()
         && let Some(path) = find_module(
             module,
             fallback_search_path.iter().filter(|path| {

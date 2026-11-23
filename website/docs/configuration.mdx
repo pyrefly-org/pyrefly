@@ -345,7 +345,7 @@ the most common ways of setting up and configuring your project, on top of any
 [`search-path`](#search-path) entries you may pass in through the CLI or
 set in your config.
 
-The three heuristics that are currently supported are:
+The four heuristics that are currently supported are:
 
 1. Adding your import root to the end of your search path. Your import root is
    a `src/` directory in the same directory as a config file, the parent directory
@@ -360,6 +360,9 @@ The three heuristics that are currently supported are:
    names of modules under `src/`.
 3. If no project root can be inferred, each directory from the given file to `/`
    will be added as a fallback search path.
+4. If a config is found but no other fallback search path applies, the directory
+   containing the config file is used as a fallback search path, so files outside
+   the import root (such as `tests/` next to `src/`) still resolve their imports.
 
 See more on [how Pyrefly does import resolution](import-resolution.mdx).
 
