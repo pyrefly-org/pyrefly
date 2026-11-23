@@ -21,7 +21,8 @@ tar = "0.4.46"
 zstd = { version = "0.14.3", features = ["experimental", "zstdmt"] }
 
 [features]
-default = ["third-party-stubs"]
+default = ["sandbox-stubs", "third-party-stubs"]
+sandbox-stubs = []
 third-party-stubs = []
 
 [lints]

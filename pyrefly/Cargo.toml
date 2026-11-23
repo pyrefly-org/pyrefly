@@ -124,6 +124,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 [features]
 debug-stack-overflow = ["dep:backtrace-on-stack-overflow"]
 default = ["third-party-stubs"]
+sandbox-stubs = ["pyrefly_bundled/sandbox-stubs"]
 third-party-stubs = ["pyrefly_bundled/third-party-stubs"]
 
 [lints]

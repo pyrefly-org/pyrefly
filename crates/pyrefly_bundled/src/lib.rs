@@ -45,6 +45,12 @@ static BUNDLED_THIRD_PARTY_INDEX: &str = include_str!(concat!(env!("OUT_DIR"), "
 pub const BUNDLED_THIRD_PARTY_DIGEST: &[u8; 32] =
     include_bytes!(concat!(env!("OUT_DIR"), "/stubs.sha256"));
 
+/// Empty unless the target is wasm32; see this crate's `build.rs`.
+static BUNDLED_SANDBOX_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/sandbox_stubs.tar.zst"));
+
+static BUNDLED_SANDBOX_INDEX: &str = include_str!(concat!(env!("OUT_DIR"), "/sandbox_stubs.index"));
+
 #[derive(Clone, Copy)]
 enum PathFilter {
     /// Filter for stdlib files (typeshed/stdlib/...)
@@ -53,6 +59,8 @@ enum PathFilter {
     ThirdPartyTypeshedStubs,
     /// Filter for third-party stubs not from typeshed (stubs/package-name/...)
     ThirdPartyStubs,
+    /// Filter for sandbox-only third-party stubs (sandbox/package-name/...)
+    SandboxStubs,
 }
 
 impl PathFilter {
@@ -60,7 +68,7 @@ impl PathFilter {
         match self {
             PathFilter::Stdlib => Some("stdlib"),
             PathFilter::ThirdPartyTypeshedStubs => Some("stubs"),
-            PathFilter::ThirdPartyStubs => None,
+            PathFilter::ThirdPartyStubs | PathFilter::SandboxStubs => None,
         }
     }
 
@@ -69,6 +77,7 @@ impl PathFilter {
             PathFilter::Stdlib => BUNDLED_TYPESHED_BYTES,
             PathFilter::ThirdPartyTypeshedStubs => BUNDLED_TYPESHED_THIRD_PARTY_BYTES,
             PathFilter::ThirdPartyStubs => BUNDLED_THIRD_PARTY_BYTES,
+            PathFilter::SandboxStubs => BUNDLED_SANDBOX_BYTES,
         }
     }
 
@@ -77,6 +86,7 @@ impl PathFilter {
             PathFilter::Stdlib => BUNDLED_TYPESHED_INDEX,
             PathFilter::ThirdPartyTypeshedStubs => BUNDLED_TYPESHED_THIRD_PARTY_INDEX,
             PathFilter::ThirdPartyStubs => BUNDLED_THIRD_PARTY_INDEX,
+            PathFilter::SandboxStubs => BUNDLED_SANDBOX_INDEX,
         }
     }
 
@@ -109,7 +119,7 @@ impl PathFilter {
                     .map(str::to_owned);
                 (components.collect(), package)
             }
-            PathFilter::ThirdPartyStubs => {
+            PathFilter::ThirdPartyStubs | PathFilter::SandboxStubs => {
                 // Include first_component (e.g., "conans-stubs") in the path
                 let mut path = PathBuf::from(first_component?.as_os_str());
                 path.extend(components);
@@ -220,6 +230,18 @@ pub fn bundled_third_party_paths() -> Vec<PathBuf> {
 /// These are stubs that are not included in typeshed (e.g., pandas-stubs, boto3-stubs).
 pub fn bundled_third_party() -> anyhow::Result<SmallMap<PathBuf, String>> {
     extract_files_from_archive(PathFilter::ThirdPartyStubs)
+}
+
+/// The paths of the third-party stubs embedded only in the WASM sandbox. The
+/// archive is empty for native targets.
+pub fn bundled_sandbox_paths() -> Vec<PathBuf> {
+    archive_paths(PathFilter::SandboxStubs).paths
+}
+
+/// Extract the third-party stubs embedded only in the WASM sandbox. Native
+/// builds see an empty map.
+pub fn bundled_sandbox_stubs() -> anyhow::Result<SmallMap<PathBuf, String>> {
+    extract_files_from_archive(PathFilter::SandboxStubs)
 }
 
 #[cfg(test)]

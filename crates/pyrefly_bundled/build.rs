@@ -38,6 +38,13 @@ fn get_stubs_input_path() -> PathBuf {
     }
 }
 
+fn get_sandbox_stubs_input_path() -> PathBuf {
+    match env::var_os("SANDBOX_STUBS_ROOT") {
+        Some(root) => Path::new(&root).join("sandbox"),
+        None => PathBuf::from("sandbox"),
+    }
+}
+
 fn get_output_path() -> Result<PathBuf, std::env::VarError> {
     // When building with Buck, output artifact directory is specified using this env var
     match env::var_os("OUT") {
@@ -149,6 +156,15 @@ fn main() -> Result<(), std::io::Error> {
     // simply resolves no third-party imports.
     let third_party = env::var_os("CARGO_FEATURE_THIRD_PARTY_STUBS").is_some();
 
+    let target_wasm32 = env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32");
+    if target_wasm32 {
+        println!("cargo::rerun-if-env-changed=CARGO_FEATURE_SANDBOX_STUBS");
+    }
+    let sandbox_stubs = target_wasm32 && env::var_os("CARGO_FEATURE_SANDBOX_STUBS").is_some();
+    if sandbox_stubs {
+        println!("cargo::rerun-if-changed=sandbox");
+    }
+
     // Create separate archives so each runtime bundle only decodes its own files.
     let typeshed_input = get_typeshed_input_path();
     create_archive(
@@ -182,6 +198,15 @@ fn main() -> Result<(), std::io::Error> {
         &stubs_output,
         "stubs.sha256",
         "stubs.index",
+    )?;
+
+    let sandbox_stubs_output = output_dir.join("sandbox_stubs.tar.zst");
+    create_archive(
+        sandbox_stubs.then(get_sandbox_stubs_input_path).as_deref(),
+        "",
+        &sandbox_stubs_output,
+        "sandbox_stubs.sha256",
+        "sandbox_stubs.index",
     )?;
 
     Ok(())
