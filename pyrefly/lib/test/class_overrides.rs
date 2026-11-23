@@ -2456,7 +2456,7 @@ class A:
         raise NotImplementedError()
 
 class B(A):
-    def aload(self):  # E: overrides parent class `A` in an inconsistent manner
+    def aload(self):  # E: is not assignable to `() -> Coroutine[Any, Any, Unknown]`, the type of `A.aload`
         return {}
     "#,
 );

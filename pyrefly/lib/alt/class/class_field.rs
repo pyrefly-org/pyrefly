@@ -4900,9 +4900,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                     let any_implicit = self.heap.mk_any_implicit();
                     let relaxed_ret = if is_async {
+                        // Only the return is relaxed. The yield and send types stay the
+                        // explicit `Any`s of every `async def`.
+                        let any_explicit = self.heap.mk_any_explicit();
                         self.heap.mk_class_type(self.stdlib.coroutine(
-                            any_implicit.clone(),
-                            any_implicit.clone(),
+                            any_explicit.clone(),
+                            any_explicit,
                             any_implicit,
                         ))
                     } else {
