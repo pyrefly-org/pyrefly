@@ -1,0 +1,23 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+from polars.series.utils import expr_dispatch
+from polars import Series
+from polars._plr import PySeries
+from polars._typing import IntoExpr
+
+
+@expr_dispatch
+class MapNameSpace:
+    def __init__(self, series: Series) -> None: ...
+
+    def entries(self) -> Series: ...
+
+    def keys(self) -> Series: ...
+
+    def values(self) -> Series: ...
+
+    def len(self) -> Series: ...
+
+    def contains_key(self, key: IntoExpr) -> Series: ...
+
+    def get(self, key: IntoExpr) -> Series: ...

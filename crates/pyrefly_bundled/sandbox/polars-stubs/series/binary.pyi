@@ -1,0 +1,39 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+from polars.series.utils import expr_dispatch
+from polars import Series
+from polars._plr import PySeries
+from polars._typing import (
+        Endianness,
+        IntoExpr,
+        PolarsDataType,
+        SizeUnit,
+        TransferEncoding,
+    )
+
+
+@expr_dispatch
+class BinaryNameSpace:
+    def __init__(self, series: Series) -> None: ...
+
+    def contains(self, literal: IntoExpr) -> Series: ...
+
+    def ends_with(self, suffix: IntoExpr) -> Series: ...
+
+    def starts_with(self, prefix: IntoExpr) -> Series: ...
+
+    def decode(self, encoding: TransferEncoding, *, strict: bool = True) -> Series: ...
+
+    def encode(self, encoding: TransferEncoding) -> Series: ...
+
+    def size(self, unit: SizeUnit = "b") -> Series: ...
+
+    def reinterpret(self, *, dtype: PolarsDataType, endianness: Endianness = "little") -> Series: ...
+
+    def slice(self, offset: int, length: int | None = None) -> Series: ...
+
+    def get(self, index: int | IntoExpr, *, null_on_oob: bool = False) -> Series: ...
+
+    def head(self, n: int = 5) -> Series: ...
+
+    def tail(self, n: int = 5) -> Series: ...
