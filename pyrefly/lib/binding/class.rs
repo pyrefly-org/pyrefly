@@ -1621,7 +1621,20 @@ impl<'a> BindingsBuilder<'a> {
         self.ensure_expr(new_type_name, class_object.usage());
         self.check_functional_definition_name(&name.id, new_type_name, ErrorKind::InvalidArgument);
         self.ensure_type(base, None, Evaluation::Eager);
-        self.bind_unread_keywords(keywords);
+        // NewType accepts exactly two positional arguments and no keywords.
+        for kw in keywords {
+            self.ensure_expr(&mut kw.value, class_object.usage());
+            let msg = if let Some(name) = &kw.arg {
+                format!("Unrecognized keyword argument `{name}`")
+            } else {
+                "Unpacking is not supported".to_owned()
+            };
+            self.error(
+                kw.range(),
+                ErrorKind::InvalidArgument,
+                format!("{msg} in NewType definition"),
+            );
+        }
         self.synthesize_class_def(
             class_name,
             class_object,
