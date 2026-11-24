@@ -2041,8 +2041,8 @@ def check[M: IntVar](
     assert_type(InferredBox(3), InferredBox[Int[3]])
     assert_type(InferredBox(3).result(), Tensor[[3]])
     assert_type(InferredBox(symbolic).result(), Tensor[[M]])
-    bounded(True)  # E: While checking parameter `x`, `bool` is not assignable to upper bound `Int[int]` of type variable `N`
-    bounded("nope")  # E: While checking parameter `x`, `str` is not assignable to upper bound `Int[int]` of type variable `N`
+    bounded(True)  # E: While checking parameter `x`: `bool` is not assignable to upper bound `Int[int]` of type variable `N`
+    bounded("nope")  # E: While checking parameter `x`: `str` is not assignable to upper bound `Int[int]` of type variable `N`
 
 def check_union(value: Int[3] | Int[4]) -> None:
     assert_type(bounded(value), Tensor[[int]])
@@ -2057,7 +2057,7 @@ def check_accumulated_upper_bound(
 class MyInt(int): ...
 
 def check_int_subclass(value: MyInt) -> None:
-    bounded(value)  # E: While checking parameter `x`, `MyInt` is not assignable to upper bound `Int[int]` of type variable `N`
+    bounded(value)  # E: While checking parameter `x`: `MyInt` is not assignable to upper bound `Int[int]` of type variable `N`
 
 # An `Int`-bound variable that substitution never resolves evaluates as the
 # gradual size, not as a symbolic dimension: only `IntVar` carries symbols.
@@ -12987,8 +12987,8 @@ def unpacked(middle: tuple[tuple[int, ...], ...]) -> None:
         ShapeTuple[tuple[IntTuple[2], *tuple[IntTuple, ...], IntTuple[3, 4]]],
     )
 
-capture(((2,), ("bad",)))  # E: While checking parameter `shapes`, `tuple[IntTuple[2], tuple[Literal['bad']]]` is not assignable to upper bound `tuple[IntTuple, ...]` of type variable `Shapes`
-capture((2, 3))  # E: While checking parameter `shapes`, `tuple[Literal[2], Literal[3]]` is not assignable to upper bound `tuple[IntTuple, ...]` of type variable `Shapes`
+capture(((2,), ("bad",)))  # E: While checking parameter `shapes`: `tuple[IntTuple[2], tuple[Literal['bad']]]` is not assignable to upper bound `tuple[IntTuple, ...]` of type variable `Shapes`
+capture((2, 3))  # E: While checking parameter `shapes`: `tuple[Literal[2], Literal[3]]` is not assignable to upper bound `tuple[IntTuple, ...]` of type variable `Shapes`
 
 narrow: Narrow[tuple[IntTuple[3], ...]]  # E: is not assignable to upper bound `tuple[IntTuple[2], ...]`
 "#,

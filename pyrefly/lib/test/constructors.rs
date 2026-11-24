@@ -1381,13 +1381,13 @@ class Holder[T: int]:
     def __init__(self, value: T, fallback: T) -> None: ...
 
 Holder(1, 2)
-Holder(1, "bad fallback")  # E: While checking parameter `fallback`, `str` is not assignable to upper bound `int` of type variable `T`
-Holder(1, fallback="bad fallback")  # E: While checking parameter `fallback`, `str` is not assignable to upper bound `int` of type variable `T`
+Holder(1, "bad fallback")  # E: While checking parameter `fallback`: `str` is not assignable to upper bound `int` of type variable `T`
+Holder(1, fallback="bad fallback")  # E: While checking parameter `fallback`: `str` is not assignable to upper bound `int` of type variable `T`
 
 class FromNew[T: int]:
     def __new__(cls, first: T, second: T) -> "FromNew[T]": ...
 
-FromNew(1, "bad second")  # E: While checking parameter `second`, `str` is not assignable to upper bound `int` of type variable `T`
+FromNew(1, "bad second")  # E: While checking parameter `second`: `str` is not assignable to upper bound `int` of type variable `T`
 "#,
 );
 
@@ -1478,7 +1478,7 @@ from typing import Self
 class A:
     def __new__(cls: type[Self]): ...
 A.__new__(A)  # OK
-A.__new__(int) # E: While checking parameter `cls`, `int` is not assignable to upper bound `A` of type variable `Self@A`
+A.__new__(int) # E: While checking parameter `cls`: `int` is not assignable to upper bound `A` of type variable `Self@A`
     "#,
 );
 
@@ -1488,7 +1488,7 @@ testcase!(
 class A:
     def __new__(cls): ...
 A.__new__(A)  # OK
-A.__new__(int)  # E: While checking parameter `cls`, `int` is not assignable to upper bound `A` of type variable `Self@A`
+A.__new__(int)  # E: While checking parameter `cls`: `int` is not assignable to upper bound `A` of type variable `Self@A`
     "#,
 );
 
@@ -1852,7 +1852,7 @@ class A(Generic[T]):
     def __new__(cls, x: T) -> A[T]: ...
 
 assert_type(A(0), A[int])
-A("oops")  # E: While checking parameter `x`, `str` is not assignable to upper bound `int` of type variable `T`
+A("oops")  # E: While checking parameter `x`: `str` is not assignable to upper bound `int` of type variable `T`
     "#,
 );
 

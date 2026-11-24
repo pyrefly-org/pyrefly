@@ -4326,7 +4326,7 @@ def f[T: str](x: T) -> TypeGuard[T]:
     return True
 
 def g(x: int | str):
-    if f(x):  # E: While checking parameter `x`, `int | str` is not assignable to upper bound `str` of type variable `T`
+    if f(x):  # E: While checking parameter `x`: `int | str` is not assignable to upper bound `str` of type variable `T`
         pass
     "#,
 );

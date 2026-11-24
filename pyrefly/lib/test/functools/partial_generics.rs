@@ -79,7 +79,7 @@ reveal_type(fp(1))  # E: revealed type: int
 reveal_type(fp("a"))  # E: revealed type: str
 fp(1)
 fp("a")
-fp(object())  # E: While checking parameter `y`, `object` is not assignable to any of constraints `int`, `str` of type variable `T`
+fp(object())  # E: While checking parameter `y`: `object` is not assignable to any of constraints `int`, `str` of type variable `T`
 "#,
 );
 

@@ -950,7 +950,7 @@ class Box(Generic[defs.T]):
 
 def check(b: Box[str], s: defs.Sub) -> None:
     assert_type(b.pair("ok", s), tuple[str, defs.Sub])
-    b.pair("ok", 123)  # E: While checking parameter `y`, `int` is not assignable to upper bound `Base[Unknown]` of type variable `BoundT`
+    b.pair("ok", 123)  # E: While checking parameter `y`: `int` is not assignable to upper bound `Base[Unknown]` of type variable `BoundT`
 "#,
 );
 

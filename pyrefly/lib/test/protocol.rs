@@ -2592,7 +2592,7 @@ def f[T: A](a: T) -> T:
     return a
 def g(b: B, c: C):
     f(b)
-    f(c)  # E: While checking parameter `a`, `C` is not assignable to upper bound `A` of type variable `T`
+    f(c)  # E: While checking parameter `a`: `C` is not assignable to upper bound `A` of type variable `T`
     "#,
 );
 

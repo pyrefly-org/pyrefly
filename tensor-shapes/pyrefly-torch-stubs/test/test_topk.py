@@ -98,7 +98,7 @@ if TYPE_CHECKING:
     def check_invalid_k_type[T, S: str](
         x: Tensor[[4, 32]], unconstrained: T, string: S
     ) -> None:
-        # E: While checking parameter `k`, `T` is not assignable to upper bound `Int[int]` of type variable `K`
+        # E: While checking parameter `k`: `T` is not assignable to upper bound `Int[int]` of type variable `K`
         torch.topk(x, unconstrained)
-        # E: While checking parameter `k`, `S` is not assignable to upper bound `Int[int]` of type variable `K`
+        # E: While checking parameter `k`: `S` is not assignable to upper bound `Int[int]` of type variable `K`
         torch.topk(x, string)

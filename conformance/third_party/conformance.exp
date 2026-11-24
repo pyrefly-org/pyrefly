@@ -5893,8 +5893,8 @@
     {
       "code": -2,
       "column": 20,
-      "concise_description": "While checking parameter `y`, `str` is not assignable to upper bound `int` of type variable `T_int`",
-      "description": "While checking parameter `y`, `str` is not assignable to upper bound `int` of type variable `T_int`",
+      "concise_description": "While checking parameter `y`: `str` is not assignable to upper bound `int` of type variable `T_int`",
+      "description": "While checking parameter `y`: `str` is not assignable to upper bound `int` of type variable `T_int`",
       "line": 241,
       "name": "bad-specialization",
       "severity": "error",
@@ -8467,8 +8467,8 @@
     {
       "code": -2,
       "column": 7,
-      "concise_description": "While checking parameter `y`, `int` is not assignable to upper bound `Sized` of type variable `ST`",
-      "description": "While checking parameter `y`, `int` is not assignable to upper bound `Sized` of type variable `ST`",
+      "concise_description": "While checking parameter `y`: `int` is not assignable to upper bound `Sized` of type variable `ST`",
+      "description": "While checking parameter `y`: `int` is not assignable to upper bound `Sized` of type variable `ST`",
       "line": 52,
       "name": "bad-specialization",
       "severity": "error",
@@ -9060,8 +9060,8 @@
     {
       "code": -2,
       "column": 21,
-      "concise_description": "While checking parameter `s`, `str` is not assignable to upper bound `LiteralString` of type variable `TLiteral`",
-      "description": "While checking parameter `s`, `str` is not assignable to upper bound `LiteralString` of type variable `TLiteral`",
+      "concise_description": "While checking parameter `s`: `str` is not assignable to upper bound `LiteralString` of type variable `TLiteral`",
+      "description": "While checking parameter `s`: `str` is not assignable to upper bound `LiteralString` of type variable `TLiteral`",
       "line": 119,
       "name": "bad-specialization",
       "severity": "error",
@@ -9082,8 +9082,8 @@
     {
       "code": -2,
       "column": 50,
-      "concise_description": "While checking parameter `value`, `str` is not assignable to upper bound `LiteralString` of type variable `T`",
-      "description": "While checking parameter `value`, `str` is not assignable to upper bound `LiteralString` of type variable `T`",
+      "concise_description": "While checking parameter `value`: `str` is not assignable to upper bound `LiteralString` of type variable `T`",
+      "description": "While checking parameter `value`: `str` is not assignable to upper bound `LiteralString` of type variable `T`",
       "line": 133,
       "name": "bad-specialization",
       "severity": "error",
