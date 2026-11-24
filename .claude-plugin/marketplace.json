@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "pyrefly",
+  "description": "Claude Code plugins for Pyrefly, a fast type checker and language server for Python",
+  "owner": {
+    "name": "Meta"
+  },
+  "plugins": [
+    {
+      "name": "pyrefly-lsp",
+      "description": "Python language server (Pyrefly) for type checking and code intelligence",
+      "source": "./lsp/claude-code",
+      "category": "development"
+    }
+  ]
+}
