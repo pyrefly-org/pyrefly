@@ -24,7 +24,7 @@ jax==0.12.1
 # resolve freely under a pinned `jax`.
 jaxlib==0.12.1
 torch==2.12.1+cpu ; sys_platform != "darwin"
-torch==2.12.1 ; sys_platform == "darwin"
+torch==2.12.1+cpu ; sys_platform == "darwin"
 
 # Checkers run by pyrefly-shape-extensions/compatibility_tests, which check that
 # `Shaped` annotations stay readable to them. Pinned for the same reason as the
