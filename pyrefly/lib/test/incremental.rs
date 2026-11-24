@@ -4126,9 +4126,9 @@ from bar import Box, f, g
 def use(b: Box) -> None:
     assert_type(b, Box[int])
 f(1)
-f("x")  # E: Argument `str` is not assignable to parameter `x` with type variable `C` (upper bound `int`)
+f("x")  # E: While checking parameter `x`, `str` is not assignable to upper bound `int` of type variable `C`
 g(1)
-g("x")  # E: Argument `str` is not assignable to parameter `x` with type variable `T` (upper bound `int`)
+g("x")  # E: While checking parameter `x`, `str` is not assignable to upper bound `int` of type variable `T`
 "#;
     init_test();
     let config = |modules: &[(&str, &str)]| {

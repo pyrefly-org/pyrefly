@@ -1406,13 +1406,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let parameter = e
                 .argument
                 .and_then(|argument| argmap?.parameter_name(argument));
-            self.error_with_context(
-                errors,
-                range,
-                kind,
-                e.to_error_msg(self, parameter),
-                context,
-            );
+            let msg = e.to_error_msg(self);
+            let msg = match parameter {
+                Some(parameter) => {
+                    // Every specialization error message starts with an ASCII character.
+                    let (first, rest) = msg.split_at(1);
+                    format!(
+                        "While checking parameter `{parameter}`, {}{rest}",
+                        first.to_ascii_lowercase()
+                    )
+                }
+                None => msg,
+            };
+            self.error_with_context(errors, range, kind, msg, context);
         }
     }
 

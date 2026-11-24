@@ -2086,7 +2086,7 @@ testcase!(
 class C:
     def f[T: int](self: T) -> T:
         return self
-C().f()  # E: Argument `C` is not assignable to parameter `self` with type variable `T` (upper bound `int`)
+C().f()  # E: While checking parameter `self`, `C` is not assignable to upper bound `int` of type variable `T`
     "#,
 );
 

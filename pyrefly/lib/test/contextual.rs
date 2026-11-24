@@ -906,7 +906,7 @@ class B(A): ...
 def f[T: Sequence[list[A]]](x: T) -> T:
     return x
 # When the top-level hint is a Var, we ignore it, so the Var restriction isn't used as a hint.
-f(([B()],))  # E: Argument `tuple[list[B]]` is not assignable to parameter `x` with type variable `T` (upper bound `Sequence[list[A]]`)
+f(([B()],))  # E: While checking parameter `x`, `tuple[list[B]]` is not assignable to upper bound `Sequence[list[A]]` of type variable `T`
     "#,
 );
 
@@ -933,7 +933,7 @@ def f3[T: list[A]](x: Sequence[T]) -> T:
 # `decompose_tuple` accidentally drops the relationship between the Unwrap var we create to collect
 # the hint and the Quantified var created from T because `is_subset_eq_var` unifies the latter
 # into the former, losing the information that the Unwrap var has collected a bound.
-f3(([B()],))  # E: Argument `list[B]` is not assignable to parameter `x` with type variable `T` (upper bound `list[A]`)
+f3(([B()],))  # E: While checking parameter `x`, `list[B]` is not assignable to upper bound `list[A]` of type variable `T`
     "#,
 );
 

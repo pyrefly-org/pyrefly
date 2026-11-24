@@ -2990,21 +2990,15 @@ impl TypeVarSpecializationError {
         }
     }
 
-    pub fn to_error_msg<Ans: LookupAnswer>(
-        self,
-        ans: &AnswersSolver<Ans>,
-        parameter: Option<&Name>,
-    ) -> String {
+    pub fn to_error_msg<Ans: LookupAnswer>(self, ans: &AnswersSolver<Ans>) -> String {
         use TypeVarSpecializationErrorKind::*;
-        let parameter_context =
-            parameter.map_or_else(String::new, |name| format!(" for parameter `{name}`"));
         match self.kind {
             BadShapeExtensionSpecialization {
                 name,
                 got,
                 restriction,
             } => format!(
-                "`{}` is not a valid `{restriction}` value for type variable `{name}`{parameter_context}",
+                "`{}` is not a valid `{restriction}` value for type variable `{name}`",
                 ans.display(got),
             ),
             ConflictingShapeExtensionSpecialization {
@@ -3013,13 +3007,13 @@ impl TypeVarSpecializationError {
                 constraint,
                 restriction,
             } => format!(
-                "`{}` is incompatible with selected `{}` value `{}` for type variable `{name}`{parameter_context}",
+                "`{}` is incompatible with selected `{}` value `{}` for type variable `{name}`",
                 ans.display(constraint),
                 restriction.kind_name(),
                 ans.display(selected),
             ),
             BadBoundSpecialization { name, got, want } => {
-                TypeCheckKind::TypeVarSpecialization(name, parameter.cloned()).format_error(
+                TypeCheckKind::TypeVarSpecialization(name).format_error(
                     ans,
                     &ans.for_display(got),
                     &ans.for_display(want),
@@ -3027,24 +3021,17 @@ impl TypeVarSpecializationError {
                 )
             }
             BadConstraintSpecialization { name, got, want } => {
-                let got = ans.display(got);
-                let constraints = want
-                    .into_iter()
-                    .map(|want| format!("`{}`", ans.display(want)))
-                    .join(", ");
-                if let Some(parameter) = parameter {
-                    format!(
-                        "Argument `{got}` is not assignable to parameter `{parameter}` with type variable `{name}` (expected one of {constraints})"
-                    )
-                } else {
-                    format!(
-                        "`{got}` is not assignable to any of constraints {constraints} of type variable `{name}`"
-                    )
-                }
+                format!(
+                    "`{}` is not assignable to any of constraints {} of type variable `{name}`",
+                    ans.display(got),
+                    want.into_iter()
+                        .map(|want| format!("`{}`", ans.display(want)))
+                        .join(", ")
+                )
             }
             IncompatibleOverloadArgument { solved_constraints } => {
                 format!(
-                    "Overload type{parameter_context} was not compatible with solved type variables: {}",
+                    "Overload type was not compatible with solved type variables: {}",
                     solved_constraints
                         .into_iter()
                         .map(|(name, ty)| format!("{} = {}", name, ans.display(ty)))
@@ -3896,6 +3883,13 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
         Some(argument.clone())
     }
 
+    fn specialization_error(
+        &self,
+        kind: TypeVarSpecializationErrorKind,
+    ) -> TypeVarSpecializationError {
+        TypeVarSpecializationError::new(kind, self.active_call_context.argument())
+    }
+
     fn quantified_satisfies_constraints(&mut self, q: &Quantified, constraints: &[Type]) -> bool {
         match q.restriction() {
             Restriction::Bound(b) => constraints.iter().any(|c| self.is_subset_eq(b, c).is_ok()),
@@ -4132,12 +4126,7 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                 }
             }
         };
-        (
-            answer,
-            error.map(|kind| {
-                TypeVarSpecializationError::new(kind, self.active_call_context.argument())
-            }),
-        )
+        (answer, error.map(|kind| self.specialization_error(kind)))
     }
 
     fn is_shape_extension_binding_source(&self, q: &Quantified, v: Var) -> bool {
@@ -4376,11 +4365,13 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                                 if !self.quantified_satisfies_constraints(q_t2, &constraints) {
                                     self.solver.instantiation_errors.write().insert(
                                         *v1,
-                                        TypeVarSpecializationError::new(TypeVarSpecializationErrorKind::BadConstraintSpecialization {
-                                            name,
-                                            got: t2.clone(),
-                                            want: constraints,
-                                        }, self.active_call_context.argument()),
+                                        self.specialization_error(
+                                            TypeVarSpecializationErrorKind::BadConstraintSpecialization {
+                                                name,
+                                                got: t2.clone(),
+                                                want: constraints,
+                                            },
+                                        ),
                                     );
                                 }
                             } else if let Some(constraint) =
@@ -4395,11 +4386,13 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                             } else if !t2.is_any() {
                                 self.solver.instantiation_errors.write().insert(
                                     *v1,
-                                    TypeVarSpecializationError::new(TypeVarSpecializationErrorKind::BadConstraintSpecialization {
-                                        name,
-                                        got: t2.clone(),
-                                        want: constraints,
-                                    }, self.active_call_context.argument()),
+                                    self.specialization_error(
+                                        TypeVarSpecializationErrorKind::BadConstraintSpecialization {
+                                            name,
+                                            got: t2.clone(),
+                                            want: constraints,
+                                        },
+                                    ),
                                 );
                             }
                         } else {
@@ -4409,13 +4402,12 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                             if self.is_subset_eq(t2, &bound).is_err() {
                                 self.solver.instantiation_errors.write().insert(
                                     *v1,
-                                    TypeVarSpecializationError::new(
+                                    self.specialization_error(
                                         TypeVarSpecializationErrorKind::BadBoundSpecialization {
                                             name,
                                             got: t2.clone(),
                                             want: bound,
                                         },
-                                        self.active_call_context.argument(),
                                     ),
                                 );
                             }

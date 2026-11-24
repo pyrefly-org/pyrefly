@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     def check_invalid_sample_count_type[T, S: str](
         probabilities: Tensor[[4, 32]], unconstrained: T, string: S
     ) -> None:
-        # E: Argument `T` is not assignable to parameter `num_samples` with type variable `NumSamples` (upper bound `Int[int]`)
+        # E: While checking parameter `num_samples`, `T` is not assignable to upper bound `Int[int]` of type variable `NumSamples`
         torch.multinomial(probabilities, unconstrained)
-        # E: Argument `S` is not assignable to parameter `num_samples` with type variable `NumSamples` (upper bound `Int[int]`)
+        # E: While checking parameter `num_samples`, `S` is not assignable to upper bound `Int[int]` of type variable `NumSamples`
         torch.multinomial(probabilities, string)

@@ -725,7 +725,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         let tcc = &|| {
                             TypeCheckContext::of_kind(TypeCheckKind::TypeVarSpecialization(
                                 param.name().clone(),
-                                None,
                             ))
                         };
                         // In a legacy type alias, one old-style TypeVar can be specialized with
