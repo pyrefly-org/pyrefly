@@ -1255,6 +1255,19 @@ f"{'text':.2f}"  # invalid-format-spec, if enabled
 f"{1:.2d}"  # invalid-format-spec, if enabled
 ```
 
+## invalid-ignore-comment
+
+Default severity: `warn`
+
+Malformed ignore comments are flagged without changing their lenient suppression effects: misspelled tool directives (`# pyrefly: ignoree`), unterminated lists (`# pyrefly: ignore[bad-code`), and empty lists (`# pyrefly: ignore[]`). Identifier extensions in `# type: <identifier>` can be ordinary type comments, so they are not flagged as typos.
+
+```python
+x: int = "oops"  # pyrefly: ignoree  # invalid-ignore-comment: did you mean `ignore`?
+
+# Fix: use a valid directive.
+y: int = "oops"  # pyrefly: ignore[bad-assignment]
+```
+
 ## invalid-inheritance
 
 An error caused by incorrect inheritance in a class or type definition.

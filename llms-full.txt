@@ -3904,8 +3904,8 @@ Examples:
 `Sub-Configs` are a method for overriding one or more config options for specific files based on
 filepath glob matching. Only certain config options are allowed to be overridden, and a need
 to override other configs means you likely need to use a separate config file for your subdirectory.
-You can have as many SubConfigs as you want in a project, and even multiple separate SubConfigs
-that can apply to a given file when the `matches` glob pattern matches.
+You can have as many SubConfigs as you want in a project, and multiple SubConfigs can apply
+to the same file.
 
 #### **SubConfig Allowed Overrides**
 
@@ -3942,15 +3942,16 @@ and would like to see the option supported.
 
 A SubConfig has two or more entries:
 
-- a `matches` key, with a [Filesystem Glob](#filesystem-globbing) detailing which files the config
-  applies to.
+- a `matches` key with a [Filesystem Glob](#filesystem-globbing) string or a non-empty list of
+  strings, such as `matches = ["src/file.py", "tests/**"]`. The sub-config applies when any
+  pattern matches the file.
 - at least one of the [SubConfig allowed overrides](#subconfig-allowed-overrides)
 
 #### **SubConfig Option Selection**
 
 Since you can have more than one SubConfig matching a file, we need to define a resolution order
 to determine which SubConfig's option should be selected. Pyrefly does this by filtering
-SubConfigs whose `matches` does not match the given file, then takes the first non-null
+SubConfigs for which no `matches` pattern matches the file, then takes the first non-null
 value that can be found in the order the SubConfigs appear in your configuration.
 
 If no SubConfigs match, or there are no non-null config options present, then we take
@@ -6503,6 +6504,19 @@ types, invalid flags, and unrecognized specifications.
 f"{None:>10}"  # invalid-format-spec, if enabled
 f"{'text':.2f}"  # invalid-format-spec, if enabled
 f"{1:.2d}"  # invalid-format-spec, if enabled
+```
+
+## invalid-ignore-comment
+
+Default severity: `warn`
+
+Malformed ignore comments are flagged without changing their lenient suppression effects: misspelled tool directives (`# pyrefly: ignoree`), unterminated lists (`# pyrefly: ignore[bad-code`), and empty lists (`# pyrefly: ignore[]`). Identifier extensions in `# type: <identifier>` can be ordinary type comments, so they are not flagged as typos.
+
+```python
+x: int = "oops"  # pyrefly: ignoree  # invalid-ignore-comment: did you mean `ignore`?
+
+# Fix: use a valid directive.
+y: int = "oops"  # pyrefly: ignore[bad-assignment]
 ```
 
 ## invalid-inheritance
@@ -12771,6 +12785,15 @@ pyrefly check --report-scip index.scip \
 
 External package identities come from installed distribution metadata, and bundled standard-library stubs use the Python version
 configured for the project.
+
+## Test code
+
+Occurrences in test code get the SCIP `Test` role. Test code is:
+
+- every `.py` file that pytest collects tests from, by the `python_files` setting in the pytest
+  configuration file of the project root (by default `test_*.py` and `*_test.py`), and every
+  `conftest.py`;
+- every class that derives from `unittest.TestCase`, wherever it is defined.
 
 ## Compatibility
 

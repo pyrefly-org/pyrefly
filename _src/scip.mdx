@@ -49,6 +49,15 @@ pyrefly check --report-scip index.scip \
 External package identities come from installed distribution metadata, and bundled standard-library stubs use the Python version
 configured for the project.
 
+## Test code
+
+Occurrences in test code get the SCIP `Test` role. Test code is:
+
+- every `.py` file that pytest collects tests from, by the `python_files` setting in the pytest
+  configuration file of the project root (by default `test_*.py` and `*_test.py`), and every
+  `conftest.py`;
+- every class that derives from `unittest.TestCase`, wherever it is defined.
+
 ## Compatibility
 
 :::tip

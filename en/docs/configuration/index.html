@@ -39,8 +39,8 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/clipboard.js/2.0.0/clipboard.min.js"></script>
 <script src="/js/code-block-buttons.js"></script>
 <script src="/js/gtag-fragment-tracking.js"></script><link rel="stylesheet" href="/assets/css/styles.519bb944.css">
-<script src="/assets/js/runtime~main.40cabde2.js" defer="defer"></script>
-<script src="/assets/js/main.1cf40e10.js" defer="defer"></script>
+<script src="/assets/js/runtime~main.96d2cc12.js" defer="defer"></script>
+<script src="/assets/js/main.72a71318.js" defer="defer"></script>
 </head>
 <body class="navigation-with-keyboard">
 <script>!function(){function t(t){document.documentElement.setAttribute("data-theme",t)}var e=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme")}catch(t){}}();t(null!==e?e:"dark")}(),function(){try{const n=new URLSearchParams(window.location.search).entries();for(var[t,e]of n)if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script>
@@ -1600,8 +1600,8 @@ by <code>.</code>, unless it is at the start or end of a module glob.</p>
 <p><code>Sub-Configs</code> are a method for overriding one or more config options for specific files based on
 filepath glob matching. Only certain config options are allowed to be overridden, and a need
 to override other configs means you likely need to use a separate config file for your subdirectory.
-You can have as many SubConfigs as you want in a project, and even multiple separate SubConfigs
-that can apply to a given file when the <code>matches</code> glob pattern matches.</p>
+You can have as many SubConfigs as you want in a project, and multiple SubConfigs can apply
+to the same file.</p>
 <h4 class="anchor anchorWithStickyNavbar_LWe7" id="subconfig-allowed-overrides"><strong>SubConfig Allowed Overrides</strong><a href="#subconfig-allowed-overrides" class="hash-link" aria-label="Direct link to subconfig-allowed-overrides" title="Direct link to subconfig-allowed-overrides">​</a></h4>
 <p>We currently allow the following config options to be overridden in a SubConfig:</p>
 <ul>
@@ -1632,14 +1632,15 @@ and would like to see the option supported.</p>
 <h4 class="anchor anchorWithStickyNavbar_LWe7" id="subconfig-table-structure"><strong>SubConfig Table Structure</strong><a href="#subconfig-table-structure" class="hash-link" aria-label="Direct link to subconfig-table-structure" title="Direct link to subconfig-table-structure">​</a></h4>
 <p>A SubConfig has two or more entries:</p>
 <ul>
-<li>a <code>matches</code> key, with a <a href="#filesystem-globbing">Filesystem Glob</a> detailing which files the config
-applies to.</li>
+<li>a <code>matches</code> key with a <a href="#filesystem-globbing">Filesystem Glob</a> string or a non-empty list of
+strings, such as <code>matches = [&quot;src/file.py&quot;, &quot;tests/**&quot;]</code>. The sub-config applies when any
+pattern matches the file.</li>
 <li>at least one of the <a href="#subconfig-allowed-overrides">SubConfig allowed overrides</a></li>
 </ul>
 <h4 class="anchor anchorWithStickyNavbar_LWe7" id="subconfig-option-selection"><strong>SubConfig Option Selection</strong><a href="#subconfig-option-selection" class="hash-link" aria-label="Direct link to subconfig-option-selection" title="Direct link to subconfig-option-selection">​</a></h4>
 <p>Since you can have more than one SubConfig matching a file, we need to define a resolution order
 to determine which SubConfig&#x27;s option should be selected. Pyrefly does this by filtering
-SubConfigs whose <code>matches</code> does not match the given file, then takes the first non-null
+SubConfigs for which no <code>matches</code> pattern matches the file, then takes the first non-null
 value that can be found in the order the SubConfigs appear in your configuration.</p>
 <p>If no SubConfigs match, or there are no non-null config options present, then we take
 the value in the &#x27;root&#x27;/top-level Pyrefly config (or Pyrefly default if no value is specified).</p>
