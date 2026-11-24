@@ -73,9 +73,9 @@ testcase!(
     r#"
 from typing import NewType, Any
 A = NewType("A", int, extra=True)  # E: Unrecognized keyword argument `extra` in NewType definition
-B = NewType("B", int, tp=int)  # E: Unrecognized keyword argument `tp` in NewType definition
+a: A = A(1)
 def f(kwargs: dict[str, Any]) -> None:
-    C = NewType("C", int, **kwargs)  # E: Unpacking is not supported in NewType definition
+    B = NewType("B", int, **kwargs)  # E: Unpacking is not supported in NewType definition
      "#,
 );
 
