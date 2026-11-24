@@ -69,6 +69,17 @@ userId = NewType() # E: Missing argument `name` # E: Missing argument `tp`
 );
 
 testcase!(
+    test_new_type_unexpected_keyword,
+    r#"
+from typing import NewType, Any
+A = NewType("A", int, extra=True)  # E: Unrecognized keyword argument `extra` in NewType definition
+B = NewType("B", int, tp=int)  # E: Unrecognized keyword argument `tp` in NewType definition
+def f(kwargs: dict[str, Any]) -> None:
+    C = NewType("C", int, **kwargs)  # E: Unpacking is not supported in NewType definition
+     "#,
+);
+
+testcase!(
     test_new_type_call_base,
     r#"
 from typing import NewType
