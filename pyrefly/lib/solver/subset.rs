@@ -6,6 +6,7 @@
  */
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::iter;
 use std::ptr;
 
@@ -590,7 +591,9 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
                 _ => return Err(lists.error_at(l_arg, u_arg, SubsetError::Other)),
             }
         }
-        let mut l_keywords = SmallMap::new();
+        // `l_keywords` is a `HashMap` because entries are removed one at a time as they are
+        // matched, and a TypedDict may expand into thousands of keyword parameters.
+        let mut l_keywords = HashMap::new();
         let mut l_kwargs_param = None;
         for arg in Option::into_iter(l_arg).chain(l_args) {
             match arg {
@@ -679,7 +682,7 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
         // These parameters from `u` may be passed by name or position. We matched the positional
         // case with *args from `l` already; now we check that they can be passed by name.
         for (name, u_ty, u_param) in u_param_matched_with_l_varargs {
-            if let Some((l_ty, l_req, l_param)) = l_keywords.shift_remove(name) {
+            if let Some((l_ty, l_req, l_param)) = l_keywords.remove(name) {
                 // Matched kw-only param from `l` must be optional, since the argument will not be
                 // present if passed positionally.
                 if l_req {
@@ -696,7 +699,7 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
         }
         // Handle keyword-only args
         for (name, (u_ty, u_req, u_param)) in u_keywords.iter() {
-            if let Some((l_ty, l_req, l_param)) = l_keywords.shift_remove(name) {
+            if let Some((l_ty, l_req, l_param)) = l_keywords.remove(name) {
                 if !*u_req && l_req {
                     return Err(lists.error_at(Some(l_param), Some(u_param), SubsetError::Other));
                 }
@@ -720,9 +723,10 @@ impl<'solver, 'subset, Ans: LookupAnswer> Subset<'solver, 'subset, Ans> {
             return Err(error);
         }
         // `u` may pass an extra keyword argument to any keyword parameter of `l` that it does not
-        // declare itself.
+        // declare itself. Sorting by name keeps the reported error independent of `HashMap`
+        // iteration order.
         if let Some(u_ty) = &u_kwargs {
-            for (l_ty, _, l_param) in l_keywords.values() {
+            for (_, (l_ty, _, l_param)) in l_keywords.iter().sorted_by_key(|(name, _)| *name) {
                 self.is_subset_eq(u_ty, l_ty)
                     .map_err(|e| lists.error_at(Some(l_param), u_kwargs_param, e))?;
             }
