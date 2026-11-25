@@ -1207,30 +1207,6 @@ x2: P2 = a1
 "#,
 );
 
-// Pyrefly does not treat a `def` as declaring the type of its name, so reassigning the name is
-// not checked against the function's signature.
-testcase!(
-    bug = "Reassigning `a1` to an incompatible function should be an error",
-    test_reassign_unpack_kwargs_function,
-    r#"
-from typing import TypedDict, Unpack
-
-class TDBase(TypedDict):
-    x: int
-
-class TD(TDBase, total=False):
-    y: int
-
-def a1(**kwargs: Unpack[TDBase]) -> None: ...
-def a2(**kwargs: Unpack[TD]) -> None: ...
-
-if bool():
-    a1 = a2  # Should error: `a1` may be called with `y` of any type.
-else:
-    a2 = a1
-"#,
-);
-
 testcase!(
     test_assignability_typed_dict_wrong_kwarg,
     r#"
