@@ -10,8 +10,6 @@ use ruff_python_ast::Expr;
 use ruff_python_ast::ExprCall;
 use ruff_python_ast::ExprStringLiteral;
 
-use crate::export::special::SpecialExport;
-
 fn extract_message(call: &ExprCall) -> Option<String> {
     if let Some(arg) = call.arguments.args.first()
         && let Expr::StringLiteral(ExprStringLiteral { value, .. }) = arg

@@ -159,7 +159,6 @@ use crate::error::context::ErrorContext;
 use crate::error::context::TypeCheckContext;
 use crate::error::context::TypeCheckKind;
 use crate::error::style::ErrorStyle;
-use crate::export::deprecation::parse_deprecation;
 use crate::export::exports::ExportLocation;
 use crate::export::special::SpecialExport;
 use crate::solver::solver::CallContext;
@@ -7840,36 +7839,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
     }
 
-    fn is_deprecated_decorator(&self, func: &Expr, errors: &ErrorCollector) -> bool {
-        if SpecialExport::from_syntax(func) == Some(SpecialExport::Deprecated) {
-            return true;
-        }
-        let func_ty = self.expr_infer(func, errors);
-        let cls = match &func_ty {
-            Type::ClassDef(cls) => Some(*cls),
-            Type::SpecializedClassDef(cls) => Some(*cls.class_object()),
-            Type::Type(inner) => match &**inner {
-                Type::ClassType(cls) => Some(*cls.class_object()),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(cls) = cls {
-            let m = cls.module_name();
-            (m == ModuleName::warnings() || m == ModuleName::typing_extensions())
-                && cls.name(self).as_str() == "deprecated"
-        } else {
-            false
-        }
-    }
-
     pub fn solve_decorator(&self, x: &BindingDecorator, errors: &ErrorCollector) -> Decorator {
         let mut ty = self.expr_infer(&x.expr, errors);
         self.pin_all_placeholder_types(&mut ty, true, x.expr.range(), errors);
         self.expand_mut(&mut ty);
-        let deprecation =
-            parse_deprecation(&x.expr, |func| self.is_deprecated_decorator(func, errors));
-        Decorator { ty, deprecation }
+        Decorator {
+            ty,
+            deprecation: x.deprecation.as_deref().cloned(),
+        }
     }
 
     pub fn solve_decorated_function(

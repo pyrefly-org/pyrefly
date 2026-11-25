@@ -403,13 +403,6 @@ fn is_final_annotation(annotation: &Expr) -> bool {
     SpecialExport::from_syntax(target) == Some(SpecialExport::Final)
 }
 
-fn is_overload_decorator(decorator: &Decorator) -> bool {
-    decorator
-        .expression
-        .as_name_expr()
-        .is_some_and(|x| x.id == "overload" || x.id == "typing.overload")
-}
-
 impl Definitions {
     pub fn new(x: &[Stmt], module_name: ModuleName, is_init: bool, sys_info: SysInfo) -> Self {
         let mut builder = DefinitionsBuilder {
@@ -527,21 +520,23 @@ impl Definitions {
 }
 
 impl DefinitionsBuilder {
-    fn is_deprecated_decorator(&self, func: &Expr) -> bool {
-        if SpecialExport::from_syntax(func) == Some(SpecialExport::Deprecated) {
+    fn resolves_to_special(
+        &self,
+        expr: &Expr,
+        special: SpecialExport,
+        name: &str,
+        modules: &[ModuleName],
+    ) -> bool {
+        if SpecialExport::from_syntax(expr) == Some(special) {
             return true;
         }
-        match func {
-            Expr::Name(name) => {
-                if let Some(def) = self.inner.definitions.get(&name.id) {
+        match expr {
+            Expr::Name(id) => {
+                if let Some(def) = self.inner.definitions.get(&id.id) {
                     match &def.style {
-                        DefinitionStyle::Import(m) => {
-                            (m == &ModuleName::warnings() || m == &ModuleName::typing_extensions())
-                                && name.id.as_str() == "deprecated"
-                        }
+                        DefinitionStyle::Import(m) => modules.contains(m) && id.id.as_str() == name,
                         DefinitionStyle::ImportAs(m, upstream_name) => {
-                            (m == &ModuleName::warnings() || m == &ModuleName::typing_extensions())
-                                && upstream_name.as_str() == "deprecated"
+                            modules.contains(m) && upstream_name.as_str() == name
                         }
                         _ => false,
                     }
@@ -549,15 +544,13 @@ impl DefinitionsBuilder {
                     false
                 }
             }
-            Expr::Attribute(ExprAttribute { value, attr, .. })
-                if attr.id.as_str() == "deprecated" =>
-            {
+            Expr::Attribute(ExprAttribute { value, attr, .. }) if attr.id.as_str() == name => {
                 if let Expr::Name(base) = &**value
                     && let Some(def) = self.inner.definitions.get(&base.id)
                 {
                     match &def.style {
                         DefinitionStyle::Import(m) | DefinitionStyle::ImportAs(m, _) => {
-                            m == &ModuleName::warnings() || m == &ModuleName::typing_extensions()
+                            modules.contains(m)
                         }
                         _ => false,
                     }
@@ -567,6 +560,24 @@ impl DefinitionsBuilder {
             }
             _ => false,
         }
+    }
+
+    fn is_deprecated_decorator(&self, func: &Expr) -> bool {
+        self.resolves_to_special(
+            func,
+            SpecialExport::Deprecated,
+            "deprecated",
+            &[ModuleName::warnings(), ModuleName::typing_extensions()],
+        )
+    }
+
+    fn is_overload_decorator(&self, decorator: &Decorator) -> bool {
+        self.resolves_to_special(
+            &decorator.expression,
+            SpecialExport::Overload,
+            "overload",
+            &[ModuleName::typing(), ModuleName::typing_extensions()],
+        )
     }
     fn stmts(&mut self, xs: &[Stmt]) {
         for x in xs {
@@ -1057,7 +1068,7 @@ impl DefinitionsBuilder {
                 let mut deprecated_decoration = None;
                 for d in decorator_list {
                     self.named_in_expr(&d.expression);
-                    is_overload = is_overload || is_overload_decorator(d);
+                    is_overload = is_overload || self.is_overload_decorator(d);
                     if deprecated_decoration.is_none() {
                         deprecated_decoration = parse_deprecation(&d.expression, |func| {
                             self.is_deprecated_decorator(func)

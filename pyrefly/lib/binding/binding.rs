@@ -23,6 +23,7 @@ use pyrefly_python::nesting_context::NestingContext;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_python::symbol_kind::SymbolKind;
 use pyrefly_types::function::BodyKind;
+use pyrefly_types::function::Deprecation;
 use pyrefly_types::heap::TypeHeap;
 use pyrefly_types::special_form::SpecialForm;
 use pyrefly_types::type_alias::TypeAlias;
@@ -150,7 +151,7 @@ assert_words!(BindingClassSynthesizedFields, 2);
 assert_bytes!(BindingLegacyTypeParam, 32);
 assert_words!(BindingYield, 4);
 assert_words!(BindingYieldFrom, 4);
-assert_words!(BindingDecorator, 9);
+assert_words!(BindingDecorator, 10);
 assert_bytes!(BindingDecoratedFunction, 24);
 assert_words!(BindingUndecoratedFunction, 16);
 
@@ -2115,6 +2116,7 @@ pub enum FunctionParameter {
 pub struct BindingDecorator {
     pub expr: Expr,
     pub trailing_name: Option<Name>,
+    pub deprecation: Option<Box<Deprecation>>,
 }
 
 impl DisplayWith<Bindings> for BindingDecorator {
