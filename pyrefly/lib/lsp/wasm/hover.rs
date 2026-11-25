@@ -37,6 +37,7 @@ use pyrefly_types::callable::Required;
 use pyrefly_types::class::Class;
 use pyrefly_types::class::ClassType;
 use pyrefly_types::display::LspDisplayMode;
+use pyrefly_types::function::FunctionKind;
 use pyrefly_types::type_var::Variance;
 use pyrefly_types::types::Type;
 use pyrefly_util::absolutize::Absolutize as _;
@@ -50,6 +51,7 @@ use ruff_python_ast::ExprContext;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::ModModule;
 use ruff_python_ast::Stmt;
+use ruff_python_ast::StmtFunctionDef;
 use ruff_python_ast::UnaryOp;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::token::Token;
@@ -1586,6 +1588,66 @@ fn inherited_method_docstring(
     })
 }
 
+/// `def` statement whose name is at `name_range` in `ast`
+fn find_function_def(ast: &ModModule, name_range: TextRange) -> Option<&StmtFunctionDef> {
+    for node in Ast::locate_node(ast, name_range.start()) {
+        if let AnyNodeRef::StmtFunctionDef(func) = node
+            && func.name.range() == name_range
+        {
+            return Some(func);
+        }
+    }
+    None
+}
+
+/// when Python sets `__doc__`to the wrapper's docstring, returns the wrapper's docstring in that case, otherwise `None`
+fn decorator_wrapper_docstring(
+    transaction: &Transaction<'_>,
+    handle: &Handle,
+    type_: &Type,
+    definition: &FindDefinitionItemWithDocstring,
+) -> Option<Docstring> {
+    // only a `def` with decorators can be replaced by a wrapper
+    let hovered_ast = transaction.get_ast_or_parse_module(handle, &definition.module);
+    let hovered_def = find_function_def(&hovered_ast, definition.definition_range)?;
+    if hovered_def.decorator_list.is_empty() {
+        return None;
+    }
+
+    // hovered type is the function after decoration, find where it is defined
+    let func_def_id = type_.toplevel_func_metadata()?.kind.as_func_def_id()?;
+    let qname = &func_def_id.qname;
+
+    // if it is the hovered `def` itself, the decorator did not replace it
+    let same_file = qname.module_path() == definition.module.path();
+    let same_def = qname.range() == definition.definition_range;
+    if same_file && same_def {
+        return None;
+    }
+
+    // find the wrapper's `def` statement
+    let wrapper_handle =
+        transaction.imported_handle(handle, qname.module_name(), qname.module_path().dupe());
+    let wrapper_module = transaction.get_module_info(&wrapper_handle)?;
+    let ast = transaction.get_ast_or_parse_module(handle, &wrapper_module);
+    let wrapper = find_function_def(&ast, qname.range())?;
+
+    // in case the wrapper is decorated with `functools.wraps`, Python copies the original docstrings
+    let answers = transaction.get_answers(&wrapper_handle)?;
+    for decorator in &wrapper.decorator_list {
+        let decorator_type = answers.get_type_trace(decorator.expression.range());
+        if let Some(Type::KwCall(call)) = decorator_type
+            && call.has_function_kind(FunctionKind::FunctoolsWraps)
+        {
+            return None;
+        }
+    }
+
+    // else show the wrapper's own docstring
+    let docstring_range = Docstring::range_from_stmts(&wrapper.body)?;
+    nonempty_docstring(Docstring(docstring_range, wrapper_module))
+}
+
 pub fn get_hover(
     transaction: &Transaction<'_>,
     handle: &Handle,
@@ -1761,6 +1823,9 @@ pub fn get_hover_with_verbosity(
                 Some(Docstring(doc_ranges.docstring()?, interface.module))
             })
     });
+    let wrapper_docstring = definition
+        .as_ref()
+        .and_then(|item| decorator_wrapper_docstring(transaction, handle, &type_, item));
     let hover_constructor_dunder = definition
         .as_ref()
         .is_some_and(|item| is_constructor_dunder(item.display_name.as_deref()));
@@ -1785,8 +1850,8 @@ pub fn get_hover_with_verbosity(
         } else {
             (None, fallback_name_from_type, None, Vec::new())
         };
-    let docstring = interface_docstring
-        .and_then(nonempty_docstring)
+    let docstring = wrapper_docstring
+        .or_else(|| interface_docstring.and_then(nonempty_docstring))
         .or_else(|| fallback_docstring.and_then(nonempty_docstring))
         .or_else(|| docstring_for_class_object_type(transaction, handle, &type_));
 

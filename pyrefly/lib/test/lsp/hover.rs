@@ -5369,7 +5369,6 @@ class Child(Base):
     );
 }
 
-
 // https://github.com/pyrefly-org/pyrefly/issues/4719
 #[test]
 fn hover_decorated_function_shows_runtime_docstring() {
@@ -5438,6 +5437,7 @@ print(quux)
 #     ^
 "#;
     let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    // TODO: `foo_wrapper` should show "Foo docstring" and `qux` "Qux wrapper docstring"
     assert_eq!(
         r#"
 # main.py
@@ -5447,7 +5447,7 @@ print(quux)
 (function) foo_wrapper: def foo_wrapper() -> None: ...
 ```
 ---
-Foo docstring
+Foo wrapper docstring
 
 56 | print(bar)
            ^
@@ -5471,7 +5471,7 @@ Baz docstring
 (function) qux: def qux_wrapper() -> Unknown: ...
 ```
 ---
-Qux wrapper docstring
+Qux docstring
 
 62 | print(quux)
            ^
@@ -5505,7 +5505,8 @@ def f():
 print(f)
 #     ^
 "#;
-    let report = get_batched_lsp_operations_report(&[("main", code), ("lib", lib)], get_test_report);
+    let report =
+        get_batched_lsp_operations_report(&[("main", code), ("lib", lib)], get_test_report);
     assert!(report.contains("Wrapper docstring"), "got: {report}");
     assert!(!report.contains("Original docstring"), "got: {report}");
 }
