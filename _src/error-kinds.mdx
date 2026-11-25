@@ -276,6 +276,29 @@ class C:
     x: Desc = Desc()  # instance attribute shadows the descriptor [bad-dataclass-descriptor]
 ```
 
+## bad-descriptor-inheritance
+
+Default severity: `warn`
+
+A descriptor's `__get__` return type is incompatible with a base class that has no getter.
+Widening the descriptor to that base type can hide its descriptor behavior when it is stored on a class.
+
+```python
+class A: ...
+
+class B(A):
+    def __get__(self, instance: object | None, owner: type[object]) -> int:  # incompatible with A
+        return 1
+```
+
+Every advertised getter return type, including class and instance overloads, must be assignable to each non-descriptor direct base.
+Returning `Self` preserves that contract. Bases with getters remain subject to ordinary override checks.
+This conservative signature check does not select overloads for a particular receiver or owner. Implementation-inheritance mixins may therefore require a named suppression or a different base.
+It checks declarations in checked files, not structural protocol assignments or unchecked third-party declarations; setter contracts and function method-binding behavior are outside its scope. Dynamic or unresolved getters and `Any` follow gradual typing.
+
+The check is a warning by default and an error in `strict` and `all`. Disable it with `bad-descriptor-inheritance = "ignore"` under `[errors]`.
+It is independently configurable: existing `bad-override` settings do not enable or disable it. Nominal subtyping is unchanged.
+
 ## bad-dunder-all
 
 This error occurs when `__all__` is explicitly defined for a module but contains an entry that cannot be found in the module's definitions, wildcard imports, or submodules (for `__init__.py` files).
@@ -760,6 +783,21 @@ import helper  # fallback-search-path-relative-import
 # Fix when helper.py belongs to pkg:
 from . import helper
 # or: import pkg.helper
+```
+
+## ignore-without-code
+
+Default severity: `ignore`
+
+A `# pyrefly: ignore` comment suppresses any error on its line without naming the specific error code(s) it silences. This rule is off by default; enable it to require every Pyrefly suppression to be explicit, so a blanket ignore can't silently hide a new, unrelated error introduced later. Only `# pyrefly: ignore` comments are checked, since Pyrefly only honors error codes for its own tool.
+
+```python
+def f() -> int:
+    return "oops"  # pyrefly: ignore  # ignore-without-code
+
+# Fix: name the error code being suppressed.
+def g() -> int:
+    return "oops"  # pyrefly: ignore[bad-return]
 ```
 
 ## implicit-abstract-class
