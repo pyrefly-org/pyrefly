@@ -839,6 +839,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     options.type_form_context,
                     cache,
                 );
+                let dict_context;
+                let context = if let (Expr::Dict(dict), Type::Union(union)) = (x, want) {
+                    dict_context = move || {
+                        let mut tcc = context();
+                        if let Some((range, detail)) =
+                            self.invalid_typed_dict_union_tag(&dict.items, &union.members)
+                        {
+                            tcc.detail = Some(detail);
+                            tcc.annotations.push((range, "invalid tag".to_owned()));
+                        }
+                        tcc
+                    };
+                    &dict_context
+                } else {
+                    context
+                };
                 let check_options = match call_context {
                     Some(call_context) => {
                         TypeCheckOptions::new(errors, context).with_call_context(call_context)
@@ -2355,6 +2371,67 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 errors,
             )
         }
+    }
+
+    /// Explain a supplied tag only if it is rejected by every member of a tagged union.
+    fn invalid_typed_dict_union_tag(
+        &self,
+        items: &[DictItem],
+        members: &[Type],
+    ) -> Option<(TextRange, String)> {
+        let typed_dicts = members
+            .iter()
+            .map(|member| match member {
+                Type::ClassType(cls) if self.is_typed_dict_class(cls.class_object()) => Some(cls),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        // Unpacks, nonliteral keys, and duplicates can obscure which value the key has.
+        let mut fields = SmallMap::new();
+        for item in items {
+            let key = item.key.as_ref()?.as_string_literal_expr()?;
+            if fields
+                .insert(Name::new(key.value.to_str()), (key, &item.value))
+                .is_some()
+            {
+                return None;
+            }
+        }
+        fields.into_iter().find_map(|(name, (key, value))| {
+            let value = value.as_string_literal_expr()?;
+            let got = Lit::from_string_literal(value)?;
+            let mut tags = typed_dicts
+                .iter()
+                .map(|cls| {
+                    let field = self.typed_dict_field(cls, &name)?;
+                    if field.required
+                        && let Type::Literal(literal) = field.ty
+                        && literal.value.is_string()
+                        && literal.value != got
+                    {
+                        Some(literal.value)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            tags.sort_unstable();
+            tags.dedup();
+            if tags.len() < 2 {
+                return None;
+            }
+            let expected = tags
+                .iter()
+                .map(|tag| format!("`{}`", tag.to_string_escaped(false, self)))
+                .join(", ");
+            let key = Lit::from_string_literal(key)?.to_string_escaped(false, self);
+            let got = got.to_string_escaped(false, self);
+            Some((
+                value.range(),
+                format!("Invalid tag `{got}` for key `{key}`; expected one of {expected}"),
+            ))
+        })
     }
 
     fn dict_infer(

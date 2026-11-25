@@ -2793,6 +2793,9 @@ impl Solver {
         if let Some(detail) = subset_error.to_error_msg(env) {
             builder = builder.with_detail(detail);
         }
+        if let Some(detail) = tcc.detail {
+            builder = builder.with_detail(detail);
+        }
         builder
     }
 

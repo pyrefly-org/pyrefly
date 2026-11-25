@@ -2955,6 +2955,32 @@ def f(x: str) -> TD[int] | TD[str]:
 );
 
 testcase!(
+    test_invalid_typed_dict_union_tag,
+    r#"
+from typing import Literal, NotRequired, TypedDict
+
+class Cat(TypedDict):
+    kind: Literal["cat"]
+    lives: int
+
+class Dog(TypedDict):
+    kind: Literal["dog"]
+    bark: bool
+
+class Fish(TypedDict):
+    kind: NotRequired[Literal["fish"]]
+    fins: int
+
+cat: Cat | Dog = {"kind": "cat", "lives": 9}
+dog: Cat | Dog = {"kind": "dog", "bark": True}
+unknown: Dog | Cat = {"kind": "bird", "lives": 1}  # E: Invalid tag `"bird"` for key `"kind"`; expected one of `"cat"`, `"dog"`
+bad_field: Cat | Dog = {"kind": "cat", "lives": "many"}  # E: is not assignable to # !E: Invalid tag
+optional: Cat | Fish = {"kind": "bird", "lives": 1}  # E: is not assignable to # !E: Invalid tag
+mixed: Cat | Dog | int = {"kind": "bird", "lives": 1}  # E: is not assignable to # !E: Invalid tag
+"#,
+);
+
+testcase!(
     test_constrained_type_var_typed_dict_index,
     r#"
 from typing import Generic, TypedDict, TypeVar, assert_type

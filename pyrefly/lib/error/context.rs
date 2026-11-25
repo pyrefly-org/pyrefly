@@ -118,6 +118,8 @@ impl ErrorContext {
 pub struct TypeCheckContext {
     pub kind: TypeCheckKind,
     pub context: Option<ErrorContext>,
+    /// Additional explanation specific to the expression being checked.
+    pub detail: Option<String>,
     /// Optional secondary annotations to attach to the error.
     pub annotations: Vec<(TextRange, String)>,
 }
@@ -127,6 +129,7 @@ impl TypeCheckContext {
         Self {
             kind,
             context: None,
+            detail: None,
             annotations: Vec::new(),
         }
     }
