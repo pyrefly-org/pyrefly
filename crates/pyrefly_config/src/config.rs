@@ -6652,6 +6652,72 @@ bad-override = "error"
         assert_eq!(handle.module(), ModuleName::from_str("fastapi"));
     }
 
+    // https://github.com/pyrefly-org/pyrefly/issues/5759
+    #[test]
+    fn test_interpreter_stdlib_module_names() {
+        let root = TempDir::new().unwrap();
+        let interpreter = root.path().join("python");
+        let stdlib = interpreter.join("Lib");
+        fs::create_dir_all(stdlib.join("email")).unwrap();
+        let mut config = ConfigFile {
+            import_root: Some(root.path().to_path_buf()),
+            ..Default::default()
+        };
+        config.python_environment.site_package_path = Some(vec![interpreter, stdlib.clone()]);
+        config.python_environment.interpreter_stdlib_path = vec![stdlib.clone()];
+        config.python_environment.set_empty_to_default();
+
+        // TODO(#5759): These names should be relative to the stdlib root.
+        for (file, module) in [
+            ("typing.py", "Lib.typing"),
+            ("email/__init__.py", "Lib.email"),
+            ("email/message.py", "Lib.email.message"),
+        ] {
+            let path = stdlib.join(file);
+            fs::write(&path, "").unwrap();
+            let handle = config.handle_from_module_path(ModulePath::filesystem(path));
+            assert_eq!(handle.module(), ModuleName::from_str(module));
+        }
+    }
+
+    #[test]
+    fn test_interpreter_stdlib_preserves_explicit_search_path() {
+        let root = TempDir::new().unwrap();
+        let stdlib = root.path().join("Lib");
+        let email = stdlib.join("email");
+        fs::create_dir_all(&email).unwrap();
+        let message = email.join("message.py");
+        fs::write(&message, "").unwrap();
+        let mut config = ConfigFile {
+            search_path_from_args: vec![email],
+            ..Default::default()
+        };
+        config.python_environment.site_package_path = Some(vec![root.path().to_path_buf()]);
+        config.python_environment.interpreter_stdlib_path = vec![stdlib];
+        config.python_environment.set_empty_to_default();
+
+        let handle = config.handle_from_module_path(ModulePath::filesystem(message));
+        assert_eq!(handle.module(), ModuleName::from_str("message"));
+    }
+
+    #[test]
+    fn test_interpreter_stdlib_preserves_nested_site_packages() {
+        let root = TempDir::new().unwrap();
+        let stdlib = root.path().join("Lib");
+        let site_packages = stdlib.join("vendor");
+        let package = site_packages.join("package");
+        fs::create_dir_all(&package).unwrap();
+        let init = package.join("__init__.py");
+        fs::write(&init, "").unwrap();
+        let mut config = ConfigFile::default();
+        config.python_environment.site_package_path = Some(vec![site_packages]);
+        config.python_environment.interpreter_stdlib_path = vec![stdlib];
+        config.python_environment.set_empty_to_default();
+
+        let handle = config.handle_from_module_path(ModulePath::filesystem(init));
+        assert_eq!(handle.module(), ModuleName::from_str("package"));
+    }
+
     #[test]
     fn test_custom_typeshed_versions_is_watched() {
         // A custom typeshed usually lives outside every watched root, so unless its VERSIONS is
