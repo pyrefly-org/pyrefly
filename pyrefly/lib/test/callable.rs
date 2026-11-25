@@ -1157,8 +1157,77 @@ class P4(Protocol):
     def __call__(self, **kwargs: int): ...
 def test(unannotated: P1, unpacked: P2, annotated: P3, annotated_wrong: P4):
     a: P2 = unannotated
-    b: P2 = annotated
+    # `TD` is not closed, so `P2` may be called with extra keyword arguments of type `object`.
+    b: P2 = annotated  # E: `P3` is not assignable to `P2`
     c: P2 = annotated_wrong  # E: `P4` is not assignable to `P2`
+"#,
+);
+
+// https://github.com/python/typing/pull/2338#issuecomment-5395279191
+testcase!(
+    test_override_unpack_kwargs_with_extra_keyword,
+    r#"
+from typing import TypedDict, Unpack
+
+class Person(TypedDict):
+    name: str
+    age: int
+
+class Base:
+    def foo(self, **kwargs: Unpack[Person]) -> None: ...
+class SubGood(Base):
+    # `Person` is not closed, so `Base.foo` accepts `extra` with any type.
+    def foo(self, *, name: str, age: int, extra: bool = False) -> None: ...  # E: `SubGood.foo` overrides parent class `Base` in an inconsistent manner
+"#,
+);
+
+// https://github.com/python/typing/pull/2338#issuecomment-5395279191
+// A non-closed TypedDict in `Unpack` behaves as if it had `extra_items=object`.
+testcase!(
+    test_assignability_unpack_kwargs_open_typed_dict_extra_items,
+    r#"
+from typing import Protocol, TypedDict, Unpack
+
+class TDBase(TypedDict):
+    x: int
+
+class TD(TDBase, total=False):
+    y: int
+
+def a1(**kwargs: Unpack[TDBase]) -> None: ...
+def a2(**kwargs: Unpack[TD]) -> None: ...
+
+class P1(Protocol):
+    def __call__(self, **kwargs: Unpack[TDBase]) -> None: ...
+class P2(Protocol):
+    def __call__(self, **kwargs: Unpack[TD]) -> None: ...
+
+x1: P1 = a2  # E: `(**kwargs: Unpack[TD]) -> None` is not assignable to `P1`
+x2: P2 = a1
+"#,
+);
+
+// Pyrefly does not treat a `def` as declaring the type of its name, so reassigning the name is
+// not checked against the function's signature.
+testcase!(
+    bug = "Reassigning `a1` to an incompatible function should be an error",
+    test_reassign_unpack_kwargs_function,
+    r#"
+from typing import TypedDict, Unpack
+
+class TDBase(TypedDict):
+    x: int
+
+class TD(TDBase, total=False):
+    y: int
+
+def a1(**kwargs: Unpack[TDBase]) -> None: ...
+def a2(**kwargs: Unpack[TD]) -> None: ...
+
+if bool():
+    a1 = a2  # Should error: `a1` may be called with `y` of any type.
+else:
+    a2 = a1
 "#,
 );
 
@@ -2327,9 +2396,9 @@ callback: Callback = lambda **kwargs: (
 )[3]
 split_callback: SplitCallback = lambda consumed, **kwargs: (
     assert_type(consumed, int),
-    assert_type(kwargs, dict[str, str]),
-    assert_type(kwargs["remaining"], str),
-    assert_type(kwargs["consumed"], str),
+    assert_type(kwargs, dict[str, object]),
+    assert_type(kwargs["remaining"], object),
+    assert_type(kwargs["consumed"], object),
     None,
 )[4]
 generic_callback: GenericCallback = generic
@@ -2341,13 +2410,14 @@ apply(source, lambda **kwargs: (
 )[3])
 apply(split_source, lambda consumed, **kwargs: (
     assert_type(consumed, int),
-    assert_type(kwargs, dict[str, str]),
-    assert_type(kwargs["remaining"], str),
-    assert_type(kwargs["consumed"], str),
+    assert_type(kwargs, dict[str, object]),
+    assert_type(kwargs["remaining"], object),
+    assert_type(kwargs["consumed"], object),
     None,
 )[4])
-plain_callback: SplitCallback = split_plain
-apply(split_source, split_plain)
+# `SplitOptions` is not closed, so its extra items of type `object` are not assignable to `str`.
+plain_callback: SplitCallback = split_plain  # E: is not assignable to `SplitCallback`
+apply(split_source, split_plain)  # E: is not assignable to parameter `g`
 "#,
 );
 
