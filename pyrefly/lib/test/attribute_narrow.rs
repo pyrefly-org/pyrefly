@@ -1124,3 +1124,17 @@ def f(a: A) -> None:
         assert_type(a.y, int | None)
     "#,
 );
+
+// hasattr narrowing for unions containing a single-abstract-method class.
+testcase!(
+    test_hasattr_narrows_union_with_iterable,
+    r#"
+from collections.abc import Iterable
+from typing import assert_type
+def f(v: int | Iterable[int]) -> None:
+    if hasattr(v, "__iter__"):
+        assert_type(v, Iterable[int])
+    else:
+        assert_type(v, int)
+    "#,
+);

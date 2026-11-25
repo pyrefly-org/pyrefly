@@ -123,6 +123,18 @@ pub(crate) enum IntersectFallback {
     Right,
 }
 
+/// Whether `ty` is a class object (`type[...]`, `Self`, or a class literal) rather than
+/// an instance. Class objects gain attributes dynamically by assignment (e.g. lazy
+/// `cls.foo = ...` initialisation), so `hasattr` narrowing leaves them unchanged:
+/// static attribute presence neither confirms nor rules out a class object.
+fn is_class_object(ty: &Type) -> bool {
+    match ty {
+        Type::SelfType(_) | Type::ClassDef(_) | Type::Type(_) => true,
+        Type::ClassType(class) if class.is(KnownClass::Type) => true,
+        _ => false,
+    }
+}
+
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     // Get the union of all members of an enum, minus the specified member
     fn subtract_enum_member(&self, instance: Instance, name: &Name) -> Type {
@@ -2470,13 +2482,65 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // have the attribute, plus `Any` for members that don't. Preserving
                 // specific attribute types (rather than using a blanket `Any`) ensures
                 // fixpoint convergence when `hasattr` is used in loops with reassignment.
-                if let Some(narrow_ty) = self.hasattr_narrow_type(&base_ty, attr, range, errors) {
+                let narrowed = if let Some(narrow_ty) =
+                    self.hasattr_narrow_type(&base_ty, attr, range, errors)
+                {
                     let facet = FacetKind::Attribute(attr.clone());
                     let facets = extend_facet_chain(resolved_chain.as_ref(), facet);
                     type_info.with_narrow(&facets, narrow_ty)
                 } else {
                     type_info.clone()
+                };
+                // When the subject is the variable itself, also narrow the base type.
+                // Members lacking the attribute are intersected with matching
+                // single-abstract-method classes from the union (e.g. `int` becomes
+                // `int & Iterable[int]` under `hasattr(v, "__iter__")`). Members are
+                // left unchanged when no such class is present.
+                if subject.is_none() {
+                    let mut targets = Vec::new();
+                    self.map_over_union(&base_ty, |member| {
+                        if let Type::ClassType(cls) = member
+                            && let abstracts = self
+                                .get_abstract_members_for_class(cls.class_object())
+                                .unimplemented_abstract_methods()
+                            && abstracts.len() == 1
+                            && abstracts.contains(attr)
+                        {
+                            targets.push(member.clone());
+                        }
+                    });
+                    if !targets.is_empty() {
+                        let target_union = self.unions(targets);
+                        let narrowed_base = self.distribute_over_union(&base_ty, |member| {
+                            if is_class_object(member) || self.has_attr(member, attr) {
+                                member.clone()
+                            } else {
+                                self.intersect_with_fallback(
+                                    member,
+                                    &target_union,
+                                    IntersectFallback::Never,
+                                )
+                            }
+                        });
+                        return narrowed.with_ty(narrowed_base);
+                    }
                 }
+                narrowed
+            }
+            NarrowOp::Atomic(None, AtomicNarrowOp::NotHasAttr(attr)) => {
+                let base_ty = self.force_for_narrowing(type_info.ty(), range, errors);
+                // Drop members that statically have the attribute. Members whose
+                // presence comes only from a `__getattr__` fallback are kept, since
+                // the attribute may still be absent at runtime, as are class objects,
+                // which gain attributes dynamically by assignment.
+                let narrowed_base = self.distribute_over_union(&base_ty, |member| {
+                    if is_class_object(member) || !self.has_static_attr(member, attr) {
+                        member.clone()
+                    } else {
+                        self.heap.mk_never()
+                    }
+                });
+                type_info.clone().with_ty(narrowed_base)
             }
             NarrowOp::Atomic(subject, AtomicNarrowOp::GetAttr(attr, default)) => {
                 let suppress_errors =
