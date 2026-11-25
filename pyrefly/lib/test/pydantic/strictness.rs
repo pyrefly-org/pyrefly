@@ -724,7 +724,7 @@ from pydantic import Field, RootModel
 class IntList(RootModel[list[int]]):
     root: list[int] = Field(strict=True)
 
-class IntDict(RootModel[dict[str,int]]):
+class IntDict(RootModel[dict[str, int]]):
     root: dict[str, int] = Field(strict=True)
 
 
@@ -756,7 +756,7 @@ InheritedStrict(["1"]) # E: Argument `list[str]` is not assignable to parameter 
 );
 
 pydantic_testcase!(
-    test_root_model_field_strict_optinal_unwrapping,
+    test_root_model_field_strict_optional_unwrapping,
     r#"
 from typing import Optional
 from pydantic import Field, RootModel
