@@ -1755,20 +1755,30 @@ impl ConfigFile {
         match &named_by(&self.source_db).or_else(|| named_by(&self.fallback_source_db)) {
             Some(handle) => handle.dupe(),
             None => {
-                // Order: explicit search paths (user intent) > custom typeshed
-                // stdlib > site-package paths (known third-party roots) >
-                // heuristic import_root. This ensures files in site-packages or
-                // a custom typeshed nested under the project root resolve from
-                // that prefix, not from the heuristic project root, while still
-                // letting explicit search paths override when the user has
-                // configured them.
+                // Library roots may be nested under the heuristic import root, and the
+                // interpreter's stdlib may be nested under a site-package root. Prefer
+                // those known roots, while letting explicit search paths take precedence.
+                let path = module_path.as_path();
                 let typeshed_stdlib = self.typeshed_stdlib_path();
+                let interpreter_stdlib = self
+                    .python_environment
+                    .interpreter_stdlib_path
+                    .iter()
+                    .filter(|stdlib| {
+                        path.starts_with(stdlib)
+                            // Site packages nested under stdlib are not stdlib modules.
+                            && !self.site_package_path().any(|site_packages| {
+                                site_packages != *stdlib
+                                    && site_packages.starts_with(stdlib)
+                                    && path.starts_with(site_packages)
+                            })
+                    });
                 let search_paths = self
                     .explicit_search_path()
                     .chain(typeshed_stdlib.iter())
+                    .chain(interpreter_stdlib)
                     .chain(self.site_package_path())
                     .chain(self.heuristic_search_path());
-                let path = module_path.as_path();
                 let fallback_paths = self.fallback_search_path_for_directory(path.parent());
                 let module_kind = ModuleName::from_path_with_fallback(
                     path,
@@ -6667,11 +6677,10 @@ bad-override = "error"
         config.python_environment.interpreter_stdlib_path = vec![stdlib.clone()];
         config.python_environment.set_empty_to_default();
 
-        // TODO(#5759): These names should be relative to the stdlib root.
         for (file, module) in [
-            ("typing.py", "Lib.typing"),
-            ("email/__init__.py", "Lib.email"),
-            ("email/message.py", "Lib.email.message"),
+            ("typing.py", "typing"),
+            ("email/__init__.py", "email"),
+            ("email/message.py", "email.message"),
         ] {
             let path = stdlib.join(file);
             fs::write(&path, "").unwrap();
