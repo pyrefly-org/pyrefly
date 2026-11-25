@@ -715,3 +715,59 @@ Model4(b"hello") # E: Argument `Literal[b'hello']` is not assignable to paramete
 Model5(b"hello") # E: Argument `Literal[b'hello']` is not assignable to parameter `root` with type `str`
 "#,
 );
+
+pydantic_testcase!(
+    test_root_model_field_strict_shallow_containers,
+    r#"
+from pydantic import Field, RootModel
+
+class IntList(RootModel[list[int]]):
+    root: list[int] = Field(strict=True)
+
+class IntDict(RootModel[dict[str,int]]):
+    root: dict[str, int] = Field(strict=True)
+
+
+IntList(["1"])
+IntList((1,))
+IntDict({"a": "1"})
+"#,
+);
+
+pydantic_testcase!(
+    test_root_model_config_and_field_strict_deep,
+    r#"
+from pydantic import ConfigDict, Field, RootModel
+
+class DirectStrict(RootModel[list[int]]):
+    model_config = ConfigDict(strict=True)
+    root: list[int] = Field(strict=True)
+
+class BaseStrict(RootModel[list[int]]):
+    model_config = ConfigDict(strict=True)
+
+class InheritedStrict(BaseStrict):
+    root: list[int] = Field(strict=True)
+
+
+DirectStrict(["1"]) # E: Argument `list[str]` is not assignable to parameter `root` with type `list[int]`
+InheritedStrict(["1"]) # E: Argument `list[str]` is not assignable to parameter `root` with type `list[int]`
+"#,
+);
+
+pydantic_testcase!(
+    test_root_model_field_strict_optinal_unwrapping,
+    r#"
+from typing import Optional
+from pydantic import Field, RootModel
+
+class OptionalList(RootModel[Optional[list[int]]]):
+    root: Optional[list[int]] = Field(strict=True)
+
+class OptionalInt(RootModel[Optional[int]]):
+    root: Optional[int] = Field(strict=True)
+
+OptionalList(["1"])
+OptionalInt("1") # E: Argument `Literal['1']` is not assignable to parameter `root` with type `int | None`
+"#,
+);
