@@ -5368,3 +5368,170 @@ class Child(Base):
         report.trim()
     );
 }
+
+// https://github.com/pyrefly-org/pyrefly/issues/4719
+#[test]
+fn hover_decorated_function_shows_runtime_docstring() {
+    let code = r#"
+import functools
+
+def foo():
+    """Foo docstring"""
+
+@functools.wraps(foo)
+def foo_wrapper():
+    """Foo wrapper docstring"""
+
+def deco_nowraps(func):
+    def bar_wrapper():
+        """Bar wrapper docstring"""
+        return func()
+    return bar_wrapper
+
+@deco_nowraps
+def bar():
+    """Bar docstring"""
+
+def deco_wraps(func):
+    @functools.wraps(func)
+    def baz_wrapper():
+        """Baz wrapper docstring"""
+        return func()
+    return baz_wrapper
+
+@deco_wraps
+def baz():
+    """Baz docstring"""
+
+def deco_nodoc(func):
+    @functools.wraps(func, assigned=())
+    def qux_wrapper():
+        """Qux wrapper docstring"""
+        return func()
+    return qux_wrapper
+
+@deco_nodoc
+def qux():
+    """Qux docstring"""
+
+def deco_doc(func):
+    @functools.wraps(func, assigned=("__module__", "__doc__"))
+    def quux_wrapper():
+        """Quux wrapper docstring"""
+        return func()
+    return quux_wrapper
+
+@deco_doc
+def quux():
+    """Quux docstring"""
+
+print(foo_wrapper)
+#     ^
+print(bar)
+#     ^
+print(baz)
+#     ^
+print(qux)
+#     ^
+print(quux)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    // TODO: `foo_wrapper` should show "Foo docstring" and `qux` "Qux wrapper docstring"
+    assert_eq!(
+        r#"
+# main.py
+54 | print(foo_wrapper)
+           ^
+```python
+(function) foo_wrapper: def foo_wrapper() -> None: ...
+```
+---
+Foo wrapper docstring
+
+56 | print(bar)
+           ^
+```python
+(function) bar: def bar_wrapper() -> Unknown: ...
+```
+---
+Bar wrapper docstring
+
+58 | print(baz)
+           ^
+```python
+(function) baz: def baz_wrapper() -> Unknown: ...
+```
+---
+Baz docstring
+
+60 | print(qux)
+           ^
+```python
+(function) qux: def qux_wrapper() -> Unknown: ...
+```
+---
+Qux docstring
+
+62 | print(quux)
+           ^
+```python
+(function) quux: def quux_wrapper() -> Unknown: ...
+```
+---
+Quux docstring
+"#
+        .trim(),
+        report.trim(),
+    );
+}
+
+#[test]
+fn hover_function_with_imported_decorator_shows_wrapper_docstring() {
+    let lib = r#"
+def deco(func):
+    def wrapper():
+        """Wrapper docstring"""
+        return func()
+    return wrapper
+"#;
+    let code = r#"
+from lib import deco
+
+@deco
+def f():
+    """Original docstring"""
+
+print(f)
+#     ^
+"#;
+    let report =
+        get_batched_lsp_operations_report(&[("main", code), ("lib", lib)], get_test_report);
+    assert!(report.contains("Wrapper docstring"), "got: {report}");
+    assert!(!report.contains("Original docstring"), "got: {report}");
+}
+
+#[test]
+fn hover_function_with_annotated_decorator_keeps_own_docstring() {
+    // The return annotation hides which function the decorator returns, so hover cannot know
+    // the runtime `__doc__` and shows the docstring of the decorated function.
+    let code = r#"
+from typing import Any, Callable
+
+def deco(func: Callable[..., Any]) -> Callable[..., Any]:
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        """Wrapper docstring"""
+        return func(*args, **kwargs)
+    return wrapper
+
+@deco
+def f():
+    """Original docstring"""
+
+print(f)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(report.contains("Original docstring"), "got: {report}");
+    assert!(!report.contains("Wrapper docstring"), "got: {report}");
+}
