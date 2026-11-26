@@ -1755,20 +1755,30 @@ impl ConfigFile {
         match &named_by(&self.source_db).or_else(|| named_by(&self.fallback_source_db)) {
             Some(handle) => handle.dupe(),
             None => {
-                // Order: explicit search paths (user intent) > custom typeshed
-                // stdlib > site-package paths (known third-party roots) >
-                // heuristic import_root. This ensures files in site-packages or
-                // a custom typeshed nested under the project root resolve from
-                // that prefix, not from the heuristic project root, while still
-                // letting explicit search paths override when the user has
-                // configured them.
+                // Library roots may be nested under the heuristic import root, and the
+                // interpreter's stdlib may be nested under a site-package root. Prefer
+                // those known roots, while letting explicit search paths take precedence.
+                let path = module_path.as_path();
                 let typeshed_stdlib = self.typeshed_stdlib_path();
+                let interpreter_stdlib = self
+                    .python_environment
+                    .interpreter_stdlib_path
+                    .iter()
+                    .filter(|stdlib| {
+                        path.starts_with(stdlib)
+                            // Site packages nested under stdlib are not stdlib modules.
+                            && !self.site_package_path().any(|site_packages| {
+                                site_packages != *stdlib
+                                    && site_packages.starts_with(stdlib)
+                                    && path.starts_with(site_packages)
+                            })
+                    });
                 let search_paths = self
                     .explicit_search_path()
                     .chain(typeshed_stdlib.iter())
+                    .chain(interpreter_stdlib)
                     .chain(self.site_package_path())
                     .chain(self.heuristic_search_path());
-                let path = module_path.as_path();
                 let fallback_paths = self.fallback_search_path_for_directory(path.parent());
                 let module_kind = ModuleName::from_path_with_fallback(
                     path,
@@ -6650,6 +6660,71 @@ bad-override = "error"
 
         let handle = config.handle_from_module_path(ModulePath::filesystem(init));
         assert_eq!(handle.module(), ModuleName::from_str("fastapi"));
+    }
+
+    // https://github.com/pyrefly-org/pyrefly/issues/5759
+    #[test]
+    fn test_interpreter_stdlib_module_names() {
+        let root = TempDir::new().unwrap();
+        let interpreter = root.path().join("python");
+        let stdlib = interpreter.join("Lib");
+        fs::create_dir_all(stdlib.join("email")).unwrap();
+        let mut config = ConfigFile {
+            import_root: Some(root.path().to_path_buf()),
+            ..Default::default()
+        };
+        config.python_environment.site_package_path = Some(vec![interpreter, stdlib.clone()]);
+        config.python_environment.interpreter_stdlib_path = vec![stdlib.clone()];
+        config.python_environment.set_empty_to_default();
+
+        for (file, module) in [
+            ("typing.py", "typing"),
+            ("email/__init__.py", "email"),
+            ("email/message.py", "email.message"),
+        ] {
+            let path = stdlib.join(file);
+            fs::write(&path, "").unwrap();
+            let handle = config.handle_from_module_path(ModulePath::filesystem(path));
+            assert_eq!(handle.module(), ModuleName::from_str(module));
+        }
+    }
+
+    #[test]
+    fn test_interpreter_stdlib_preserves_explicit_search_path() {
+        let root = TempDir::new().unwrap();
+        let stdlib = root.path().join("Lib");
+        let email = stdlib.join("email");
+        fs::create_dir_all(&email).unwrap();
+        let message = email.join("message.py");
+        fs::write(&message, "").unwrap();
+        let mut config = ConfigFile {
+            search_path_from_args: vec![email],
+            ..Default::default()
+        };
+        config.python_environment.site_package_path = Some(vec![root.path().to_path_buf()]);
+        config.python_environment.interpreter_stdlib_path = vec![stdlib];
+        config.python_environment.set_empty_to_default();
+
+        let handle = config.handle_from_module_path(ModulePath::filesystem(message));
+        assert_eq!(handle.module(), ModuleName::from_str("message"));
+    }
+
+    #[test]
+    fn test_interpreter_stdlib_preserves_nested_site_packages() {
+        let root = TempDir::new().unwrap();
+        let stdlib = root.path().join("Lib");
+        let site_packages = stdlib.join("vendor");
+        let package = site_packages.join("package");
+        fs::create_dir_all(&package).unwrap();
+        let init = package.join("__init__.py");
+        fs::write(&init, "").unwrap();
+        let mut config = ConfigFile::default();
+        config.python_environment.site_package_path = Some(vec![site_packages]);
+        config.python_environment.interpreter_stdlib_path = vec![stdlib];
+        config.python_environment.set_empty_to_default();
+
+        let handle = config.handle_from_module_path(ModulePath::filesystem(init));
+        assert_eq!(handle.module(), ModuleName::from_str("package"));
     }
 
     #[test]
