@@ -1949,15 +1949,17 @@ impl CheckArgs {
 
         let state = Forgetter::new(State::new(config_finder, thread_count), true);
         let require_levels = self.get_required_levels();
-        // The dependency graph report reads the dependencies between modules, which a
-        // one-shot transaction does not record.
-        let transaction = if self.output.dependency_graph.is_some() {
-            state.as_ref().new_transaction(require_levels.default, None)
-        } else {
-            state
-                .as_ref()
-                .new_one_shot_transaction(require_levels.default)
-        };
+        // A one-shot transaction does not record the dependencies between modules. The dependency
+        // graph report reads them, and the SCIP report needs them because it re-solves some
+        // dependencies at a higher `Require` level after the check, which can change their exports.
+        let transaction =
+            if self.output.dependency_graph.is_some() || self.output.report_scip.is_some() {
+                state.as_ref().new_transaction(require_levels.default, None)
+            } else {
+                state
+                    .as_ref()
+                    .new_one_shot_transaction(require_levels.default)
+            };
         let mut transaction = Forgetter::new(transaction, true);
         let (loaded_handles, _, sourcedb_errors) = handles.all(state.as_ref().config_finder());
 
@@ -3221,6 +3223,52 @@ def go(w: Widget) -> int:
             "unexpected project root: {}",
             metadata.project_root
         );
+    }
+
+    /// Regression test for https://github.com/pyrefly-org/pyrefly/issues/5785.
+    #[test]
+    fn check_writes_scip_report_documenting_dependency() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        let site_packages = root.join("sp");
+        fs::create_dir_all(&site_packages).unwrap();
+        // With unannotated bodies skipped, `y` is inferred as `Any` at `Require::Exports`, but
+        // as `int` once the SCIP report re-solves `dependency` to document `C`.
+        fs::write(
+            site_packages.join("dependency.py"),
+            "class C:\n    def __init__(self):\n        self.y = 1\n",
+        )
+        .unwrap();
+        let module = root.join("main.py");
+        fs::write(&module, "from dependency import C\n\ndel C().y\n").unwrap();
+        let scip_path = temp.path().join("index.scip");
+        let mut config = test_config(&root);
+        config.root.check_unannotated_defs = Some(false);
+        config.python_environment.site_package_path = Some(vec![site_packages]);
+        config.configure();
+
+        let args = CheckArgs::parse_from([
+            "check",
+            "--report-scip",
+            scip_path.to_str().unwrap(),
+            "--relative-to",
+            root.to_str().unwrap(),
+        ]);
+        let (status, _) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![module],
+                }),
+                ConfigFinder::new_constant(ArcId::new(config)),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        assert!(matches!(status, CommandExitStatus::Success));
+        let index = scip::types::Index::parse_from_bytes(&fs::read(&scip_path).unwrap()).unwrap();
+        assert_eq!(index.documents.len(), 1);
     }
 
     #[test]
