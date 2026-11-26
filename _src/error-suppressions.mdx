@@ -219,7 +219,7 @@ existing file.
 As you fix errors, the entries that suppressed them become stale. Two flags help keep the baseline current:
 
 ```
-# Rewrite the baseline to drop stale entries, without recording any new errors.
+# Drop stale entries only if no new errors remain at or above --min-severity.
 pyrefly check --prune-baseline
 
 # Exit with a non-zero status if the baseline contains stale entries.

@@ -740,9 +740,8 @@ baseline-auto-update = true
     - A file edited again after being saved is left alone until the next save, so
       entries are never judged against unsaved text.
     - This setting affects the IDE only. Use `pyrefly check --prune-baseline` to
-      do the same thing across a whole project from the command line. Note that
-      `--prune-baseline` has no such condition: it removes every unused entry it
-      finds, whether or not new errors remain.
+      prune across the checked scope from the command line. CLI pruning is skipped
+      if any new diagnostic meets `--min-severity`.
 
 ### `min-severity`
 

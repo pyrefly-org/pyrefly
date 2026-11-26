@@ -1396,6 +1396,15 @@ Here's an example of a Zed config with Pyrefly integration:
 }
 ```
 
+### Claude Code
+
+Pyrefly ships a [Claude Code](https://code.claude.com) plugin that runs `pyrefly lsp` for `.py` and `.pyi` files. With `pyrefly` on your `PATH`, run:
+
+```
+/plugin marketplace add pyrefly-org/pyrefly
+/plugin install pyrefly-lsp@pyrefly
+```
+
 
 ---
 
@@ -2829,9 +2838,8 @@ baseline-auto-update = true
     - A file edited again after being saved is left alone until the next save, so
       entries are never judged against unsaved text.
     - This setting affects the IDE only. Use `pyrefly check --prune-baseline` to
-      do the same thing across a whole project from the command line. Note that
-      `--prune-baseline` has no such condition: it removes every unused entry it
-      finds, whether or not new errors remain.
+      prune across the checked scope from the command line. CLI pruning is skipped
+      if any new diagnostic meets `--min-severity`.
 
 ### `min-severity`
 
@@ -8503,7 +8511,7 @@ existing file.
 As you fix errors, the entries that suppressed them become stale. Two flags help keep the baseline current:
 
 ```
-# Rewrite the baseline to drop stale entries, without recording any new errors.
+# Drop stale entries only if no new errors remain at or above --min-severity.
 pyrefly check --prune-baseline
 
 # Exit with a non-zero status if the baseline contains stale entries.
