@@ -1298,36 +1298,59 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         right_expr: &Expr,
         errors: &ErrorCollector,
     ) -> Type {
-        let mut res = Vec::new();
+        // Members of `left` that are not class objects cannot be narrowed by `issubclass`, so the
+        // negation preserves them as they are. They are unioned back in at the end rather than
+        // intersected with the narrowed class objects, which would wrongly collapse the result.
+        let mut preserved = Vec::new();
         let left_untyped = self.distribute_over_union(left, |left| {
             if let Some(left_untyped) = self.untype_opt(left.clone(), right_expr.range(), errors) {
                 left_untyped
             } else {
-                // If `left` cannot be untyped, then `issubclass` cannot narrow it, so the negation
-                // preserves it.
-                res.push(left.clone());
-                Type::never()
+                preserved.push(left.clone());
+                self.heap.mk_never()
             }
         });
-        if !left_untyped.is_never() {
-            for (right, allows_negative_narrow) in self.expr_as_class_info(right_expr, errors) {
-                if allows_negative_narrow
-                    && let Some((tparams, right)) = self.unwrap_class_object_silently(&right)
-                {
-                    let (vs, right) = self
-                        .solver()
-                        .fresh_quantified(&tparams, right, self.uniques);
-                    res.push(self.issubclass_result(self.subtract(&left_untyped, &right), left));
-                    // These are safe to ignore, as the only possible specialization errors are handled elsewhere:
-                    // * If `left` is an invalid specialization, the error has already been reported at its definition site.
-                    // * Unsafe runtime protocol overlaps are separately checked for in special_calls.rs.
-                    let _specialization_errors = self.finish_quantified(vs, false);
-                } else {
-                    res.push(left.clone())
-                }
+        if left_untyped.is_never() {
+            // Nothing to narrow: `left` is `Never`, `type[Never]`, or holds no class objects. In
+            // particular, the negation of a check on `Never` stays `Never` instead of widening to
+            // `object`, and `type[Never]` keeps its shape.
+            return if preserved.is_empty() && !left.is_never() {
+                self.issubclass_result(left_untyped, left)
+            } else {
+                self.unions(preserved)
+            };
+        }
+        let mut res = Vec::new();
+        for (right, allows_negative_narrow) in self.expr_as_class_info(right_expr, errors) {
+            if allows_negative_narrow
+                && let Some((tparams, right)) = self.unwrap_class_object_silently(&right)
+            {
+                let (vs, right) = self
+                    .solver()
+                    .fresh_quantified(&tparams, right, self.uniques);
+                res.push(self.issubclass_result(self.subtract(&left_untyped, &right), left));
+                // These are safe to ignore, as the only possible specialization errors are handled elsewhere:
+                // * If `left` is an invalid specialization, the error has already been reported at its definition site.
+                // * Unsafe runtime protocol overlaps are separately checked for in special_calls.rs.
+                let _specialization_errors = self.finish_quantified(vs, false);
+            } else {
+                res.push(self.issubclass_result(left_untyped.clone(), left))
             }
         }
-        self.intersects(&res)
+        if res.is_empty() {
+            // No class to subtract, so the class objects are unchanged.
+            res.push(self.issubclass_result(left_untyped, left));
+        }
+        let narrowed = self.intersects(&res);
+        if preserved.is_empty() {
+            return narrowed;
+        }
+        // `type[Never]` is the empty set of classes, so it adds nothing next to the preserved
+        // members.
+        if !matches!(&narrowed, Type::Type(t) if t.is_never()) {
+            preserved.push(narrowed);
+        }
+        self.unions(preserved)
     }
 
     fn narrow_length_greater(&self, ty: &Type, len: usize) -> Type {

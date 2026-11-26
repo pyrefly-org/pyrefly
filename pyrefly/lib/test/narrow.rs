@@ -1505,6 +1505,50 @@ def f(cls: type[int], x: type[int] | type[str]):
 );
 
 testcase!(
+    test_not_issubclass_never_stays_never,
+    r#"
+from typing import Never, assert_type
+
+def f(x: Never) -> None:
+    if issubclass(x, dict):
+        assert_type(x, Never)
+    else:
+        assert_type(x, Never)
+    issubclass(x, set)
+    "#,
+);
+
+testcase!(
+    test_not_issubclass_preserves_non_class_members,
+    r#"
+from typing import Never, assert_type
+
+def f(x: type[int] | str) -> None:
+    if not issubclass(x, dict):  # E: Argument `str | type[int]` is not assignable to parameter `cls` with type `type`
+        assert_type(x, type[int] | str)
+
+def g(x: type[int] | type[str] | bytes) -> None:
+    if not issubclass(x, str):  # E: Argument `bytes | type[int | str]` is not assignable to parameter `cls` with type `type`
+        assert_type(x, type[int] | bytes)
+
+def h(x: int | str) -> None:
+    if issubclass(x, dict):  # E: Argument `int | str` is not assignable to parameter `cls` with type `type`
+        return
+    assert_type(x, int | str)
+
+def k(cls: type[int], x: type[int] | str) -> None:
+    # `cls` may be a subclass of `int`, so the class objects cannot be narrowed either.
+    if not issubclass(x, cls):  # E: Argument `str | type[int]` is not assignable to parameter `cls` with type `type`
+        assert_type(x, type[int] | str)
+
+def m(x: type[int]) -> None:
+    if issubclass(x, str):
+        if not issubclass(x, bytes):
+            assert_type(x, type[Never])
+    "#,
+);
+
+testcase!(
     test_issubclass_union,
     r#"
 from typing import assert_type
