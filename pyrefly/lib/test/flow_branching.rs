@@ -2714,6 +2714,122 @@ def p(u: str | os.PathLike[str]) -> None:
 );
 
 testcase!(
+    test_walrus_in_later_bool_op_operand_keeps_earlier_narrowing,
+    r#"
+from typing import assert_type
+
+class C: ...
+def find() -> C | None: ...
+
+def f(flag: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    # When `flag` is false the walrus never runs, so `c` keeps the narrowed `C`;
+    # otherwise the walrus ran and the fall-through excludes `None`.
+    if flag and (c := find()) is None:
+        return
+    assert_type(c, C)
+
+def g(flag: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    if flag and (c := find()) is None:
+        assert_type(c, None)
+    else:
+        assert_type(c, C)
+
+def h(flag: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    if flag or (c := find()) is None:
+        assert_type(c, C | None)
+    else:
+        assert_type(c, C)
+
+def i(flag: bool, other: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    if flag and other and (c := find()) is None:
+        return
+    assert_type(c, C)
+
+def j(flag: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    if not (flag and (c := find()) is None):
+        assert_type(c, C)
+
+def k(flag: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    if flag and (c := find()) is not None:
+        assert_type(c, C)
+    else:
+        assert_type(c, C | None)
+
+def m(flag: bool) -> None:
+    c = find()
+    # `c` was not narrowed before, so the fall-through still includes `None`.
+    if flag and (c := find()) is None:
+        return
+    assert_type(c, C | None)
+
+def n(flag: bool) -> None:
+    # `c` has no value before the operation, so there is nothing to restore.
+    if flag and (c := find()) is None:
+        return
+    assert_type(c, C | None)
+
+def p(a: C | None, c: C | None) -> None:
+    # The first `if` implies `c is not None` when `a is None` passes. That narrow describes the
+    # case in which the operand passed and must not leak into the fall-through, where the operand
+    # failed and `c` was never reassigned.
+    if a is None and c is None:
+        return
+    if a is None and (c := find()) is None:
+        return
+    assert_type(c, C | None)
+
+def q(flag: bool) -> None:
+    c = find()
+    # When `c` is falsy the walrus never runs, so the fall-through keeps `None`.
+    if c and flag and (c := find()) is None:
+        return
+    assert_type(c, C | None)
+
+def r(a: bool, b: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    if a and (b or (c := find()) is None):
+        return
+    assert_type(c, C)
+
+def s(flag: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    if (c := find()) is None or (flag and (c := find()) is None):
+        return
+    assert_type(c, C)
+
+def t(flag: bool) -> None:
+    c = find()
+    if c is None:
+        return
+    while flag and (c := find()) is None:
+        pass
+    assert_type(c, C)
+    "#,
+);
+
+testcase!(
     test_setitem_with_loop_and_walrus,
     r#"
 def f():

@@ -3051,6 +3051,14 @@ impl Scopes {
         Some(self.current().flow.get_info(name)?.value()?.idx)
     }
 
+    /// Get the flow idx for `name` in the current scope, taking the latest narrow into account.
+    ///
+    /// Returns `None` if there is no current flow (which may mean the
+    /// name is uninitialized in the current scope, or is not in scope at all).
+    pub fn current_narrowed_flow_idx(&self, name: &Name) -> Option<Idx<Key>> {
+        Some(self.current().flow.get_info(name)?.idx())
+    }
+
     /// Get the flow idx for `name` in the current fork's **base** flow (the flow captured
     /// at `start_fork` time, before any branches were started).
     ///

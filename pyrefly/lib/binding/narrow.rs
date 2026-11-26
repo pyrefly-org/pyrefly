@@ -116,6 +116,17 @@ pub enum AtomicNarrowOp {
     /// operation widens the name again. In a position where the whole test is known to have
     /// passed, such as the body of `if u and (u := str(u)):`, this restores the assigned type.
     WalrusValue(Idx<Key>),
+    /// The subject holds the value of this binding, because a walrus that assigns it sits in a
+    /// later operand of a boolean operation and has not run: the operand this fact belongs to
+    /// decided the operation first. The flow merge after the operation covers both the earlier
+    /// and the assigned value, so in a position where that operand is known to have decided the
+    /// result, such as the fall-through of `if flag and (c := f()) is None: return`, this
+    /// restores the value the name had when the operand was evaluated.
+    PriorValue(Idx<Key>),
+    /// The counterpart of `PriorValue` for the polarity in which the operand did not decide the
+    /// operation: the walrus ran, or may have run, so this operand adds nothing about the name
+    /// beyond the merged flow. It carries the binding so that negating it yields `PriorValue`.
+    MergedValue(Idx<Key>),
     /// Narrowing for sequence pattern matching - confirms the subject is a sequence type
     IsSequence,
     /// Negation of IsSequence - confirms the subject is NOT a sequence type
@@ -175,6 +186,8 @@ impl NarrowOp {
                     | AtomicNarrowOp::IsFalsy
                     | AtomicNarrowOp::MatchSubjectElement(_, _)
                     | AtomicNarrowOp::WalrusValue(_)
+                    | AtomicNarrowOp::PriorValue(_)
+                    | AtomicNarrowOp::MergedValue(_)
                     | AtomicNarrowOp::Placeholder
             ),
             Self::And(ops) | Self::Or(ops) => ops.iter().all(Self::is_plain_root),
@@ -262,6 +275,8 @@ impl DisplayWith<ModuleInfo> for AtomicNarrowOp {
                 write!(f, "MatchSubjectElement({subject:?}, {index})")
             }
             AtomicNarrowOp::WalrusValue(value) => write!(f, "WalrusValue({value:?})"),
+            AtomicNarrowOp::PriorValue(value) => write!(f, "PriorValue({value:?})"),
+            AtomicNarrowOp::MergedValue(value) => write!(f, "MergedValue({value:?})"),
             AtomicNarrowOp::IsNotSequence => write!(f, "IsNotSequence"),
             AtomicNarrowOp::IsMapping => write!(f, "IsMapping"),
             AtomicNarrowOp::IsNotMapping => write!(f, "IsNotMapping"),
@@ -410,7 +425,7 @@ impl AtomicNarrowOp {
             )),
             Self::Placeholder => None,
             Self::MatchSubjectElement(_, _) => None,
-            Self::WalrusValue(_) => None,
+            Self::WalrusValue(_) | Self::PriorValue(_) | Self::MergedValue(_) => None,
             Self::ClassCoverageGate(_) | Self::ClassCoverageGateNeg(_) => None,
         }
     }
@@ -461,6 +476,10 @@ impl AtomicNarrowOp {
             Self::MatchSubjectElement(_, _) => Self::Placeholder,
             // Whether the test passed or failed, an evaluated walrus has assigned its value.
             Self::WalrusValue(value) => Self::WalrusValue(*value),
+            // An operand decides a boolean operation in exactly one polarity: when it fails for
+            // `and`, when it passes for `or`. Only then has a walrus in a later operand not run.
+            Self::PriorValue(value) => Self::MergedValue(*value),
+            Self::MergedValue(value) => Self::PriorValue(*value),
             Self::ClassCoverageGate(ks) => Self::ClassCoverageGateNeg(ks.clone()),
             Self::ClassCoverageGateNeg(ks) => Self::ClassCoverageGate(ks.clone()),
         }
@@ -618,7 +637,7 @@ impl NarrowOp {
     /// where at least one branch is an unconstrained `Placeholder`).
     pub fn is_placeholder(&self) -> bool {
         match self {
-            Self::Atomic(_, AtomicNarrowOp::Placeholder) => true,
+            Self::Atomic(_, AtomicNarrowOp::Placeholder | AtomicNarrowOp::MergedValue(_)) => true,
             Self::Atomic(..) => false,
             Self::And(ops) => ops.iter().all(Self::is_placeholder),
             Self::Or(ops) => ops.iter().any(Self::is_placeholder),
@@ -1027,6 +1046,29 @@ impl NarrowOps {
         }
     }
 
+    /// Record, for an operand of a boolean operation, the names that a walrus in a later operand
+    /// assigns and that this operand says nothing about. When this operand decides the
+    /// operation (by failing for `and`, by passing for `or`), the walrus does not run and the
+    /// name keeps the value it had after the operand, as recorded by the bindings for the
+    /// operation. Without this fact, the operation has nothing to say about the name in that
+    /// case and falls back to the flow merged after the operation, which includes the assigned
+    /// value.
+    fn add_prior_values(&mut self, builder: &BindingsBuilder, operand: &Expr, op: BoolOp) {
+        for (name, idx) in builder.walrus_prior_values(operand.range()) {
+            // An operand that constrains the name has an entry for it, since every narrowing
+            // form is keyed by the base name of its subject. Only names the operand says nothing
+            // about get the fact, so it never overrides a narrow the operand established.
+            let atomic = match op {
+                // The fact holds when the operand fails, so it appears in the negation.
+                BoolOp::And => AtomicNarrowOp::MergedValue(*idx),
+                BoolOp::Or => AtomicNarrowOp::PriorValue(*idx),
+            };
+            self.0
+                .entry(name.clone())
+                .or_insert((NarrowOp::Atomic(None, atomic), operand.range()));
+        }
+    }
+
     pub fn from_single_narrow_op(left: &Expr, op: AtomicNarrowOp, range: TextRange) -> Self {
         let mut narrow_ops = Self::new();
         for subject in expr_to_subjects(left) {
@@ -1253,12 +1295,16 @@ impl NarrowOps {
                         )
                     )
                 });
-                let mut narrow_ops = Self::from_expr_helper(builder, exprs.next(), seen.clone());
+                let first = exprs.next();
+                let mut narrow_ops = Self::from_expr_helper(builder, first, seen.clone());
+                if let Some(first) = first {
+                    narrow_ops.add_prior_values(builder, first, *op);
+                }
                 for next_val in exprs {
-                    extend(
-                        &mut narrow_ops,
-                        Self::from_expr_helper(builder, Some(next_val), seen.clone()),
-                    )
+                    let mut next_ops =
+                        Self::from_expr_helper(builder, Some(next_val), seen.clone());
+                    next_ops.add_prior_values(builder, next_val, *op);
+                    extend(&mut narrow_ops, next_ops)
                 }
                 narrow_ops
             }
@@ -1531,6 +1577,11 @@ impl NarrowOps {
                         None => true,
                     }
                 }
+                // These facts restore a value from a specific point in the flow of the boolean
+                // operation they belong to, so they do not survive being aliased.
+                AtomicNarrowOp::WalrusValue(_)
+                | AtomicNarrowOp::PriorValue(_)
+                | AtomicNarrowOp::MergedValue(_) => false,
                 _ => false,
             },
         }

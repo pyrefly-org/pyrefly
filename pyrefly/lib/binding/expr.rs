@@ -30,9 +30,12 @@ use ruff_python_ast::Identifier;
 use ruff_python_ast::Operator;
 use ruff_python_ast::StringLiteral;
 use ruff_python_ast::name::Name;
+use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
+use ruff_python_ast::visitor::source_order::walk_expr;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use starlark_map::Hashed;
+use starlark_map::small_set::SmallSet;
 use thin_vec::ThinVec;
 use vec1::Vec1;
 
@@ -937,7 +940,20 @@ impl<'a> BindingsBuilder<'a> {
                 op,
                 values,
             }) => {
-                let mut values = values.iter_mut();
+                // A walrus in a later operand does not run when an earlier operand decides the
+                // operation, so the earlier operand leaves the name with the value it had at that
+                // point. Record that value for each operand so the narrowing of the operation can
+                // use it (see `NarrowOps::add_prior_values`). The first operand always runs, so
+                // only walruses in later operands matter; most operations have none.
+                let walrus_targets: Vec<SmallSet<Name>> =
+                    values.iter().skip(1).map(walrus_target_names).collect();
+                let operand_ranges: Vec<TextRange> =
+                    if walrus_targets.iter().any(|names| !names.is_empty()) {
+                        values.iter().map(Ranged::range).collect()
+                    } else {
+                        Vec::new()
+                    };
+                let mut values = values.iter_mut().enumerate();
                 fn get_narrow_ops(myself: &BindingsBuilder, expr: &Expr, op: BoolOp) -> NarrowOps {
                     let raw_narrow_ops = NarrowOps::from_expr(myself, Some(expr));
                     match op {
@@ -951,7 +967,7 @@ impl<'a> BindingsBuilder<'a> {
                         }
                     }
                 }
-                if let Some(value) = values.next() {
+                if let Some((_, value)) = values.next() {
                     // The first operation runs unconditionally, so any walrus-defined
                     // names will be added to the base flow.
                     self.ensure_expr(value, &mut usage.as_condition());
@@ -965,7 +981,23 @@ impl<'a> BindingsBuilder<'a> {
                     if self.sys_info.evaluate_bool(value) == short_circuit_trigger {
                         self.scopes.set_definitely_unreachable(true);
                     }
-                    for value in values {
+                    for (i, value) in values {
+                        // The flow holds the values the names have once the previous operand
+                        // has been evaluated, including the narrows of the operands before it,
+                        // but not the previous operand's own narrows: those describe the case
+                        // in which it passed, while the recorded value is for the case in which
+                        // it decided the operation (see `NarrowOps::add_prior_values`).
+                        if !operand_ranges.is_empty() {
+                            for name in walrus_targets[i - 1..].iter().flatten() {
+                                if let Some(idx) = self.scopes.current_narrowed_flow_idx(name) {
+                                    self.record_walrus_prior_value(
+                                        operand_ranges[i - 1],
+                                        name.clone(),
+                                        idx,
+                                    );
+                                }
+                            }
+                        }
                         self.bind_narrow_ops_for_branch(&narrow_ops, value);
                         self.ensure_expr(value, &mut usage.as_condition());
                         let new_narrow_ops = get_narrow_ops(self, value, *op);
@@ -1628,4 +1660,27 @@ impl<'a> BindingsBuilder<'a> {
         }
         decorator_keys
     }
+}
+
+/// The names assigned by a walrus anywhere in `expr`, except inside a lambda, whose body is a
+/// separate scope.
+fn walrus_target_names(expr: &Expr) -> SmallSet<Name> {
+    struct Finder(SmallSet<Name>);
+    impl<'a> SourceOrderVisitor<'a> for Finder {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            match expr {
+                Expr::Named(named) => {
+                    if let Expr::Name(target) = &*named.target {
+                        self.0.insert(target.id.clone());
+                    }
+                    walk_expr(self, expr);
+                }
+                Expr::Lambda(_) => {}
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+    let mut finder = Finder(SmallSet::new());
+    finder.visit_expr(expr);
+    finder.0
 }
