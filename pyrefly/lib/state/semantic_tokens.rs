@@ -640,7 +640,10 @@ impl SemanticTokenBuilder {
     fn process_expr(
         &mut self,
         x: &Expr,
-        get_attribute_kind: &dyn Fn(&ExprAttribute) -> Option<SemanticTokenTypes>,
+        get_attribute_kind: &dyn Fn(
+            &ExprAttribute,
+        )
+            -> Option<(SemanticTokenTypes, Vec<SemanticTokenModifiers>)>,
         get_symbol_kind: &dyn Fn(&Key) -> Option<(ModuleName, SymbolKind)>,
     ) {
         match x {
@@ -672,8 +675,9 @@ impl SemanticTokenBuilder {
             }
             Expr::Attribute(attr) => {
                 if range_overlaps(self.limit_range, attr.attr.range()) {
-                    let kind = get_attribute_kind(attr).unwrap_or(SemanticTokenTypes::Property);
-                    self.push_if_in_range(attr.attr.range(), kind, Vec::new());
+                    let (kind, modifiers) = get_attribute_kind(attr)
+                        .unwrap_or((SemanticTokenTypes::Property, Vec::new()));
+                    self.push_if_in_range(attr.attr.range(), kind, modifiers);
                 }
                 attr.value
                     .visit(&mut |x| self.process_expr(x, get_attribute_kind, get_symbol_kind));
@@ -716,7 +720,7 @@ impl SemanticTokenBuilder {
     fn process_stmt(
         &mut self,
         x: &Stmt,
-        in_class: bool,
+        class_body: Option<&[Stmt]>,
         get_symbol_kind: &dyn Fn(&Key) -> Option<(ModuleName, SymbolKind)>,
     ) {
         match x {
@@ -731,15 +735,43 @@ impl SemanticTokenBuilder {
                         );
                     }
                 }
-                x.recurse(&mut |x| self.process_stmt(x, true, get_symbol_kind));
+                x.recurse(&mut |x| self.process_stmt(x, Some(&class_def.body), get_symbol_kind));
             }
             Stmt::FunctionDef(function_def) => {
-                let token_type = if in_class {
+                let is_readonly_property = class_body.is_some_and(|class_body| {
+                    let name = &function_def.name.id;
+                    let decorators = &function_def.decorator_list;
+                    let is_property = decorators.iter().any(|d| match &d.expression {
+                        Expr::Name(n) => matches!(n.id.as_str(), "property" | "cached_property"),
+                        Expr::Attribute(a) => a.attr.as_str() == "cached_property",
+                        _ => false,
+                    });
+                    // A property is read-only unless the same class body defines a setter
+                    // for it with `@<name>.setter`.
+                    let has_setter = class_body
+                        .iter()
+                        .flat_map(|s| match s {
+                            Stmt::FunctionDef(f) => f.decorator_list.as_slice(),
+                            _ => &[],
+                        })
+                        .any(|d| {
+                            matches!(&d.expression, Expr::Attribute(a)
+                                if a.attr.as_str() == "setter"
+                                    && matches!(&*a.value, Expr::Name(n) if n.id == *name))
+                        });
+                    is_property && !has_setter
+                });
+                let token_type = if class_body.is_some() {
                     SemanticTokenTypes::Method
                 } else {
                     SemanticTokenTypes::Function
                 };
-                self.push_if_in_range(function_def.name.range, token_type, Vec::new());
+                let modifiers = if is_readonly_property {
+                    vec![SemanticTokenModifiers::Readonly]
+                } else {
+                    Vec::new()
+                };
+                self.push_if_in_range(function_def.name.range, token_type, modifiers);
                 if let Some(type_params) = &function_def.type_params {
                     for tp in &type_params.type_params {
                         self.push_if_in_range(
@@ -780,7 +812,7 @@ impl SemanticTokenBuilder {
                         modifiers,
                     );
                 }
-                x.recurse(&mut |x| self.process_stmt(x, false, get_symbol_kind));
+                x.recurse(&mut |x| self.process_stmt(x, None, get_symbol_kind));
             }
             Stmt::TypeAlias(type_alias) => {
                 self.push_if_in_range(
@@ -801,7 +833,7 @@ impl SemanticTokenBuilder {
                         }
                     }
                 }
-                x.recurse(&mut |x| self.process_stmt(x, in_class, get_symbol_kind));
+                x.recurse(&mut |x| self.process_stmt(x, class_body, get_symbol_kind));
             }
             Stmt::Try(stmt_try) => {
                 for ExceptHandler::ExceptHandler(handler) in stmt_try.handlers.iter() {
@@ -809,7 +841,7 @@ impl SemanticTokenBuilder {
                         self.push_if_in_range(name.range(), SemanticTokenTypes::Variable, vec![]);
                     }
                 }
-                x.recurse(&mut |x| self.process_stmt(x, in_class, get_symbol_kind));
+                x.recurse(&mut |x| self.process_stmt(x, class_body, get_symbol_kind));
             }
             Stmt::With(with) => {
                 for with_item in with.items.iter() {
@@ -817,13 +849,13 @@ impl SemanticTokenBuilder {
                         self.push_if_in_range(name.range(), SemanticTokenTypes::Variable, vec![]);
                     }
                 }
-                x.recurse(&mut |x| self.process_stmt(x, in_class, get_symbol_kind));
+                x.recurse(&mut |x| self.process_stmt(x, class_body, get_symbol_kind));
             }
             Stmt::Match(stmt_match) => {
                 for case in &stmt_match.cases {
                     self.process_pattern(&case.pattern);
                 }
-                x.recurse(&mut |x| self.process_stmt(x, in_class, get_symbol_kind));
+                x.recurse(&mut |x| self.process_stmt(x, class_body, get_symbol_kind));
             }
             Stmt::Import(StmtImport { names, .. }) => {
                 for alias in names {
@@ -895,20 +927,23 @@ impl SemanticTokenBuilder {
                 if let Expr::Name(name) = &*ann_assign.target {
                     self.push_if_in_range(name.range, SemanticTokenTypes::Variable, vec![]);
                 }
-                x.recurse(&mut |x| self.process_stmt(x, in_class, get_symbol_kind));
+                x.recurse(&mut |x| self.process_stmt(x, class_body, get_symbol_kind));
             }
-            _ => x.recurse(&mut |x| self.process_stmt(x, in_class, get_symbol_kind)),
+            _ => x.recurse(&mut |x| self.process_stmt(x, class_body, get_symbol_kind)),
         }
     }
 
     pub fn process_ast(
         &mut self,
         ast: &ModModule,
-        get_attribute_kind: &dyn Fn(&ExprAttribute) -> Option<SemanticTokenTypes>,
+        get_attribute_kind: &dyn Fn(
+            &ExprAttribute,
+        )
+            -> Option<(SemanticTokenTypes, Vec<SemanticTokenModifiers>)>,
         get_symbol_kind: &dyn Fn(&Key) -> Option<(ModuleName, SymbolKind)>,
     ) {
         for s in &ast.body {
-            self.process_stmt(s, false, get_symbol_kind);
+            self.process_stmt(s, None, get_symbol_kind);
         }
         ast.visit(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
     }

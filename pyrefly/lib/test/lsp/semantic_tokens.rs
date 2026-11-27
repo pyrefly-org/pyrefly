@@ -1401,7 +1401,11 @@ normalized_union_class: type[SingletonE] | type[SingletonF]
         ("Holder.kind", "class", "property"),
         ("Holder.A", "class", "property"),
         ("holder.kind", "variable", "property"),
-        ("e.kind", "variable", "property"),
+        (
+            "e.kind",
+            "variable",
+            "property, token-modifiers: [readonly]",
+        ),
         ("X.title", "class", "enumMember"),
         ("x.title", "variable", "enumMember"),
         ("str_enum_class.title", "class", "enumMember"),
@@ -2549,7 +2553,7 @@ fn attribute_range_skips_classification_but_visits_receiver() {
             &ast,
             &|attr| {
                 classified.borrow_mut().push(attr.attr.id.to_string());
-                Some(SemanticTokenTypes::Property)
+                Some((SemanticTokenTypes::Property, Vec::new()))
             },
             &|_| Some((ModuleName::from_str("main"), SymbolKind::Variable)),
         );
