@@ -2688,6 +2688,59 @@ f.current_timestamp
     );
 }
 
+/// The trailing string after a module-level assignment or PEP 695 type alias documents
+/// that name, following the convention pyright supports (pyrefly#5778).
+#[test]
+fn hover_on_variable_with_trailing_docstring() {
+    let code = r#"
+asdf = 1
+"""docs for asdf"""
+print(asdf)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(report.contains("docs for asdf"), "{report}");
+}
+
+#[test]
+fn hover_on_annotated_variable_with_trailing_docstring() {
+    let code = r#"
+asdf: int = 1
+"""docs for asdf"""
+print(asdf)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(report.contains("docs for asdf"), "{report}");
+}
+
+#[test]
+fn hover_on_type_alias_with_trailing_docstring() {
+    let code = r#"
+type Foo = int
+"""docs for Foo"""
+print(Foo)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(report.contains("docs for Foo"), "{report}");
+}
+
+/// A string statement documents the definition directly above it, so it must not
+/// leak into the hover of a name defined further away.
+#[test]
+fn hover_on_variable_does_not_steal_distant_trailing_docstring() {
+    let code = r#"
+asdf = 1
+other = 2
+"""docs for other"""
+print(asdf)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(!report.contains("docs for other"), "{report}");
+}
+
 #[test]
 fn hover_prefers_nonempty_pyi_docstring() {
     let mut test_env = TestEnv::new();
