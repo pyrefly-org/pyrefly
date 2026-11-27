@@ -1165,6 +1165,141 @@ token-type: property
 }
 
 #[test]
+fn readonly_property_test() {
+    let code = r#"
+from functools import cached_property
+
+class Box:
+    field: int
+
+    @property
+    def label(self) -> str:
+        return "box"
+
+    @property
+    def size(self) -> int:
+        return 1
+
+    @size.setter
+    def size(self, value: int) -> None: ...
+
+    @cached_property
+    def area(self) -> int:
+        return 1
+
+box = Box()
+box.field
+box.label
+box.size
+box.area
+"#;
+    assert_full_semantic_tokens(
+        &[("main", code)],
+        r#"
+# main.py
+line: 1, column: 5, length: 9, text: functools
+token-type: namespace
+
+line: 1, column: 22, length: 15, text: cached_property
+token-type: class
+
+line: 3, column: 6, length: 3, text: Box
+token-type: class
+
+line: 4, column: 4, length: 5, text: field
+token-type: variable
+
+line: 4, column: 11, length: 3, text: int
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 6, column: 5, length: 8, text: property
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 7, column: 8, length: 5, text: label
+token-type: method, token-modifiers: [readonly]
+
+line: 7, column: 14, length: 4, text: self
+token-type: parameter, token-modifiers: [selfParameter]
+
+line: 7, column: 23, length: 3, text: str
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 10, column: 5, length: 8, text: property
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 11, column: 8, length: 4, text: size
+token-type: method
+
+line: 11, column: 13, length: 4, text: self
+token-type: parameter, token-modifiers: [selfParameter]
+
+line: 11, column: 22, length: 3, text: int
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 14, column: 5, length: 4, text: size
+token-type: method
+
+line: 14, column: 10, length: 6, text: setter
+token-type: method
+
+line: 15, column: 8, length: 4, text: size
+token-type: method
+
+line: 15, column: 13, length: 4, text: self
+token-type: parameter, token-modifiers: [selfParameter]
+
+line: 15, column: 19, length: 5, text: value
+token-type: parameter
+
+line: 15, column: 26, length: 3, text: int
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 17, column: 5, length: 15, text: cached_property
+token-type: class
+
+line: 18, column: 8, length: 4, text: area
+token-type: method, token-modifiers: [readonly]
+
+line: 18, column: 13, length: 4, text: self
+token-type: parameter, token-modifiers: [selfParameter]
+
+line: 18, column: 22, length: 3, text: int
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 21, column: 0, length: 3, text: box
+token-type: variable
+
+line: 21, column: 6, length: 3, text: Box
+token-type: class
+
+line: 22, column: 0, length: 3, text: box
+token-type: variable
+
+line: 22, column: 4, length: 5, text: field
+token-type: property
+
+line: 23, column: 0, length: 3, text: box
+token-type: variable
+
+line: 23, column: 4, length: 5, text: label
+token-type: property, token-modifiers: [readonly]
+
+line: 24, column: 0, length: 3, text: box
+token-type: variable
+
+line: 24, column: 4, length: 4, text: size
+token-type: property
+
+line: 25, column: 0, length: 3, text: box
+token-type: variable
+
+line: 25, column: 4, length: 4, text: area
+token-type: property, token-modifiers: [readonly]
+"#,
+    );
+}
+
+#[test]
 fn enum_member_attribute_test() {
     let code = r#"
 from enum import Enum
