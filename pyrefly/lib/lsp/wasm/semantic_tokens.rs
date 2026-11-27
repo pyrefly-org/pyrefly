@@ -84,6 +84,7 @@ impl Transaction<'_> {
 
         builder.process_ast(
             &ast,
+            module_info.contents().as_str(),
             &|attr| self.attribute_semantic_token_type(handle, attr),
             &|key: &Key| {
                 let find_preference = FindPreference {

@@ -390,13 +390,23 @@ fn definition_matcher(
 /// Parses a forward-reference string such as `"list[Foo]"` into the expression the binder
 /// built from it. Only strings whose source text is exactly their value are parsed: escapes
 /// or implicit concatenation shift the ranges of the names parsed from a string.
-fn exact_forward_ref(literal: &ExprStringLiteral, source: &str) -> Option<Expr> {
+pub(crate) fn exact_forward_ref(literal: &ExprStringLiteral, source: &str) -> Option<Expr> {
     let part = literal.as_single_part_string()?;
     if &source[part.content_range()] == part.as_str() {
         Ast::parse_type_literal(literal, source).ok()
     } else {
         None
     }
+}
+
+/// Whether the binder treated a parsed forward reference as a type. The binder only parses
+/// strings in type positions, so a string counts only if a name in it has a key: ordinary
+/// strings and `Literal["..."]` values stay strings.
+pub(crate) fn is_type_forward_ref(parsed: &Expr, has_key: &dyn Fn(&Key) -> bool) -> bool {
+    let mut found = matches!(parsed, Expr::Name(name)
+        if has_key(&Key::BoundName(ShortIdentifier::expr_name(name))));
+    parsed.recurse(&mut |x| found = found || is_type_forward_ref(x, has_key));
+    found
 }
 
 #[derive(Clone, Debug)]
@@ -1113,22 +1123,12 @@ impl<'a> Transaction<'a> {
         exact_forward_ref(literal, self.get_module_info(handle)?.contents())
     }
 
-    /// Like `forward_ref_at`, but only for strings the binder treated as types. The binder only
-    /// parses strings in type positions, so a string counts only if a name in it has a key:
-    /// ordinary strings and `Literal["..."]` values stay strings.
+    /// Like `forward_ref_at`, but only for strings the binder treated as types.
     fn type_forward_ref_at(&self, handle: &Handle, covering_nodes: &[AnyNodeRef]) -> Option<Expr> {
-        fn any_name(x: &Expr, f: &impl Fn(&ExprName) -> bool) -> bool {
-            let mut found = matches!(x, Expr::Name(name) if f(name));
-            x.recurse(&mut |x| found = found || any_name(x, f));
-            found
-        }
         let parsed = self.forward_ref_at(handle, covering_nodes)?;
         let answers = self.get_answers(handle)?;
         let bindings = answers.bindings();
-        any_name(&parsed, &|name| {
-            bindings.is_valid_key(&Key::BoundName(ShortIdentifier::expr_name(name)))
-        })
-        .then_some(parsed)
+        is_type_forward_ref(&parsed, &|key| bindings.is_valid_key(key)).then_some(parsed)
     }
 
     pub(crate) fn identifier_from_covering_nodes(

@@ -331,6 +331,62 @@ token-type: string
 }
 
 #[test]
+fn forward_reference_syntax_tokens_test() {
+    let code = r#"class A: ...
+x: "list[A]"
+y = "A"
+"#;
+    assert_full_semantic_tokens_with_syntax(
+        &[("main", code)],
+        true,
+        r#"
+# main.py
+line: 0, column: 0, length: 5, text: class
+token-type: keyword
+
+line: 0, column: 6, length: 1, text: A
+token-type: class
+
+line: 0, column: 7, length: 1, text: :
+token-type: operator
+
+line: 0, column: 9, length: 3, text: ...
+token-type: operator
+
+line: 1, column: 0, length: 1, text: x
+token-type: variable
+
+line: 1, column: 1, length: 1, text: :
+token-type: operator
+
+line: 1, column: 3, length: 1, text: "
+token-type: string
+
+line: 1, column: 4, length: 4, text: list
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 1, column: 8, length: 1, text: [
+token-type: string
+
+line: 1, column: 9, length: 1, text: A
+token-type: class
+
+line: 1, column: 10, length: 2, text: ]"
+token-type: string
+
+line: 2, column: 0, length: 1, text: y
+token-type: variable
+
+line: 2, column: 2, length: 1, text: =
+token-type: operator
+
+line: 2, column: 4, length: 3, text: "A"
+token-type: string
+"#,
+    );
+}
+
+#[test]
 fn string_kind_syntax_tokens_test() {
     let code = r#"b"bytes"
 r"raw"
@@ -2412,6 +2468,7 @@ fn attribute_range_skips_classification_but_visits_receiver() {
         );
         builder.process_ast(
             &ast,
+            code,
             &|attr| {
                 classified.borrow_mut().push(attr.attr.id.to_string());
                 Some(SemanticTokenTypes::Property)
