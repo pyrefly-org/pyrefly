@@ -217,6 +217,62 @@ assert_type(Color9.RED, Literal[Color9.RED])
 );
 
 testcase!(
+    test_enum_functional_subclass,
+    TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),
+    r#"
+from enum import Enum, EnumMeta
+from typing import Callable, assert_type
+
+class Base(Enum):
+    @classmethod
+    def helper(cls) -> int:
+        return 42
+
+    def describe(self) -> str:
+        return self.name
+
+Dynamic = Base("Dynamic", {"A": "a"})
+assert_type(Dynamic, type[Base])
+assert_type(Dynamic.helper(), int)
+assert_type(Dynamic("a").describe(), str)
+
+Keyword = Base(value="Keyword", names=[("A", "a")])
+assert_type(Keyword, type[Base])
+assert_type(Keyword.helper(), int)
+
+factory: Callable[[str, dict[str, str]], type[Base]] = Base
+assert_type(factory("Other", {"B": "b"}).helper(), int)
+
+class CustomMeta(EnumMeta):
+    def __call__(cls, value: str, names: dict[str, str]) -> type[Enum]:
+        return Enum(value, names)
+
+class CustomBase(Enum, metaclass=CustomMeta):
+    pass
+
+assert_type(CustomBase("Custom", {"A": "a"}), type[Enum])
+"#,
+);
+
+testcase!(
+    test_enum_functional_subclass_3_10,
+    TestEnv::new_with_version(PythonVersion::new(3, 10, 0)),
+    r#"
+from enum import Enum
+from typing_extensions import assert_type
+
+class Base(Enum):
+    @classmethod
+    def helper(cls) -> int:
+        return 42
+
+Dynamic = Base("Dynamic", {"A": "a"})
+assert_type(Dynamic, type[Base])
+assert_type(Dynamic.helper(), int)
+"#,
+);
+
+testcase!(
     test_enum_functional_walrus_arguments,
     r#"
 from enum import Enum

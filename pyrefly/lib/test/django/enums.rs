@@ -8,6 +8,24 @@
 use crate::django_testcase;
 
 django_testcase!(
+    test_functional_choices,
+    r#"
+from django.db.models import IntegerChoices, TextChoices
+from typing import assert_type
+
+Text = TextChoices("Text", [("A", "a")])
+assert_type(Text, type[TextChoices])
+assert_type(Text.choices, list[tuple[str, str]])
+assert_type(Text.values, list[str])
+
+Number = IntegerChoices("Number", {"A": 1})
+assert_type(Number, type[IntegerChoices])
+assert_type(Number.choices, list[tuple[int, str]])
+assert_type(Number.values, list[int])
+"#,
+);
+
+django_testcase!(
     test_int_choices,
     r#"
 from django.db.models import IntegerChoices
