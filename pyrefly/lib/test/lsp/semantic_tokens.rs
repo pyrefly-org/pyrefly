@@ -1300,6 +1300,176 @@ token-type: property, token-modifiers: [readonly]
 }
 
 #[test]
+fn readonly_property_edge_cases_test() {
+    let code = r#"
+import functools
+
+class Box:
+    @property
+    def label(self) -> str:
+        return "box"
+
+class Big(Box):
+    pass
+
+class Writable(Box):
+    @Box.label.setter
+    def label(self, value: str) -> None: ...
+
+class Crate:
+    label: str
+
+class Cached:
+    @functools.cached_property
+    def area(self) -> int:
+        return 1
+
+def f(big: Big, writable: Writable, x: Box | Crate, cached: Cached) -> None:
+    big.label
+    writable.label
+    x.label
+    cached.area
+"#;
+    assert_full_semantic_tokens(
+        &[("main", code)],
+        r#"
+# main.py
+line: 1, column: 7, length: 9, text: functools
+token-type: namespace
+
+line: 3, column: 6, length: 3, text: Box
+token-type: class
+
+line: 4, column: 5, length: 8, text: property
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 5, column: 8, length: 5, text: label
+token-type: method, token-modifiers: [readonly]
+
+line: 5, column: 14, length: 4, text: self
+token-type: parameter, token-modifiers: [selfParameter]
+
+line: 5, column: 23, length: 3, text: str
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 8, column: 6, length: 3, text: Big
+token-type: class
+
+line: 8, column: 10, length: 3, text: Box
+token-type: class
+
+line: 11, column: 6, length: 8, text: Writable
+token-type: class
+
+line: 11, column: 15, length: 3, text: Box
+token-type: class
+
+line: 12, column: 5, length: 3, text: Box
+token-type: class
+
+line: 12, column: 9, length: 5, text: label
+token-type: method, token-modifiers: [readonly]
+
+line: 12, column: 15, length: 6, text: setter
+token-type: method
+
+line: 13, column: 8, length: 5, text: label
+token-type: method
+
+line: 13, column: 14, length: 4, text: self
+token-type: parameter, token-modifiers: [selfParameter]
+
+line: 13, column: 20, length: 5, text: value
+token-type: parameter
+
+line: 13, column: 27, length: 3, text: str
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 15, column: 6, length: 5, text: Crate
+token-type: class
+
+line: 16, column: 4, length: 5, text: label
+token-type: variable
+
+line: 16, column: 11, length: 3, text: str
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 18, column: 6, length: 6, text: Cached
+token-type: class
+
+line: 19, column: 5, length: 9, text: functools
+token-type: namespace
+
+line: 19, column: 15, length: 15, text: cached_property
+token-type: class
+
+line: 20, column: 8, length: 4, text: area
+token-type: method, token-modifiers: [readonly]
+
+line: 20, column: 13, length: 4, text: self
+token-type: parameter, token-modifiers: [selfParameter]
+
+line: 20, column: 22, length: 3, text: int
+token-type: class, token-modifiers: [defaultLibrary]
+
+line: 23, column: 4, length: 1, text: f
+token-type: function
+
+line: 23, column: 6, length: 3, text: big
+token-type: parameter
+
+line: 23, column: 11, length: 3, text: Big
+token-type: class
+
+line: 23, column: 16, length: 8, text: writable
+token-type: parameter
+
+line: 23, column: 26, length: 8, text: Writable
+token-type: class
+
+line: 23, column: 36, length: 1, text: x
+token-type: parameter
+
+line: 23, column: 39, length: 3, text: Box
+token-type: class
+
+line: 23, column: 45, length: 5, text: Crate
+token-type: class
+
+line: 23, column: 52, length: 6, text: cached
+token-type: parameter
+
+line: 23, column: 60, length: 6, text: Cached
+token-type: class
+
+line: 24, column: 4, length: 3, text: big
+token-type: parameter
+
+line: 24, column: 8, length: 5, text: label
+token-type: property, token-modifiers: [readonly]
+
+line: 25, column: 4, length: 8, text: writable
+token-type: parameter
+
+line: 25, column: 13, length: 5, text: label
+token-type: property
+
+line: 26, column: 4, length: 1, text: x
+token-type: parameter
+
+line: 26, column: 6, length: 5, text: label
+token-type: property
+
+line: 27, column: 4, length: 6, text: cached
+token-type: parameter
+
+line: 27, column: 11, length: 4, text: area
+token-type: property, token-modifiers: [readonly]
+"#,
+    );
+}
+
+#[test]
 fn enum_member_attribute_test() {
     let code = r#"
 from enum import Enum
