@@ -43,6 +43,8 @@ use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 
 use crate::binding::binding::Key;
+use crate::state::lsp::exact_forward_ref;
+use crate::state::lsp::is_type_forward_ref;
 
 const SELF_PARAMETER_MODIFIER: SemanticTokenModifiers =
     SemanticTokenModifiers::Custom(Cow::Borrowed("selfParameter"));
@@ -640,6 +642,7 @@ impl SemanticTokenBuilder {
     fn process_expr(
         &mut self,
         x: &Expr,
+        source: &str,
         get_attribute_kind: &dyn Fn(&ExprAttribute) -> Option<SemanticTokenTypes>,
         get_symbol_kind: &dyn Fn(&Key) -> Option<(ModuleName, SymbolKind)>,
     ) {
@@ -668,47 +671,73 @@ impl SemanticTokenBuilder {
             }
             Expr::Call(call) => {
                 self.process_arguments(&call.arguments);
-                x.recurse(&mut |x| self.process_expr(x, get_attribute_kind, get_symbol_kind));
+                x.recurse(&mut |x| {
+                    self.process_expr(x, source, get_attribute_kind, get_symbol_kind)
+                });
             }
             Expr::Attribute(attr) => {
                 if range_overlaps(self.limit_range, attr.attr.range()) {
                     let kind = get_attribute_kind(attr).unwrap_or(SemanticTokenTypes::Property);
                     self.push_if_in_range(attr.attr.range(), kind, Vec::new());
                 }
-                attr.value
-                    .visit(&mut |x| self.process_expr(x, get_attribute_kind, get_symbol_kind));
+                attr.value.visit(&mut |x| {
+                    self.process_expr(x, source, get_attribute_kind, get_symbol_kind)
+                });
             }
             // Comprehensions need special handling because the Visit trait doesn't visit targets
             Expr::ListComp(list_comp) => {
                 for comp in &list_comp.generators {
-                    comp.target
-                        .visit(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+                    comp.target.visit(&mut |e| {
+                        self.process_expr(e, source, get_attribute_kind, get_symbol_kind)
+                    });
                 }
-                x.recurse(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+                x.recurse(&mut |e| {
+                    self.process_expr(e, source, get_attribute_kind, get_symbol_kind)
+                });
             }
             Expr::SetComp(set_comp) => {
                 for comp in &set_comp.generators {
-                    comp.target
-                        .visit(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+                    comp.target.visit(&mut |e| {
+                        self.process_expr(e, source, get_attribute_kind, get_symbol_kind)
+                    });
                 }
-                x.recurse(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+                x.recurse(&mut |e| {
+                    self.process_expr(e, source, get_attribute_kind, get_symbol_kind)
+                });
             }
             Expr::DictComp(dict_comp) => {
                 for comp in &dict_comp.generators {
-                    comp.target
-                        .visit(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+                    comp.target.visit(&mut |e| {
+                        self.process_expr(e, source, get_attribute_kind, get_symbol_kind)
+                    });
                 }
-                x.recurse(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+                x.recurse(&mut |e| {
+                    self.process_expr(e, source, get_attribute_kind, get_symbol_kind)
+                });
+            }
+            Expr::StringLiteral(literal) => {
+                // The names in a forward reference such as `"list[Foo]"` have keys at their
+                // ranges in the source, so they are classified like unquoted names.
+                if let Some(forward_ref) = exact_forward_ref(literal, source)
+                    && is_type_forward_ref(&forward_ref, &|key| get_symbol_kind(key).is_some())
+                {
+                    self.process_expr(&forward_ref, source, get_attribute_kind, get_symbol_kind);
+                }
             }
             Expr::Generator(generator) => {
                 for comp in &generator.generators {
-                    comp.target
-                        .visit(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+                    comp.target.visit(&mut |e| {
+                        self.process_expr(e, source, get_attribute_kind, get_symbol_kind)
+                    });
                 }
-                x.recurse(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+                x.recurse(&mut |e| {
+                    self.process_expr(e, source, get_attribute_kind, get_symbol_kind)
+                });
             }
             _ => {
-                x.recurse(&mut |x| self.process_expr(x, get_attribute_kind, get_symbol_kind));
+                x.recurse(&mut |x| {
+                    self.process_expr(x, source, get_attribute_kind, get_symbol_kind)
+                });
             }
         }
     }
@@ -904,18 +933,49 @@ impl SemanticTokenBuilder {
     pub fn process_ast(
         &mut self,
         ast: &ModModule,
+        source: &str,
         get_attribute_kind: &dyn Fn(&ExprAttribute) -> Option<SemanticTokenTypes>,
         get_symbol_kind: &dyn Fn(&Key) -> Option<(ModuleName, SymbolKind)>,
     ) {
         for s in &ast.body {
             self.process_stmt(s, false, get_symbol_kind);
         }
-        ast.visit(&mut |e| self.process_expr(e, get_attribute_kind, get_symbol_kind));
+        ast.visit(&mut |e| self.process_expr(e, source, get_attribute_kind, get_symbol_kind));
     }
 
+    /// Returns the tokens sorted by start. LSP clients expect tokens not to overlap, so a string
+    /// token is split around the tokens inside it, such as the names in a forward reference.
     pub fn all_tokens_sorted(self) -> Vec<SemanticTokenWithFullRange> {
-        let mut tokens = self.tokens;
-        tokens.sort_by_key(|a| a.range.start());
+        let (strings, mut tokens): (Vec<_>, Vec<_>) = self
+            .tokens
+            .into_iter()
+            .partition(|token| token.token_type == SemanticTokenTypes::String);
+        tokens.sort_by_key(|token| token.range.start());
+        let mut string_segments = Vec::new();
+        for string in strings {
+            let first_inside =
+                tokens.partition_point(|token| token.range.start() < string.range.start());
+            let mut start = string.range.start();
+            for inner in tokens[first_inside..]
+                .iter()
+                .take_while(|token| string.range.contains_range(token.range))
+            {
+                string_segments.push(TextRange::new(start, inner.range.start()));
+                start = inner.range.end();
+            }
+            string_segments.push(TextRange::new(start, string.range.end()));
+            for segment in string_segments
+                .drain(..)
+                .filter(|segment| !segment.is_empty())
+            {
+                tokens.push(SemanticTokenWithFullRange {
+                    range: segment,
+                    token_type: SemanticTokenTypes::String,
+                    token_modifiers: string.token_modifiers.clone(),
+                });
+            }
+        }
+        tokens.sort_by_key(|token| token.range.start());
         tokens
     }
 }

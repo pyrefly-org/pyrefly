@@ -2468,6 +2468,7 @@ fn attribute_range_skips_classification_but_visits_receiver() {
         );
         builder.process_ast(
             &ast,
+            code,
             &|attr| {
                 classified.borrow_mut().push(attr.attr.id.to_string());
                 Some(SemanticTokenTypes::Property)
