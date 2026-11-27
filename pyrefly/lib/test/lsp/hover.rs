@@ -2742,6 +2742,37 @@ print(asdf)
 }
 
 #[test]
+fn hover_on_walrus_target_does_not_show_assignment_docstring() {
+    let code = r#"
+result = (helper := 1)
+#          ^
+"""Result docs."""
+print(helper)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert_eq!(report.matches("(variable) helper:").count(), 2, "{report}");
+    assert!(!report.contains("Result docs."), "{report}");
+}
+
+#[test]
+fn hover_on_class_valued_variable_prefers_trailing_docstring() {
+    let code = r#"
+class Target:
+    """Target class docs."""
+
+factory: type[Target] = Target
+"""Factory variable docs."""
+
+print(factory)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(report.contains("Factory variable docs."), "{report}");
+    assert!(!report.contains("Target class docs."), "{report}");
+}
+
+#[test]
 fn hover_prefers_nonempty_pyi_docstring() {
     let mut test_env = TestEnv::new();
     test_env.add_with_path(

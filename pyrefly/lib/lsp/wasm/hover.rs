@@ -1480,30 +1480,30 @@ fn field_docstring_at_definition(
 /// statement adjacent to it in this body.
 fn trailing_docstring_at_definition(
     ast: &ModModule,
-    module: Module,
+    module: &Module,
     definition_range: TextRange,
 ) -> Option<Docstring> {
     let mut stmts = ast.body.iter();
-    while let Some(stmt) = stmts.next() {
-        // Classes and functions document themselves through their bodies, and a
-        // definition nested in another statement is not adjacent to this body.
-        if stmt.range().contains(definition_range.start())
-            && matches!(
-                stmt,
-                Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::TypeAlias(_)
-            )
-        {
-            return match stmts.next() {
-                Some(Stmt::Expr(expr_stmt))
-                    if matches!(&*expr_stmt.value, Expr::StringLiteral(_)) =>
-                {
-                    Some(Docstring(expr_stmt.range(), module))
-                }
-                _ => None,
-            };
-        }
+    let stmt = stmts.find(|stmt| stmt.range().contains_range(definition_range))?;
+    // The right-hand side can define names of its own via assignment expressions.
+    let binds_name = |target: &Expr| {
+        let mut binds = false;
+        Ast::expr_lvalue(target, &mut |name| binds |= name.range == definition_range);
+        binds
+    };
+    let is_target = match stmt {
+        Stmt::Assign(assign) => assign.targets.iter().any(binds_name),
+        Stmt::AnnAssign(assign) => binds_name(&assign.target),
+        Stmt::TypeAlias(alias) => binds_name(&alias.name),
+        _ => false,
+    };
+    if !is_target {
+        return None;
     }
-    None
+    Some(Docstring(
+        Docstring::range_from_stmts(stmts.as_slice())?,
+        module.dupe(),
+    ))
 }
 
 fn is_constructor_dunder(name: Option<&str>) -> bool {
@@ -1803,35 +1803,35 @@ pub fn get_hover_with_verbosity(
     let hover_constructor_dunder = definition
         .as_ref()
         .is_some_and(|item| is_constructor_dunder(item.display_name.as_deref()));
-    // Kept separately because the destructuring below moves fields out of `definition`.
-    let definition_site = definition
-        .as_ref()
-        .map(|item| (item.definition_range, item.module.clone()));
-    let (kind, name, fallback_docstring, definition_parameter_docs) =
-        if let Some(FindDefinitionItemWithDocstring {
-            metadata,
-            definition_range: definition_location,
-            module,
-            doc_ranges,
-            ref display_name,
-        }) = definition
-        {
-            let kind = metadata.symbol_kind();
-            let name = hover_name_from_definition_snippet(
-                module.code_at(definition_location),
-                display_name.as_deref(),
-                fallback_name_from_type,
-            );
-            let parameter_docs = doc_ranges.parameter_docs(&module).collect::<Vec<_>>();
-            let docstring = doc_ranges.docstring().map(|range| Docstring(range, module));
-            (kind, name, docstring, parameter_docs)
-        } else {
-            (None, fallback_name_from_type, None, Vec::new())
-        };
     let docstring = interface_docstring
         .and_then(nonempty_docstring)
-        .or_else(|| fallback_docstring.and_then(nonempty_docstring))
+        .or_else(|| {
+            let item = definition.as_ref()?;
+            nonempty_docstring(Docstring(item.doc_ranges.docstring()?, item.module.dupe()))
+        })
+        .or_else(|| {
+            let item = definition.as_ref()?;
+            // The hovered module's AST only describes definitions in this file.
+            if item.module.path() != handle.path() {
+                return None;
+            }
+            trailing_docstring_at_definition(ast.as_deref()?, &item.module, item.definition_range)
+                .and_then(nonempty_docstring)
+        })
         .or_else(|| docstring_for_class_object_type(transaction, handle, &type_));
+
+    let (kind, name, definition_parameter_docs) = if let Some(item) = definition {
+        let kind = item.metadata.symbol_kind();
+        let name = hover_name_from_definition_snippet(
+            item.module.code_at(item.definition_range),
+            item.display_name.as_deref(),
+            fallback_name_from_type,
+        );
+        let parameter_docs = item.doc_ranges.parameter_docs(&item.module).collect();
+        (kind, name, parameter_docs)
+    } else {
+        (None, fallback_name_from_type, Vec::new())
+    };
 
     let docstring = if hover_constructor_dunder {
         docstring.or_else(|| class_docstring_for_constructor(transaction, handle, position))
@@ -1839,15 +1839,6 @@ pub fn get_hover_with_verbosity(
         docstring
     }
     .or_else(|| field_docstring_at_definition(ast.as_deref()?, module_info?, position))
-    .or_else(|| {
-        // A trailing string documents a variable or type alias at its definition site
-        // (pyrefly#5778). The hovered module's AST only describes this module, so
-        // definitions in other modules are skipped rather than re-parsed here.
-        let (definition_range, module) = definition_site.as_ref()?;
-        (module.path() == handle.path()).then(|| {
-            trailing_docstring_at_definition(ast.as_deref()?, module.clone(), *definition_range)
-        })?
-    })
     .or_else(|| inherited_method_docstring(transaction, handle, &type_, name.as_deref()?));
 
     let name = name.or_else(|| identifier_text_at(transaction, handle, position));
