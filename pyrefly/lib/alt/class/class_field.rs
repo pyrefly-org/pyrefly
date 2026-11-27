@@ -6243,9 +6243,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             None
         } else {
             let instance = Instance::of_metaclass(ClassBase::ClassType(cls.clone()), metaclass);
-            attr.value
-                .as_raw_special_method_type(self.heap, &instance, self)
-                .and_then(|ty| make_bound_method(self, &instance, ty).ok())
+            let mut ty = attr
+                .value
+                .as_raw_special_method_type(self.heap, &instance, self)?;
+            if metadata.is_enum() && attr.defining_class == *self.stdlib.enum_meta().class_object()
+            {
+                // The functional enum API creates a subclass of the receiver.
+                ty.transform_toplevel_callable_signatures(|callable, _| {
+                    if let Type::Type(inner) = &callable.ret
+                        && let Type::ClassType(base) = inner.as_ref()
+                        && base.is(KnownClass::Enum)
+                    {
+                        callable.ret = self.heap.mk_type_of(self.heap.mk_class_type(cls.clone()));
+                    }
+                });
+            }
+            make_bound_method(self, &instance, ty).ok()
         }
     }
 
