@@ -1467,17 +1467,7 @@ fn field_docstring_at_definition(
     Some(Docstring(range, module))
 }
 
-/// The docstring in the statement after the definition of the hovered name, the
-/// conventional way to document a module-level variable or PEP 695 type alias:
-///
-/// ```python
-/// asdf = 1
-/// """Docs for asdf."""
-/// ```
-///
-/// Only the module body is scanned: class fields are documented through
-/// `field_docstring_at_definition`, and a definition in a nested scope has no
-/// statement adjacent to it in this body.
+/// Finds the trailing docstring for a top-level assignment or type alias.
 fn trailing_docstring_at_definition(
     ast: &ModModule,
     module: &Module,
@@ -1811,7 +1801,6 @@ pub fn get_hover_with_verbosity(
         })
         .or_else(|| {
             let item = definition.as_ref()?;
-            // The hovered module's AST only describes definitions in this file.
             if item.module.path() != handle.path() {
                 return None;
             }

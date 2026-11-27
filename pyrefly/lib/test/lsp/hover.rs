@@ -2688,8 +2688,6 @@ f.current_timestamp
     );
 }
 
-/// The trailing string after a module-level assignment or PEP 695 type alias documents
-/// that name, following the convention pyright supports (pyrefly#5778).
 #[test]
 fn hover_on_variable_with_trailing_docstring() {
     let code = r#"
@@ -2726,8 +2724,6 @@ print(Foo)
     assert!(report.contains("docs for Foo"), "{report}");
 }
 
-/// A string statement documents the definition directly above it, so it must not
-/// leak into the hover of a name defined further away.
 #[test]
 fn hover_on_variable_does_not_steal_distant_trailing_docstring() {
     let code = r#"
