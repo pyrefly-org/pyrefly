@@ -1158,6 +1158,18 @@ set `infer-return-types` to `"never"` in your config or pass it as a flag.
 - Default: `"checked"`
 - Flag equivalent: `--infer-return-types`
 
+### `legacy-generator-send-type`
+
+When Pyrefly infers a generator's return type, its send type defaults to `object`,
+including in generators that use `yield from`. Pyrefly does not infer the send type
+from delegates; use a return annotation such as `Generator[int, str | None]` to
+specify it. Set `legacy-generator-send-type = true` to use `Unknown` instead.
+Migration from mypy or Pyright enables the setting; migration from BasedPyright
+leaves it off.
+
+- Type: boolean
+- Default: `false`
+
 ### `infer-param-types-from-docstring`
 
 Whether to use the parameter types that a Sphinx style docstring declares for parameters
