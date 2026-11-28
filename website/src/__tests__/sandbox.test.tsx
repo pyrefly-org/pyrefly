@@ -9,10 +9,33 @@
 
 import '@testing-library/jest-dom';
 import { act } from 'react';
-import { fireEvent, render } from '@testing-library/react';
+import { fireEvent, render, waitFor } from '@testing-library/react';
 import Sandbox from '../sandbox/Sandbox';
 import { SANDBOX_FILE_NAME } from '../pages/sandbox';
 import { DEFAULT_SANDBOX_PROGRAM } from '../sandbox/DefaultSandboxProgram';
+import { fetchPyreflyVersions } from '../sandbox/pyreflyVersions';
+import { loadPyrefly } from '../sandbox/pyreflyWasmLoader';
+
+// The version selector would fetch the version list from the network; the
+// snapshot pins the sandbox while the list is still loading. The mock is
+// countable so that tests can assert how often the catalog is requested.
+jest.mock('../sandbox/pyreflyVersions', () => ({
+    fetchPyreflyVersions: jest.fn(() => new Promise(() => {})),
+}));
+
+// The loader is mocked so that tests can drive version loads; the default
+// implementation is the real one, which loads the bundled build.
+jest.mock('../sandbox/pyreflyWasmLoader', () => {
+    const actual = jest.requireActual('../sandbox/pyreflyWasmLoader');
+    return {
+        ...actual,
+        loadPyrefly: jest.fn(),
+    };
+});
+
+const actualLoader = jest.requireActual('../sandbox/pyreflyWasmLoader');
+const loadPyreflyMock = loadPyrefly as unknown as jest.Mock;
+const fetchVersionsMock = fetchPyreflyVersions as unknown as jest.Mock;
 
 describe('Sandbox Component', () => {
     const pyreflyCommit = '123456789abcdef';
@@ -23,6 +46,17 @@ describe('Sandbox Component', () => {
 
     afterAll(() => {
         delete process.env.PYREFLY_COMMIT;
+    });
+
+    beforeEach(() => {
+        loadPyreflyMock.mockImplementation((version: string | null) =>
+            actualLoader.loadPyrefly(version)
+        );
+        fetchVersionsMock.mockClear();
+    });
+
+    afterEach(() => {
+        window.history.replaceState({}, '', '/');
     });
 
     test('render sandbox correctly', async () => {
@@ -115,6 +149,118 @@ describe('Sandbox Component', () => {
         } finally {
             process.env.PYREFLY_COMMIT = pyreflyCommit;
         }
+    });
+
+    // Ordinary UI updates must not remount the selector into another
+    // catalog fetch.
+    test('does not refetch the version catalog on ordinary UI updates', async () => {
+        const { getByLabelText } = await act(async () => {
+            const result = render(
+                <Sandbox sampleFilename={SANDBOX_FILE_NAME} />
+            );
+            await Promise.resolve();
+            return result;
+        });
+        const fetchCount = fetchVersionsMock.mock.calls.length;
+        expect(fetchCount).toBeGreaterThan(0);
+
+        fireEvent.click(getByLabelText('Parameter hints'));
+        await act(async () => {
+            await Promise.resolve();
+        });
+
+        expect(fetchVersionsMock.mock.calls.length).toBe(fetchCount);
+    });
+
+    // A build that loads but rejects `State` must not become the reported
+    // version: the selection and URL would claim a checker that never ran.
+    test('falls back when a selected version cannot construct State', async () => {
+        window.history.replaceState({}, '', '/?pyrefly=1.2.0');
+        loadPyreflyMock.mockImplementation((version: string | null) =>
+            version === null
+                ? actualLoader.loadPyrefly(version)
+                : Promise.resolve({
+                      mod: {
+                          version: () => '1.2.0',
+                          State: class {
+                              constructor() {
+                                  throw new Error('incompatible State');
+                              }
+                          },
+                      },
+                      wasmSource:
+                          'https://example.invalid/pyrefly_wasm_bg.wasm',
+                  })
+        );
+
+        const { getByLabelText } = await act(async () => {
+            const result = render(
+                <Sandbox sampleFilename={SANDBOX_FILE_NAME} />
+            );
+            await Promise.resolve();
+            return result;
+        });
+
+        const selector = getByLabelText('Select Pyrefly version');
+        await waitFor(() => expect(selector).toHaveValue(''));
+        expect(window.location.search).not.toContain('pyrefly');
+    });
+
+    // The fallback explanation lives in its own state: the successful
+    // bundled load that follows must not erase it.
+    test('keeps the fallback warning visible after the bundled build loads', async () => {
+        window.history.replaceState({}, '', '/?pyrefly=1.2.0');
+        loadPyreflyMock.mockImplementation((version: string | null) =>
+            version === null
+                ? actualLoader.loadPyrefly(version)
+                : Promise.reject(new Error('network down'))
+        );
+
+        const { getByLabelText, getByText } = await act(async () => {
+            const result = render(
+                <Sandbox sampleFilename={SANDBOX_FILE_NAME} />
+            );
+            await Promise.resolve();
+            return result;
+        });
+
+        await waitFor(() =>
+            expect(getByLabelText('Select Pyrefly version')).toHaveValue('')
+        );
+        await waitFor(() =>
+            expect(
+                getByText(/Failed to load pyrefly 1\.2\.0/)
+            ).toBeInTheDocument()
+        );
+    });
+
+    // The URL is global: a load that outlives its sandbox must not write it.
+    test('a stale load failure does not clear the URL of a later sandbox', async () => {
+        window.history.replaceState({}, '', '/?pyrefly=2.0.0');
+        let rejectLoad: (reason?: unknown) => void = () => {};
+        loadPyreflyMock.mockImplementation((version: string | null) =>
+            version === null
+                ? actualLoader.loadPyrefly(version)
+                : new Promise((_resolve, reject) => {
+                      rejectLoad = reject;
+                  })
+        );
+
+        const { unmount } = await act(async () => {
+            const result = render(
+                <Sandbox sampleFilename={SANDBOX_FILE_NAME} />
+            );
+            await Promise.resolve();
+            return result;
+        });
+        unmount();
+
+        await act(async () => {
+            rejectLoad(new Error('too late'));
+            await Promise.resolve();
+        });
+
+        expect(window.location.search).toContain('pyrefly=2.0.0');
     });
 
     function expectMonacoEditorLoadedWithContent(

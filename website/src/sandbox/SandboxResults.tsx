@@ -43,6 +43,8 @@ interface SandboxResultsProps {
     goToDef: GoToDefFromError;
     errors?: ReadonlyArray<PyreflyErrorMessage> | null;
     internalError: string;
+    /** Why the sandbox fell back to the bundled pyrefly build, if it did. */
+    fallbackWarning: string;
     pythonOutput: string;
     pyodideStatus: PyodideStatus;
     activeTab: string;
@@ -132,6 +134,7 @@ export default function SandboxResults({
     goToDef,
     errors,
     internalError,
+    fallbackWarning,
     pythonOutput,
     pyodideStatus,
     activeTab,
@@ -180,6 +183,9 @@ export default function SandboxResults({
                 {!loading && activeToolbarTab === 'errors' && (
                     <pre {...stylex.props(styles.resultBody)}>
                         <ul {...stylex.props(styles.errorsList)}>
+                            {fallbackWarning ? (
+                                <li>{fallbackWarning}</li>
+                            ) : null}
                             {hasTypecheckErrors ? (
                                 errors
                                     .filter((error) => error.severity > 1)
