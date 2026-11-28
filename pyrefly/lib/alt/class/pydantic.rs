@@ -179,7 +179,24 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         } else {
             Required::Required
         };
-        let root_model_type = if !accepts_any_input && (is_any_or_quantified || has_strict) {
+        // A nested Pydantic model can validate raw input even when the enclosing root is strict.
+        let has_nested_model = || {
+            root_model_type.any(|ty| {
+                let Type::ClassType(cls) = ty else {
+                    return false;
+                };
+                matches!(
+                    self.get_metadata_for_class(cls.class_object())
+                        .pydantic_model_kind(),
+                    Some(
+                        PydanticModelKind::BaseModel | RootModel | PydanticModelKind::BaseSettings
+                    )
+                )
+            })
+        };
+        let root_model_type = if !accepts_any_input
+            && (is_any_or_quantified || (has_strict && !has_nested_model()))
+        {
             root_model_type
         } else {
             self.heap.mk_any_explicit()

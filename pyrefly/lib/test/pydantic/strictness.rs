@@ -791,7 +791,6 @@ assert_type(Text(b"hello").root, str)
 );
 
 pydantic_testcase!(
-    bug = "Strict RootModel rejects dictionaries for nested models",
     test_strict_root_model_nested_model_input,
     r#"
 from typing import assert_type
@@ -811,8 +810,8 @@ class ListStrict(RootModel[list[Inner]]):
 
 fields: dict[str, int] = {"a": 1}
 items: list[dict[str, int]] = [fields]
-assert_type(ConfigStrict(fields).root, Inner)  # E: not assignable to parameter `root` with type `Inner`
-assert_type(FieldStrict(fields).root, Inner)  # E: not assignable to parameter `root` with type `Inner`
-assert_type(ListStrict(items).root, list[Inner])  # E: not assignable to parameter `root` with type `list[Inner]`
+assert_type(ConfigStrict(fields).root, Inner)
+assert_type(FieldStrict(fields).root, Inner)
+assert_type(ListStrict(items).root, list[Inner])
 "#,
 );
