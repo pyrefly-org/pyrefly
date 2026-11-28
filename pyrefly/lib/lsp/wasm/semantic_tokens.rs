@@ -6,8 +6,10 @@
  */
 
 use lsp_types::SemanticToken;
+use lsp_types::SemanticTokenModifiers;
 use lsp_types::SemanticTokenTypes;
 use pyrefly_build::handle::Handle;
+use pyrefly_types::function::PropertyRole;
 use pyrefly_types::literal::Lit;
 use pyrefly_types::types::Type;
 use ruff_python_ast::ExprAttribute;
@@ -29,7 +31,7 @@ impl Transaction<'_> {
         &self,
         handle: &Handle,
         attr: &ExprAttribute,
-    ) -> Option<SemanticTokenTypes> {
+    ) -> Option<(SemanticTokenTypes, Vec<SemanticTokenModifiers>)> {
         let ty = self.get_type_trace(handle, attr.range())?;
         let kind = attribute_symbol_kind_from_type(&ty)
             .to_lsp_semantic_token_type_with_modifiers()
@@ -59,9 +61,38 @@ impl Transaction<'_> {
                     })
             }) == Some(true)
         {
-            return Some(SemanticTokenTypes::EnumMember);
+            return Some((SemanticTokenTypes::EnumMember, Vec::new()));
         }
-        Some(kind)
+        // A property access has the getter's return type, so check the winning
+        // declaration on each receiver branch for a getter without a setter.
+        let is_readonly_property =
+            self.get_type_trace(handle, attr.value.range())
+                .and_then(|base| {
+                    self.ad_hoc_solve(handle, "semantic_token_readonly_property", |solver| {
+                        solver
+                            .attribute_lookup_classes(&base)
+                            .is_some_and(|classes| {
+                                !classes.is_empty()
+                                    && classes.iter().all(|cls| {
+                                        solver.get_class_member(cls, name).is_some_and(|member| {
+                                            member.ty().property_metadata().is_some_and(
+                                                |property| {
+                                                    matches!(property.role, PropertyRole::Getter)
+                                                        && property.setter.is_none()
+                                                },
+                                            )
+                                        })
+                                    })
+                            })
+                    })
+                })
+                == Some(true);
+        let modifiers = if is_readonly_property {
+            vec![SemanticTokenModifiers::Readonly]
+        } else {
+            Vec::new()
+        };
+        Some((kind, modifiers))
     }
 
     pub fn semantic_tokens(
