@@ -1076,6 +1076,20 @@ def handle(
 );
 
 testcase!(
+    test_exception_handler_extended_tuple,
+    r#"
+from typing import assert_type
+
+errors: tuple[type[Exception], ...] = (TimeoutError,)
+errors += (ValueError,)
+try:
+    pass
+except errors as e:
+    assert_type(e, Exception | ValueError)
+"#,
+);
+
+testcase!(
     test_exception_handler_star_unpacking,
     r#"
 import sys
