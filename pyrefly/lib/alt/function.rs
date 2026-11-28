@@ -968,6 +968,21 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ),
             );
         }
+        if def.defining_cls.is_some()
+            && def.metadata.flags.is_abstract_method
+            && def.metadata.flags.has_final_decoration
+            && !def.metadata.flags.has_no_type_check
+        {
+            self.error(
+                errors,
+                stmt.name.range(),
+                ErrorKind::BadFunctionDefinition,
+                format!(
+                    "`{}` cannot be both `@abstractmethod` and `@final`",
+                    def.metadata.kind.format(self, self.module().name())
+                ),
+            );
+        }
         // The first parameter of a non-static method is the implicit self/cls
         // parameter and does not require an annotation, regardless of its name.
         // __new__ is an implicit staticmethod but still takes cls as its first parameter.

@@ -1905,6 +1905,91 @@ def f(a: A):
 );
 
 testcase!(
+    test_final_attribute_reassigned_in_init,
+    r#"
+from typing import Final
+
+class A:
+    def __init__(self) -> None:
+        self.a: Final[int] = 1
+        self.a = 2  # E: Cannot set field `a`
+
+class B:
+    b: Final[int]
+    def __init__(self) -> None:
+        self.b = 1
+        self.b += 1  # E: Cannot set field `b`
+
+class C(B):
+    def __init__(self) -> None:
+        super().__init__()
+        self.b += 4  # E: Cannot set field `b`
+
+class E:
+    def __init__(self) -> None:
+        self.e: Final[int] = 1
+        self.e: Final[int] = 2  # E: Cannot set field `e`
+
+class F:
+    f: Final[int]
+    def __init__(self, flag: bool) -> None:
+        if flag:
+            self.f = 1
+        else:
+            self.f = 2
+        self.f = 3  # E: Cannot set field `f`
+"#,
+);
+
+testcase!(
+    test_final_attribute_initialized_on_each_path,
+    r#"
+from typing import Final, Never
+
+class A:
+    a: Final[int]
+    def __init__(self, c: bool) -> None:
+        if c:
+            self.a = 1
+        else:
+            self.a = 2
+
+class B:
+    def __init__(self, c: bool) -> None:
+        if c:
+            self.b: Final = 1
+        else:
+            self.b: Final = 2
+
+class C:
+    c: Final[int]
+    def __init__(self, flag: bool) -> None:
+        if flag:
+            raise ValueError()
+        self.c = 1
+
+def stop() -> Never: ...
+
+class D:
+    d: Final[int]
+    def __init__(self, flag: bool) -> None:
+        if flag:
+            self.d = 1
+            stop()
+        self.d = 2
+
+class E:
+    e: Final[int]
+    def __init__(self, flag: bool) -> None:
+        class Local:
+            if flag:
+                self.e = 1
+            else:
+                self.e = 2
+"#,
+);
+
+testcase!(
     test_literal_attr_with_annotation,
     r#"
 from typing import ClassVar, assert_type

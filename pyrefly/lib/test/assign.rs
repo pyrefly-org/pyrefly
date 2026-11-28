@@ -419,6 +419,41 @@ z: Final = 1  # OK
 );
 
 testcase!(
+    test_final_redeclared,
+    r#"
+import typing
+from typing import Final
+
+m: Final = 1
+m: Final = 2  # E: `m` is already declared as `Final`
+
+class A:
+    a: Final[int]
+    b: typing.Final[int]
+    def __init__(self) -> None:
+        self.a: Final[int] = 2  # E: `a` is already declared as `Final`
+        self.b: "Final[int]" = 2  # E: `b` is already declared as `Final`
+"#,
+);
+
+testcase!(
+    test_final_declared_once,
+    r#"
+from typing import Final
+
+class A:
+    a: Final[int]
+    def __init__(self) -> None:
+        self.a: int = 1
+
+class B:
+    b: Final[int]
+    def __init__(self) -> None:
+        self.b = 1
+"#,
+);
+
+testcase!(
     test_final_stub_no_error,
     TestEnv::one_with_path(
         "stub",
@@ -444,6 +479,46 @@ def f() -> None:
     y: Final[int]  # E: Final name must be initialized with a value
 class C:
     z: Final[int]  # E: Final attribute declared in class body must be initialized with a value or in `__init__`
+"#,
+);
+
+testcase!(
+    test_final_in_loop,
+    r#"
+import typing
+from typing import Annotated, Final
+
+def cond() -> bool: ...
+
+for i in range(3):
+    x: Final[int] = 1  # E: `Final` cannot be used inside a loop
+while cond():
+    y: typing.Final = "1"  # E: `Final` cannot be used inside a loop
+def f() -> None:
+    for i in range(3):
+        z: Final[int] = 1  # E: `Final` cannot be used inside a loop
+class A:
+    def __init__(self) -> None:
+        for i in range(3):
+            self.a: Final = i  # E: `Final` cannot be used inside a loop
+for j in range(3):
+    q: "Final[int]" = 1  # E: `Final` cannot be used inside a loop
+    r: Annotated[Final[int], "metadata"] = 1  # E: `Final` cannot be used inside a loop
+"#,
+);
+
+testcase!(
+    test_final_not_in_loop_body,
+    r#"
+from typing import Final
+
+for i in range(3):
+    def f() -> None:
+        x: Final = 1
+    class C:
+        y: Final = 1
+else:
+    z: Final = 1
 "#,
 );
 

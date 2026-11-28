@@ -811,6 +811,7 @@ impl<'a> BindingsBuilder<'a> {
     ) -> Idx<KeyAnnotation> {
         let ann_key = KeyAnnotation::Annotation(ShortIdentifier::new(name));
         self.ensure_type(annotation, None, self.annotation_evaluation());
+        self.check_final_in_loop(annotation);
         let ann_val = if let Some(special) = SpecialForm::new(&name.id, annotation) {
             // Special case `_: SpecialForm` declarations (this mainly affects some names declared in `typing.pyi`)
             BindingAnnotation::SpecialForm(
@@ -887,6 +888,34 @@ impl<'a> BindingsBuilder<'a> {
                 )
             })
             .collect()
+    }
+
+    /// Report a `Final` annotation in a loop body of the current scope. Call after `ensure_type`
+    /// has parsed quoted annotations.
+    fn check_final_in_loop(&self, annotation: &Expr) {
+        if self.scopes.loop_depth() == 0 {
+            return;
+        }
+        let mut qualifier = annotation;
+        while let Expr::Subscript(subscript) = qualifier {
+            qualifier = match &*subscript.slice {
+                Expr::Tuple(args)
+                    if self.as_special_export(&subscript.value)
+                        == Some(SpecialExport::Annotated)
+                        && let Some(first) = args.elts.first() =>
+                {
+                    first
+                }
+                _ => &subscript.value,
+            };
+        }
+        if self.as_special_export(qualifier) == Some(SpecialExport::Final) {
+            self.error(
+                annotation.range(),
+                ErrorKind::InvalidAnnotation,
+                "`Final` cannot be used inside a loop".to_owned(),
+            );
+        }
     }
 
     /// Evaluate the statements and update the bindings.
@@ -1303,6 +1332,7 @@ impl<'a> BindingsBuilder<'a> {
                     let mut attr = attr;
                     let attr_name = attr.attr.id.clone();
                     self.ensure_type(&mut x.annotation, None, self.annotation_evaluation());
+                    self.check_final_in_loop(&x.annotation);
                     let ann_key = self.insert_binding(
                         KeyAnnotation::AttrAnnotation(x.annotation.range()),
                         BindingAnnotation::AnnotateExpr(

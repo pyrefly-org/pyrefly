@@ -31,7 +31,6 @@ use crate::binding::binding::Key;
 use crate::binding::binding::KeyAnnotation;
 use crate::binding::binding::KeyExpect;
 use crate::binding::binding::KeyTypeAlias;
-use crate::binding::binding::MethodSelfKind;
 use crate::binding::binding::MultiTargetReceiver;
 use crate::binding::binding::NameAssign;
 use crate::binding::binding::SizeExpectation;
@@ -206,13 +205,7 @@ impl<'a> BindingsBuilder<'a> {
         } else {
             self.declare_current_idx(Key::Anon(attr.range))
         };
-        let allow_assign_to_final =
-            self.scopes
-                .method_that_sets_attr(&attr)
-                .is_some_and(|method| {
-                    method.recognized_attribute_defining_method
-                        && matches!(method.instance_or_class, MethodSelfKind::Instance)
-                });
+        let allow_assign_to_final = self.scopes.may_initialize_final_attr(&attr);
         // Updating a function's docstring does not retain its instance-callable view.
         // Only the direct store base is exempt; assignment RHS captures still count.
         let metadata_write = self.track_classmethod_uses
@@ -234,7 +227,9 @@ impl<'a> BindingsBuilder<'a> {
             Binding::AssignToAttribute(Box::new(AssignToAttribute {
                 attr,
                 value: Box::new(value.clone()),
-                allow_assign_to_final,
+                // An augmented assignment reads the attribute first, so it never initializes it.
+                allow_assign_to_final: allow_assign_to_final
+                    && !matches!(value, ExprOrBinding::Binding(Binding::AugAssign(..))),
             })),
         );
         if let Some(identifier) = narrowing_identifier {
