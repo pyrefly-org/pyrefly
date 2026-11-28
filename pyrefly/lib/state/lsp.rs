@@ -1954,7 +1954,16 @@ impl<'a> Transaction<'a> {
         preference: FindPreference,
     ) -> Option<(Handle, Export)> {
         match intermediate_definition {
-            IntermediateDefinition::Local(export) => Some((handle.dupe(), export)),
+            IntermediateDefinition::Local(mut export) => {
+                if export.doc_ranges.is_empty()
+                    && let Some(docstring) = self
+                        .get_exports_data(handle)
+                        .declaration_docstring(export.location)
+                {
+                    export.doc_ranges = DocRanges::of_docstring(Some(docstring));
+                }
+                Some((handle.dupe(), export))
+            }
             IntermediateDefinition::NamedImport(
                 import_key,
                 module_name,

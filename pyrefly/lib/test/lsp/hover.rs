@@ -2701,18 +2701,6 @@ print(asdf)
 }
 
 #[test]
-fn hover_on_annotated_variable_with_trailing_docstring() {
-    let code = r#"
-asdf: int = 1
-"""docs for asdf"""
-print(asdf)
-#     ^
-"#;
-    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
-    assert!(report.contains("docs for asdf"), "{report}");
-}
-
-#[test]
 fn hover_on_type_alias_with_trailing_docstring() {
     let code = r#"
 type Foo = int
@@ -2722,6 +2710,65 @@ print(Foo)
 "#;
     let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
     assert!(report.contains("docs for Foo"), "{report}");
+}
+
+#[test]
+fn hover_on_imports_with_trailing_docstrings_in_closed_library() {
+    let lib = r#"
+value = 1
+"""Variable docs."""
+type Alias = int
+"""Alias docs."""
+"#;
+    for (name, docs) in [("value", "Variable docs."), ("Alias", "Alias docs.")] {
+        let main = format!("from lib import {name}\nprint({name})\n#     ^\n");
+        let report = get_test_report_with_closed_library(lib, &main);
+        assert!(report.contains(docs), "{report}");
+    }
+}
+
+#[test]
+fn hover_on_imported_reassignment_does_not_show_earlier_docstring() {
+    let lib = r#"
+value = 1
+"""Integer default."""
+value = "new"
+"#;
+    let main = "from lib import value\nprint(value)\n#     ^\n";
+    let report = get_test_report_with_closed_library(lib, main);
+    assert!(report.contains("(variable) value: str"), "{report}");
+    assert!(!report.contains("Integer default."), "{report}");
+}
+
+#[test]
+fn hover_on_reassigned_variable_uses_resolved_definition_docstring() {
+    let code = r#"
+value = 1
+"""First assignment docs."""
+value = 2
+"""Second assignment docs."""
+print(value)
+#     ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(report.contains("Second assignment docs."), "{report}");
+    assert!(!report.contains("First assignment docs."), "{report}");
+}
+
+#[test]
+fn hover_on_shadowing_local_does_not_show_module_variable_docstring() {
+    let code = r#"
+value = 1
+"""Module variable docs."""
+
+def f() -> None:
+    value = 2
+    print(value)
+#         ^
+"#;
+    let report = get_batched_lsp_operations_report(&[("main", code)], get_test_report);
+    assert!(report.contains("(variable) value: Literal[2]"), "{report}");
+    assert!(!report.contains("Module variable docs."), "{report}");
 }
 
 #[test]

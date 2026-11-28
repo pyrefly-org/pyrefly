@@ -109,7 +109,7 @@ pub struct Definition {
     /// Does this definition require an `Anywhere` binding at binding time? Typically yes if there
     /// are multiple definitions, but mutable captures and `del` both require special handling.
     pub needs_anywhere: bool,
-    /// The documentation of a class or function definition.
+    /// The documentation attached to this definition.
     pub doc_ranges: DocRanges,
     /// The range of the textually last site that assigns or rebinds this name, including an
     /// `import foo.bar` that rebinds an alias bound by `import foo as <alias>`. When there is

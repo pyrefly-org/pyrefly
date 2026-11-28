@@ -7,11 +7,14 @@
 
 //! Building the `DocRanges` of a definition from its AST.
 
+use std::slice;
+
 use pyrefly_python::ast::Ast;
 use pyrefly_python::docstring::DocRanges;
 use pyrefly_python::docstring::Docstring;
 use pyrefly_python::dunder;
 use ruff_python_ast::Expr;
+use ruff_python_ast::ExprName;
 use ruff_python_ast::Parameters;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtClassDef;
@@ -19,6 +22,25 @@ use ruff_python_ast::StmtFunctionDef;
 use ruff_text_size::TextRange;
 
 use crate::export::special::SpecialExport;
+
+/// Visits the names bound by a declaration that is followed by a string literal.
+pub(crate) fn visit_trailing_docstring(
+    stmt: &Stmt,
+    following: &[Stmt],
+    mut visit: impl FnMut(&ExprName, TextRange),
+) {
+    let targets = match stmt {
+        Stmt::Assign(assign) => assign.targets.as_slice(),
+        Stmt::AnnAssign(assign) => slice::from_ref(assign.target.as_ref()),
+        Stmt::TypeAlias(alias) => slice::from_ref(alias.name.as_ref()),
+        _ => return,
+    };
+    if let Some(docstring) = Docstring::range_from_stmts(following) {
+        for target in targets {
+            Ast::expr_lvalue(target, &mut |name| visit(name, docstring));
+        }
+    }
+}
 
 pub fn function_doc_ranges(x: &StmtFunctionDef) -> DocRanges {
     doc_ranges_from_parts(Docstring::range_from_stmts(&x.body), &x.parameters)
