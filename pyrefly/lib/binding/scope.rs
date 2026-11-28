@@ -2544,6 +2544,16 @@ impl Scopes {
                 )
             });
             match &scope.kind {
+                // Class bodies see local values, but enclosed functions skip the class namespace.
+                ScopeKind::Class(_)
+                    if i + 1 == self.scopes.len()
+                        && scope.flow.info.get(receiver).is_some_and(|info| {
+                            info.value().is_some()
+                                && info.initialized() != InitializationStatus::Uninitialized
+                        }) =>
+                {
+                    return None;
+                }
                 ScopeKind::Class(_) | ScopeKind::Annotation { .. } | ScopeKind::TypeAlias => {
                     // Intervening class namespaces and annotation/typealias scopes do not shadow
                     // lexical receiver variables in enclosed methods.

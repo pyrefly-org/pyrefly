@@ -6255,7 +6255,6 @@ class A:
 );
 
 testcase!(
-    bug = "Class-local receivers must not consume Final initialization",
     test_final_attribute_nested_class_initialization,
     TestEnv::new().enable_possibly_uninitialized_attribute_error(),
     r#"
@@ -6270,7 +6269,7 @@ class C:
         class Local:
             self = Other()
             self.x = 1
-        self.x = 2  # E: Cannot set field `x`
+        self.x = 2
         self.x = 3  # E: Cannot set field `x`
 
 class Captured:
