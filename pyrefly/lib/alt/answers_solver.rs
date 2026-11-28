@@ -75,7 +75,7 @@ use crate::alt::answers::SolutionsTable;
 use crate::alt::answers::TraceSideEffects;
 use crate::alt::traits::Solve;
 use crate::alt::traits::SolveResult;
-use crate::alt::types::class_metadata::DjangoReverseRelationIndex;
+use crate::alt::types::class_metadata::ClassSynthesizedFields;
 use crate::binding::binding::AnyIdx;
 use crate::binding::binding::Binding;
 use crate::binding::binding::Exported;
@@ -2521,8 +2521,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         !self.stack().sccs_is_empty()
     }
 
-    pub fn django_reverse_relations_index(&self) -> &'answer DjangoReverseRelationIndex {
-        self.answers
+    pub fn django_reverse_relations(&self, cls: &Class) -> Option<ClassSynthesizedFields> {
+        let current = self
+            .answers
             .get(
                 LookupModule::Exact(self.module().key()),
                 &KeyDjangoRelations,
@@ -2530,6 +2531,30 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 self.answer_scope,
             )
             .expect("the current module must be available while solving its Django relations")
+            .get(cls)
+            .cloned();
+
+        // Each module must record its own dependencies, even when another solve already
+        // computed the relation index. Answer lookup memoizes the indices.
+        let configured =
+            self.answers
+                .django_model_modules()
+                .into_iter()
+                .filter_map(|(module, path)| {
+                    self.answers
+                        .get(
+                            LookupModule::Exact(ModuleKey::new(module, &path)),
+                            &KeyDjangoRelations,
+                            self.thread_state,
+                            self.answer_scope,
+                        )?
+                        .get(cls)
+                        .cloned()
+                });
+        current
+            .into_iter()
+            .chain(configured)
+            .reduce(ClassSynthesizedFields::combine)
     }
 
     /// Access the thread-local state for trace recording.
