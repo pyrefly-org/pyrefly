@@ -350,12 +350,19 @@ pub(crate) enum SpecializationKind {
     EffectiveBase,
     /// The read, assignment and override types of a field.
     Field,
+    /// The fields that `QuerySet.annotate` adds to a model row, stored as a
+    /// `Type::AnonymousTypedDict`.
+    Annotations,
 }
 
 impl SpecializationKind {
     fn len(self) -> usize {
         match self {
-            Self::PartialMethod | Self::Queryset | Self::TargetPkType | Self::EffectiveBase => 1,
+            Self::PartialMethod
+            | Self::Queryset
+            | Self::TargetPkType
+            | Self::EffectiveBase
+            | Self::Annotations => 1,
             Self::Field => 3,
         }
     }
@@ -380,7 +387,8 @@ impl Visit<Type> for TArgs {
             Some(
                 SpecializationKind::PartialMethod
                 | SpecializationKind::TargetPkType
-                | SpecializationKind::Field,
+                | SpecializationKind::Field
+                | SpecializationKind::Annotations,
             ) => specialization.iter().for_each(|ty| ty.visit(f)),
         }
     }
@@ -406,7 +414,8 @@ impl VisitMut<Type> for TArgs {
             Some(
                 SpecializationKind::PartialMethod
                 | SpecializationKind::TargetPkType
-                | SpecializationKind::Field,
+                | SpecializationKind::Field
+                | SpecializationKind::Annotations,
             ) => specialization.iter_mut().for_each(|ty| ty.visit_mut(f)),
         }
     }
@@ -501,6 +510,9 @@ impl TArgs {
                     set_type,
                     override_type,
                 }
+            }
+            (SpecializationKind::Annotations, [Type::AnonymousTypedDict(fields)]) => {
+                DjangoSpecialization::Annotations(fields)
             }
             _ => unreachable!("a specialization has as many types as its kind fixes"),
         })

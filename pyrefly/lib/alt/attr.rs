@@ -670,11 +670,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let mut access_errors: Vec<(ErrorKind, String)> = Vec::new();
         let mut success = true;
         let (found, not_found, error) = lookup_result.decompose();
-        if found.is_empty()
-            && let Some(ty) = self.django_annotated_fields(base).get(attr_name).cloned()
-        {
-            return ty;
-        }
         // Check if we have a partial union failure (attribute exists on some union members
         // but not others) before consuming the vectors. This helps us decide whether to suggest.
         let is_partial_union_failure = !found.is_empty() && !not_found.is_empty();

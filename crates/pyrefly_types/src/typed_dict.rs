@@ -48,7 +48,7 @@ impl TypedDictField {
 }
 
 #[derive(
-    Debug, PartialOrd, Ord, Clone, Eq, PartialEq, Hash, Visit, VisitMut, TypeEq, TypeOrd
+    Debug, Default, PartialOrd, Ord, Clone, Eq, PartialEq, Hash, Visit, VisitMut, TypeEq, TypeOrd
 )]
 pub struct AnonymousTypedDictInner {
     pub fields: Vec<(Name, TypedDictField)>,

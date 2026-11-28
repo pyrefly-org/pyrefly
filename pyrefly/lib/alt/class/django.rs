@@ -23,11 +23,11 @@ use pyrefly_types::function::Function;
 use pyrefly_types::function::PropertyMetadata;
 use pyrefly_types::function::PropertyRole;
 use pyrefly_types::heap::TypeHeap;
-use pyrefly_types::keywords::KwCall;
 use pyrefly_types::keywords::TypeMap;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::literal::Lit;
 use pyrefly_types::tuple::Tuple;
+use pyrefly_types::typed_dict::TypedDictField;
 use pyrefly_types::types::AnyStyle;
 use pyrefly_types::types::Overload;
 use pyrefly_types::types::OverloadType;
@@ -99,11 +99,6 @@ const MANYRELATEDMANAGER: Name = Name::new_static("ManyRelatedManager");
 const SYMMETRICAL: Name = Name::new_static("symmetrical");
 const AS_MANAGER: Name = Name::new_static("as_manager");
 
-pub(crate) struct DjangoAnnotateCall {
-    metadata: FuncMetadata,
-    attributes: TypeMap,
-}
-
 /// Find a keyword argument by name and return its value expression.
 fn find_keyword<'a>(call_expr: &'a ExprCall, name: &Name) -> Option<&'a Expr> {
     call_expr
@@ -147,9 +142,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         &self,
         callee: &Type,
         arguments: &Arguments,
-    ) -> Option<DjangoAnnotateCall> {
-        let metadata = callee.toplevel_func_metadata()?.clone();
-        if !Self::is_django_annotate(&metadata) {
+    ) -> Option<TypeMap> {
+        if !Self::is_django_annotate(callee.toplevel_func_metadata()?) {
             return None;
         }
 
@@ -167,19 +161,16 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if attributes.0.is_empty() {
             None
         } else {
-            Some(DjangoAnnotateCall {
-                metadata,
-                attributes,
-            })
+            Some(attributes)
         }
     }
 
     pub(crate) fn apply_django_annotate_call(
         &self,
         result: Type,
-        call: Option<DjangoAnnotateCall>,
+        attributes: Option<TypeMap>,
     ) -> Type {
-        let Some(call) = call else {
+        let Some(attributes) = attributes else {
             return result;
         };
         let mut queryset = match result {
@@ -192,19 +183,36 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if base.targs().len() != 2 {
             return self.heap.mk_class_type(queryset);
         }
-
-        let row = base.targs().as_slice()[1].clone();
-        if !self.is_django_model_row(&row) {
+        let Type::ClassType(row) = &base.targs().as_slice()[1] else {
+            return self.heap.mk_class_type(queryset);
+        };
+        if !self
+            .get_metadata_for_class(row.class_object())
+            .is_django_model()
+        {
             return self.heap.mk_class_type(queryset);
         }
-        let annotation = self.heap.mk_kw_call(KwCall {
-            func_metadata: call.metadata,
-            keywords: call.attributes,
-            return_ty: row.clone(),
-        });
-        // The intersection preserves call-site metadata while generic QuerySet operations use the
-        // original row as their fallback type.
-        base.targs_mut().as_mut()[1] = self.heap.mk_intersect(vec![annotation], row);
+        // The added fields live on the row's class type, so they survive every operation that
+        // passes the row along as a type, including solving the type variables of generic
+        // `QuerySet` methods. A later `annotate` overrides a field of the same name.
+        let mut fields = row.django_annotations().cloned().unwrap_or_default();
+        for (name, ty) in attributes.0 {
+            let field = TypedDictField {
+                ty,
+                required: true,
+                read_only_reason: None,
+            };
+            match fields
+                .fields
+                .iter_mut()
+                .find(|(existing, _)| existing == &name)
+            {
+                Some((_, existing)) => *existing = field,
+                None => fields.fields.push((name, field)),
+            }
+        }
+        let row = row.clone().with_django_annotations(fields);
+        base.targs_mut().as_mut()[1] = self.heap.mk_class_type(row);
         if queryset.is(KnownClass::DjangoQuerySet) {
             queryset = base;
         } else {
@@ -213,39 +221,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.heap.mk_class_type(queryset)
     }
 
-    fn is_django_model_row(&self, ty: &Type) -> bool {
-        match ty {
-            Type::ClassType(cls) => self
-                .get_metadata_for_class(cls.class_object())
-                .is_django_model(),
-            Type::KwCall(call) => self.is_django_model_row(&call.return_ty),
-            Type::Intersect(intersection) => self.is_django_model_row(&intersection.1),
-            _ => false,
-        }
-    }
-
-    fn collect_django_annotated_fields(&self, ty: &Type, fields: &mut SmallMap<Name, Type>) {
-        match ty {
-            Type::KwCall(call) => {
-                self.collect_django_annotated_fields(&call.return_ty, fields);
-                if Self::is_django_annotate(&call.func_metadata) {
-                    for (name, ty) in &call.keywords.0 {
-                        fields.insert(name.clone(), ty.clone());
-                    }
-                }
-            }
-            Type::Intersect(intersection) => {
-                for member in &intersection.0 {
-                    self.collect_django_annotated_fields(member, fields);
-                }
-            }
-            _ => {}
-        }
-    }
-
+    /// The fields that `annotate` added to a model row, collected across union members.
     pub(crate) fn django_annotated_fields(&self, ty: &Type) -> SmallMap<Name, Type> {
         let mut fields = SmallMap::new();
-        self.collect_django_annotated_fields(ty, &mut fields);
+        for member in ty.clone().into_unions() {
+            if let Type::ClassType(cls) = member
+                && let Some(annotations) = cls.django_annotations()
+            {
+                for (name, field) in &annotations.fields {
+                    fields.insert(name.clone(), field.ty.clone());
+                }
+            }
+        }
         fields
     }
 
@@ -831,6 +818,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 Some(self.as_instance_attribute(
                     name,
                     &ClassField::new_synthesized(method),
+                    &Instance::of_class(cls),
+                ))
+            }
+            DjangoSpecialization::Annotations(annotations) => {
+                let field = annotations.field(name)?;
+                // Django assigns annotations with `setattr`, so they shadow methods and plain
+                // class attributes. A property keeps its type because assignment goes through
+                // it, and Django rejects annotations named like a model field.
+                if let Some(member) = self.get_class_member(cls.class_object(), name)
+                    && (member.is_property()
+                        || self.django_field_instance_types(&member.ty()).is_some())
+                {
+                    return None;
+                }
+                Some(self.as_instance_attribute(
+                    name,
+                    &ClassField::new_synthesized(field.ty.clone()),
                     &Instance::of_class(cls),
                 ))
             }

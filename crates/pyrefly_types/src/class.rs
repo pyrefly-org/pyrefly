@@ -39,6 +39,7 @@ use crate::function::Deprecation;
 use crate::known_class::KnownClass;
 use crate::type_ord::TypeOrd;
 use crate::type_ord::TypeOrdCtx;
+use crate::typed_dict::AnonymousTypedDictInner;
 use crate::types::SpecializationKind;
 use crate::types::Substitution;
 use crate::types::TArgs;
@@ -598,6 +599,8 @@ pub enum DjangoSpecialization<'a> {
         set_type: &'a Type,
         override_type: &'a Type,
     },
+    /// The fields that `QuerySet.annotate` adds to the rows of a model instance.
+    Annotations(&'a AnonymousTypedDictInner),
 }
 
 impl ClassType {
@@ -689,6 +692,26 @@ impl ClassType {
                 [get_type, set_type, override_type],
             ),
         )
+    }
+
+    /// Attach the fields that `QuerySet.annotate` adds to a model row. The caller checks that the
+    /// class is a Django model, which needs the class's metadata.
+    pub fn with_django_annotations(self, fields: AnonymousTypedDictInner) -> Self {
+        Self(
+            self.0,
+            self.1.with_specialization(
+                SpecializationKind::Annotations,
+                [Type::AnonymousTypedDict(Box::new(fields))],
+            ),
+        )
+    }
+
+    /// The fields that `QuerySet.annotate` added to this model row, if any.
+    pub fn django_annotations(&self) -> Option<&AnonymousTypedDictInner> {
+        match self.django_specialization() {
+            Some(DjangoSpecialization::Annotations(fields)) => Some(fields),
+            _ => None,
+        }
     }
 
     /// Attach the unbound callable signature of a `partialmethod` descriptor.
