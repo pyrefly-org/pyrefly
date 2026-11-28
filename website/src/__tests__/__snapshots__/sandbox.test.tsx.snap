@@ -29,6 +29,8 @@ exports[`Sandbox Component render sandbox correctly 1`] = `
           +
         </button>
       </div>
+    </div>
+    <div>
       <label
         title="Show parameter names at call sites"
       >

@@ -481,136 +481,145 @@ export default function Sandbox({
     // defined here would get a new type on every render, remounting the
     // version selector (and its catalog fetch) on ordinary UI updates.
     const renderTabBar = () => (
-        <div {...stylex.props(styles.tabBar)}>
-            {Array.from(models.keys()).map((fileName) => (
-                <div key={fileName} {...stylex.props(styles.tabContainer)}>
-                    {renamingFile === fileName ? (
-                        <div
-                            {...stylex.props(
-                                styles.renameContainer,
-                                !isValidFilename(renameInputValue, fileName) &&
-                                    styles.invalidInput
-                            )}
-                        >
-                            <input
-                                {...stylex.props(styles.renameInput)}
-                                value={renameInputValue}
-                                onChange={(e) =>
-                                    setRenameInputValue(e.target.value)
-                                }
-                                onKeyDown={(e) => {
-                                    if (
-                                        e.key === 'Enter' ||
-                                        (e.ctrlKey && e.key === 's')
-                                    ) {
-                                        e.preventDefault();
-                                        handleRenameSave();
-                                    } else if (e.key === 'Escape') {
-                                        setRenamingFile(null);
-                                        setRenameInputValue('');
+        <>
+            <div {...stylex.props(styles.tabBar)}>
+                {Array.from(models.keys()).map((fileName) => (
+                    <div key={fileName} {...stylex.props(styles.tabContainer)}>
+                        {renamingFile === fileName ? (
+                            <div
+                                {...stylex.props(
+                                    styles.renameContainer,
+                                    !isValidFilename(
+                                        renameInputValue,
+                                        fileName
+                                    ) && styles.invalidInput
+                                )}
+                            >
+                                <input
+                                    {...stylex.props(styles.renameInput)}
+                                    value={renameInputValue}
+                                    onChange={(e) =>
+                                        setRenameInputValue(e.target.value)
                                     }
-                                }}
-                                onBlur={handleRenameSave}
-                                placeholder="Enter filename"
-                                autoFocus
-                            />
-                            <span
-                                {...stylex.props(styles.extensionLabel)}
-                            ></span>
-                        </div>
-                    ) : (
-                        <button
-                            onClick={() => switchToFile(fileName)}
-                            {...stylex.props(
-                                styles.tabButton,
-                                fileName === activeFileName &&
-                                    styles.tabButtonActive
-                            )}
-                        >
-                            {fileName}
-                        </button>
-                    )}
-                </div>
-            ))}
-            <div {...stylex.props(styles.buttonGroup)}>
-                <button
-                    onClick={() => deleteFile(activeFileName)}
-                    {...stylex.props(
-                        styles.actionButton,
-                        styles.deleteButton,
-                        activeFileName === 'sandbox.py' && styles.disabledButton
-                    )}
-                    title={
-                        activeFileName === 'sandbox.py'
-                            ? 'Cannot delete sandbox.py'
-                            : renamingFile
-                              ? 'Cancel'
-                              : 'Delete file'
-                    }
-                    disabled={activeFileName === 'sandbox.py'}
-                    onMouseDown={(e) => {
-                        e.preventDefault();
-                    }}
-                >
-                    ×
-                </button>
-                {renamingFile ? (
+                                    onKeyDown={(e) => {
+                                        if (
+                                            e.key === 'Enter' ||
+                                            (e.ctrlKey && e.key === 's')
+                                        ) {
+                                            e.preventDefault();
+                                            handleRenameSave();
+                                        } else if (e.key === 'Escape') {
+                                            setRenamingFile(null);
+                                            setRenameInputValue('');
+                                        }
+                                    }}
+                                    onBlur={handleRenameSave}
+                                    placeholder="Enter filename"
+                                    autoFocus
+                                />
+                                <span
+                                    {...stylex.props(styles.extensionLabel)}
+                                ></span>
+                            </div>
+                        ) : (
+                            <button
+                                onClick={() => switchToFile(fileName)}
+                                {...stylex.props(
+                                    styles.tabButton,
+                                    fileName === activeFileName &&
+                                        styles.tabButtonActive
+                                )}
+                            >
+                                {fileName}
+                            </button>
+                        )}
+                    </div>
+                ))}
+                <div {...stylex.props(styles.buttonGroup)}>
                     <button
-                        onClick={handleRenameSave}
+                        onClick={() => deleteFile(activeFileName)}
                         {...stylex.props(
                             styles.actionButton,
-                            styles.saveButton,
-                            !isValidFilename(renameInputValue, renamingFile) &&
+                            styles.deleteButton,
+                            activeFileName === 'sandbox.py' &&
                                 styles.disabledButton
                         )}
                         title={
-                            isValidFilename(renameInputValue, renamingFile)
-                                ? 'Save file name'
-                                : 'Invalid filename'
+                            activeFileName === 'sandbox.py'
+                                ? 'Cannot delete sandbox.py'
+                                : renamingFile
+                                  ? 'Cancel'
+                                  : 'Delete file'
                         }
-                        disabled={
-                            !isValidFilename(renameInputValue, renamingFile)
+                        disabled={activeFileName === 'sandbox.py'}
+                        onMouseDown={(e) => {
+                            e.preventDefault();
+                        }}
+                    >
+                        ×
+                    </button>
+                    {renamingFile ? (
+                        <button
+                            onClick={handleRenameSave}
+                            {...stylex.props(
+                                styles.actionButton,
+                                styles.saveButton,
+                                !isValidFilename(
+                                    renameInputValue,
+                                    renamingFile
+                                ) && styles.disabledButton
+                            )}
+                            title={
+                                isValidFilename(renameInputValue, renamingFile)
+                                    ? 'Save file name'
+                                    : 'Invalid filename'
+                            }
+                            disabled={
+                                !isValidFilename(renameInputValue, renamingFile)
+                            }
+                        >
+                            ✓
+                        </button>
+                    ) : (
+                        <button
+                            onClick={createNewTempFile}
+                            {...stylex.props(styles.actionButton)}
+                            title="Add new file"
+                        >
+                            +
+                        </button>
+                    )}
+                </div>
+            </div>
+            <div {...stylex.props(styles.settingsBar)}>
+                <label
+                    {...stylex.props(styles.parameterHintToggle)}
+                    title="Show parameter names at call sites"
+                >
+                    <input
+                        id="parameter-hints-toggle"
+                        type="checkbox"
+                        checked={showParameterHints}
+                        onChange={(event) =>
+                            setShowParameterHints(event.target.checked)
                         }
-                    >
-                        ✓
-                    </button>
-                ) : (
-                    <button
-                        onClick={createNewTempFile}
-                        {...stylex.props(styles.actionButton)}
-                        title="Add new file"
-                    >
-                        +
-                    </button>
+                    />
+                    Parameter hints
+                </label>
+                <PyreflyVersionSelector
+                    selected={pyreflySource}
+                    onSelect={handlePyreflyVersionSelect}
+                    disabled={false}
+                />
+                {pyreflyVersion && (
+                    <PyreflyBuildLink
+                        pyreflyVersion={pyreflyVersion}
+                        pyreflyCommit={pyreflyCommit}
+                        pyreflySource={activePyreflySource}
+                    />
                 )}
             </div>
-            <label
-                {...stylex.props(styles.parameterHintToggle)}
-                title="Show parameter names at call sites"
-            >
-                <input
-                    id="parameter-hints-toggle"
-                    type="checkbox"
-                    checked={showParameterHints}
-                    onChange={(event) =>
-                        setShowParameterHints(event.target.checked)
-                    }
-                />
-                Parameter hints
-            </label>
-            <PyreflyVersionSelector
-                selected={pyreflySource}
-                onSelect={handlePyreflyVersionSelect}
-                disabled={false}
-            />
-            {pyreflyVersion && (
-                <PyreflyBuildLink
-                    pyreflyVersion={pyreflyVersion}
-                    pyreflyCommit={pyreflyCommit}
-                    pyreflySource={activePyreflySource}
-                />
-            )}
-        </div>
+        </>
     );
 
     useEffect(() => {
@@ -1859,6 +1868,14 @@ const styles = stylex.create({
         borderTopRightRadius: '0.25rem',
         alignItems: 'center',
     },
+    settingsBar: {
+        display: 'flex',
+        flexWrap: 'wrap',
+        alignItems: 'center',
+        background: 'var(--color-background)',
+        borderBottom: '1px solid var(--color-background-secondary)',
+        fontSize: '14px',
+    },
     tabButton: {
         borderRight: '1px solid var(--color-background-secondary)',
         cursor: 'pointer',
@@ -1887,7 +1904,6 @@ const styles = stylex.create({
         display: 'flex',
         alignItems: 'center',
         gap: '6px',
-        marginLeft: 'auto',
         padding: '0 12px',
         color: 'var(--color-text)',
         cursor: 'pointer',
@@ -1895,6 +1911,7 @@ const styles = stylex.create({
         userSelect: 'none',
     },
     commit: {
+        marginLeft: 'auto',
         color: 'var(--color-text-secondary)',
         fontSize: '12px',
         padding: '7px 15px',

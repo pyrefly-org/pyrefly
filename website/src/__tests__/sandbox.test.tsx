@@ -435,8 +435,7 @@ describe('Sandbox Component', () => {
         const result = render(<Sandbox sampleFilename={SANDBOX_FILE_NAME} />);
         const selector = result.getByLabelText('Select Pyrefly version');
         await waitFor(() => expect(selector).not.toBeDisabled());
-        // Bug: file tabs consume the settings row's width on phones.
-        expect(selector.parentElement).toHaveTextContent('sandbox.py');
+        expect(selector.parentElement).not.toHaveTextContent('sandbox.py');
     });
 
     function expectMonacoEditorLoadedWithContent(
