@@ -5738,6 +5738,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Type::Tuple(Tuple::Unbounded(t)) => {
                 vec![check(*t, range)]
             }
+            Type::Tuple(Tuple::Unpacked(parts)) => {
+                let (prefix, middle, suffix) = parts.into_parts();
+                let mut result: Vec<Type> = prefix.into_iter().map(|t| check(t, range)).collect();
+                result.extend(self.decompose_except_types(middle, range, check));
+                result.extend(suffix.into_iter().map(|t| check(t, range)));
+                result
+            }
             Type::Union(f) => f
                 .members
                 .into_iter()
