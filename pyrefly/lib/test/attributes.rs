@@ -6255,6 +6255,55 @@ class A:
 );
 
 testcase!(
+    bug = "Class-local receivers must not consume Final initialization",
+    test_final_attribute_nested_class_initialization,
+    TestEnv::new().enable_possibly_uninitialized_attribute_error(),
+    r#"
+from typing import Final, assert_type
+
+class Other:
+    x = 0
+
+class C:
+    x: Final[int]
+    def __init__(self) -> None:
+        class Local:
+            self = Other()
+            self.x = 1
+        self.x = 2  # E: Cannot set field `x`
+        self.x = 3  # E: Cannot set field `x`
+
+class Captured:
+    x: Final[int]
+    def __init__(self, flag: bool) -> None:
+        class Local:
+            if flag:
+                self.x = 1
+            else:
+                self.x = 2
+        self.x = 3  # E: Cannot set field `x`
+
+class MutableCaptured:
+    x: int
+    def __init__(self) -> None:
+        class Local:
+            self.x = 1
+
+class AnnotationOnly:
+    x: Final[int]
+    def __init__(self) -> None:
+        class Local:
+            self: Other
+            self.x = 1
+        self.x = 2  # E: Cannot set field `x`
+
+assert_type(C().x, int)
+assert_type(Captured(True).x, int)
+assert_type(MutableCaptured().x, int)
+"#,
+);
+
+testcase!(
     test_no_type_check_staticmethod_skipped_body,
     r#"
 from typing import no_type_check
