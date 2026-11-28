@@ -16,7 +16,6 @@ use pyrefly_python::keywords::is_valid_identifier;
 use pyrefly_python::nesting_context::NestingContext;
 use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_util::prelude::SliceExt;
-use pyrefly_util::visit::Visit;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprDict;
 use ruff_python_ast::ExprList;
@@ -92,6 +91,7 @@ use crate::config::error_kind::ErrorKind;
 use crate::export::deprecation::parse_deprecation;
 use crate::export::doc_ranges::class_doc_ranges;
 use crate::export::doc_ranges::function_doc_ranges;
+use crate::export::doc_ranges::visit_trailing_docstring;
 use crate::export::special::SpecialExport;
 use crate::types::class::ClassDef;
 use crate::types::class::ClassDefIndex;
@@ -737,21 +737,11 @@ impl<'a> BindingsBuilder<'a> {
     }
 
     /// Extracts the documentation of each field, keyed by the field's range.
-    pub fn extract_field_docstrings(
-        body: &[ruff_python_ast::Stmt],
-    ) -> SmallMap<TextRange, DocRanges> {
-        use ruff_python_ast::Expr;
-        use ruff_python_ast::Stmt;
-
+    pub fn extract_field_docstrings(body: &[Stmt]) -> SmallMap<TextRange, DocRanges> {
         let mut field_docstrings = SmallMap::new();
         let mut first_function_ranges = SmallMap::new();
-        let mut i = 0;
 
-        while i < body.len() {
-            let stmt = &body[i];
-
-            let is_field = matches!(stmt, Stmt::AnnAssign(_) | Stmt::Assign(_));
-
+        for (i, stmt) in body.iter().enumerate() {
             if let Stmt::FunctionDef(func_def) = stmt {
                 let first_range = *first_function_ranges
                     .entry(func_def.name.id.clone())
@@ -768,44 +758,14 @@ impl<'a> BindingsBuilder<'a> {
                 if !doc_ranges.is_empty() {
                     field_docstrings.insert(class_def.name.range, doc_ranges);
                 }
-            } else if is_field
-                && let Some(next_stmt) = body.get(i + 1)
-                && let Stmt::Expr(expr_stmt) = next_stmt
-                && matches!(&*expr_stmt.value, Expr::StringLiteral(_))
-            {
-                let doc_ranges = DocRanges::of_docstring(Some(next_stmt.range()));
-                let mut target_ranges = Vec::new();
-                Self::collect_field_docstring_target_ranges(stmt, &mut target_ranges);
-                for range in target_ranges {
-                    field_docstrings.insert(range, doc_ranges.clone());
-                }
+            } else if matches!(stmt, Stmt::Assign(_) | Stmt::AnnAssign(_)) {
+                visit_trailing_docstring(stmt, &body[i + 1..], |name, docstring| {
+                    field_docstrings.insert(name.range, DocRanges::of_docstring(Some(docstring)));
+                });
             }
-
-            i += 1;
         }
 
         field_docstrings
-    }
-
-    fn collect_field_docstring_target_ranges(stmt: &Stmt, ranges: &mut Vec<TextRange>) {
-        match stmt {
-            Stmt::Assign(assign) => {
-                for target in &assign.targets {
-                    Self::collect_ranges_from_expr(target, ranges);
-                }
-            }
-            Stmt::AnnAssign(ann_assign) => {
-                Self::collect_ranges_from_expr(&ann_assign.target, ranges);
-            }
-            _ => {}
-        }
-    }
-
-    fn collect_ranges_from_expr(expr: &Expr, ranges: &mut Vec<TextRange>) {
-        if let Expr::Name(name) = expr {
-            ranges.push(name.range);
-        }
-        expr.recurse(&mut |e| Self::collect_ranges_from_expr(e, ranges));
     }
 
     /// Parse fields for `collections.namedtuple`: string splitting, list/tuple of strings.

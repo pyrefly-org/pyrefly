@@ -30,6 +30,7 @@ use crate::export::definitions::DefinitionStyle;
 use crate::export::definitions::Definitions;
 use crate::export::definitions::DunderAllEntry;
 use crate::export::definitions::DunderAllKind;
+use crate::export::doc_ranges::visit_trailing_docstring;
 use crate::export::special::SpecialExport;
 use crate::export::symbols::FlatSymbols;
 use crate::module::module_info::ModuleInfo;
@@ -149,6 +150,8 @@ pub struct Exports {
     /// The range of this module's docstring, if it has one. Docstrings for the
     /// exports themselves are stored in `exports`.
     docstring_range: Option<TextRange>,
+    /// Trailing docstrings by declaration site, including sites not selected as exports.
+    declaration_docstrings: SmallMap<TextRange, TextRange>,
     /// Flat table of supported source declarations, including nested ones such
     /// as methods, backing IDE symbol features. Built only while indexing a
     /// first-party module; `None` everywhere else.
@@ -185,6 +188,19 @@ impl Exports {
             module_info.path().is_init(),
             sys_info,
         );
+        let mut declaration_docstrings = SmallMap::new();
+        for (i, stmt) in x.iter().enumerate() {
+            visit_trailing_docstring(stmt, &x[i + 1..], |name, docstring| {
+                declaration_docstrings.insert(name.range, docstring);
+                if let Some(definition) = definitions.definitions.get_mut(&name.id)
+                    && definition.range == name.range
+                    && !definition.needs_anywhere
+                {
+                    // A rebound export's canonical declaration may not supply its final value.
+                    definition.doc_ranges = DocRanges::of_docstring(Some(docstring));
+                }
+            });
+        }
         definitions.inject_implicit_globals();
         let partially_known_dunder_all = Self::get_partially_known_dunder_all(&definitions);
         let explicit_dunder_all_names = Self::compute_explicit_dunder_all_names(&definitions);
@@ -214,6 +230,7 @@ impl Exports {
             environment_wildcard: Calculation::new(),
             exports: Calculation::new(),
             docstring_range: Docstring::range_from_stmts(x),
+            declaration_docstrings,
             symbols,
             pytest_fixtures: collect_pytest_fixture_definitions(x),
         }
@@ -221,6 +238,11 @@ impl Exports {
 
     pub(crate) fn pytest_fixtures(&self) -> &[PytestFixtureDefinition] {
         &self.pytest_fixtures
+    }
+
+    /// The trailing docstring for the resolved declaration site.
+    pub(crate) fn declaration_docstring(&self, definition_range: TextRange) -> Option<TextRange> {
+        self.declaration_docstrings.get(&definition_range).copied()
     }
 
     /// Look up a fixture import by its Python name without resolving unrelated imports.
