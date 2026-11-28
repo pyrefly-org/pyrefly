@@ -13,6 +13,8 @@ use std::sync::LazyLock;
 
 use anyhow::anyhow;
 use dupe::Dupe;
+use pyrefly_bundled::bundled_sandbox_paths;
+use pyrefly_bundled::bundled_sandbox_stubs;
 use pyrefly_bundled::bundled_third_party;
 use pyrefly_bundled::bundled_third_party_paths;
 use pyrefly_config::config::ConfigFile;
@@ -55,12 +57,18 @@ impl BundledStub for BundledThirdParty {
     fn new() -> anyhow::Result<Self> {
         let files = bundled_third_party_paths()
             .into_iter()
+            .chain(bundled_sandbox_paths())
             .map(|relative_path| BundleFile {
                 import_path: strip_stubs_suffix_from_path(&relative_path),
                 storage_path: relative_path,
             });
+        let contents = || {
+            let mut stubs = bundled_third_party()?;
+            stubs.extend(bundled_sandbox_stubs()?);
+            Ok(stubs)
+        };
         Ok(Self {
-            bundle: Bundle::new(files, bundled_third_party)?,
+            bundle: Bundle::new(files, contents)?,
         })
     }
 

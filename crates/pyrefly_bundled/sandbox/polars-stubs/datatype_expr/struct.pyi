@@ -1,0 +1,13 @@
+from __future__ import annotations
+import polars._reexport as pl
+from polars._utils.various import qualified_type_name
+
+
+class DataTypeExprStructNameSpace:
+    def __init__(self, expr: pl.DataTypeExpr) -> None: ...
+
+    def __getitem__(self, item: str | int) -> pl.DataTypeExpr: ...
+
+    def field_dtype(self, field_name: str) -> pl.DataTypeExpr: ...
+
+    def field_names(self) -> pl.Expr: ...
