@@ -2449,7 +2449,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let callback_ty = callback_arg
             .pre_eval(self, &probe_errors)
             .inferred_type(self, &probe_errors);
-        let is_overloaded = match &callback_ty {
+        // Class objects expose their overloads through their constructor signatures.
+        let constructor = match &callback_ty {
+            Type::ClassDef(cls) => {
+                Some(self.constructor_to_callable(&self.as_class_type_unchecked(cls)))
+            }
+            Type::Type(inner) => self.constructor_to_callable_for_type_of(inner),
+            _ => None,
+        };
+        let is_overloaded = match constructor.as_ref().unwrap_or(&callback_ty) {
             Type::Overload(_) => true,
             Type::BoundMethod(method) => {
                 matches!(&method.func, BoundMethodType::Overload(_))

@@ -2229,6 +2229,77 @@ r8([1], [""])  # E: Argument `list[str]` is not assignable to parameter `y` with
 "#,
 );
 
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/5009.
+testcase!(
+    test_overloaded_new_callable_argument,
+    {
+        let mut env = TestEnv::new_with_infer_with_first_use(false);
+        env.add_with_path(
+            "containers",
+            "containers.pyi",
+            r#"
+from collections.abc import Callable, Iterable, Iterator
+from typing import Concatenate, Self, overload
+
+class Pipe:
+    def pipe[**P, R](
+        self, f: Callable[Concatenate[Self, P], R], *args: P.args, **kwargs: P.kwargs
+    ) -> R: ...
+
+class Vec[T](Pipe):
+    value: T
+    @overload
+    def __new__(cls, /) -> Self: ...
+    @overload
+    def __new__(cls, data: Iterable[T], /) -> Self: ...
+    @overload
+    def __new__(cls, data: T, /, *more: T) -> Self: ...
+    def __iter__(self) -> Iterator[T]: ...
+
+class Seq[T](Pipe):
+    @overload
+    def __new__(cls, /) -> Self: ...
+    @overload
+    def __new__(cls, data: Iterable[T], /) -> Self: ...
+    @overload
+    def __new__(cls, data: T, /, *more: T) -> Self: ...
+    def __iter__(self) -> Iterator[T]: ...
+
+class Iter[T]:
+    def collect[R](self, f: Callable[[Iterator[T]], R]) -> R: ...
+
+class Option[T]:
+    def map[R](self, f: Callable[[T], R]) -> Option[R]: ...
+"#,
+        );
+        env
+    },
+    r#"
+from operator import call
+from typing import assert_type
+from containers import Iter, Option, Seq, Vec
+
+def check(it: Iter[int], opt: Option[Seq[int]], factory: type[Vec[int]]) -> None:
+    x = assert_type(Seq([1]), Seq[int])
+    assert_type(Vec(x), Vec[int])
+    assert_type(Seq(x), Seq[int])
+    assert_type(call(Vec, x), Vec[int])
+    assert_type(call(Seq, x), Seq[int])
+    assert_type(call(Vec[int], x), Vec[int])
+    assert_type(call(factory, x), Vec[int])
+    assert_type(call(Vec, 1), Vec[int])
+    assert_type(call(Seq, 1), Seq[int])
+    assert_type(call(Vec, 1, 2), Vec[int])
+    assert_type(call(Seq, 1, 2), Seq[int])
+    assert_type(x.pipe(Vec), Vec[int])
+    assert_type(x.pipe(Seq), Seq[int])
+    assert_type(it.collect(Vec), Vec[int])
+    assert_type(it.collect(Seq), Seq[int])
+    assert_type(opt.map(Vec), Option[Vec[int]])
+    assert_type(opt.map(Seq), Option[Seq[int]])
+"#,
+);
+
 testcase!(
     test_generic_classmethod_to_callable_preserves_class_tparams,
     r#"
