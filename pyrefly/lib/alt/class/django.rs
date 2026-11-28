@@ -38,6 +38,7 @@ use ruff_python_ast::Expr;
 use ruff_python_ast::ExprCall;
 use ruff_python_ast::ExprStringLiteral;
 use ruff_python_ast::name::Name;
+use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use starlark_map::small_map::SmallMap;
 use vec1::vec1;
@@ -55,6 +56,7 @@ use crate::alt::types::instance::Instance;
 use crate::binding::binding::BindingDjangoRelations;
 use crate::binding::binding::ClassFieldDefinition;
 use crate::binding::binding::ExprOrBinding;
+use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 
 /// Django stubs use this attribute to specify the Python type that a field should infer to
@@ -101,7 +103,7 @@ const AS_MANAGER: Name = Name::new_static("as_manager");
 
 pub(crate) struct DjangoAnnotateCall {
     metadata: FuncMetadata,
-    attributes: TypeMap,
+    attributes: SmallMap<Name, (Type, TextRange)>,
 }
 
 /// Find a keyword argument by name and return its value expression.
@@ -147,24 +149,27 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         &self,
         callee: &Type,
         arguments: &Arguments,
+        errors: &ErrorCollector,
     ) -> Option<DjangoAnnotateCall> {
         let metadata = callee.toplevel_func_metadata()?.clone();
         if !Self::is_django_annotate(&metadata) {
             return None;
         }
 
-        let mut attributes = TypeMap::new();
-        // Positional annotations are out of scope because their generated names require Django
-        // expression semantics. Every explicit keyword still introduces a statically known name,
-        // although the expression object's type is not generally the value type Django produces.
+        let mut attributes = SmallMap::new();
+        // Positional annotations require Django's generated expression aliases.
         for keyword in &arguments.keywords {
             if let Some(name) = &keyword.arg {
-                attributes
-                    .0
-                    .insert(name.id.clone(), self.heap.mk_any_implicit());
+                attributes.insert(
+                    name.id.clone(),
+                    (
+                        self.expr_infer(&keyword.value, errors),
+                        keyword.value.range(),
+                    ),
+                );
             }
         }
-        if attributes.0.is_empty() {
+        if attributes.is_empty() {
             None
         } else {
             Some(DjangoAnnotateCall {
@@ -178,6 +183,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         &self,
         result: Type,
         call: Option<DjangoAnnotateCall>,
+        errors: &ErrorCollector,
     ) -> Type {
         let Some(call) = call else {
             return result;
@@ -197,9 +203,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if !self.is_django_model_row(&row) {
             return self.heap.mk_class_type(queryset);
         }
+        // Django resolves keyword annotations in order, so later ones can reference earlier ones.
+        let mut attributes = TypeMap::new();
+        for (name, (expression, range)) in call.attributes {
+            let context = self.heap.mk_kw_call(KwCall {
+                func_metadata: call.metadata.clone(),
+                keywords: attributes.clone(),
+                return_ty: row.clone(),
+            });
+            attributes.0.insert(
+                name,
+                self.django_expression_type(&expression, &context, range, errors),
+            );
+        }
         let annotation = self.heap.mk_kw_call(KwCall {
             func_metadata: call.metadata,
-            keywords: call.attributes,
+            keywords: attributes,
             return_ty: row.clone(),
         });
         // The intersection preserves call-site metadata while generic QuerySet operations use the
@@ -211,6 +230,420 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             queryset = queryset.with_django_base(base);
         }
         self.heap.mk_class_type(queryset)
+    }
+
+    /// Preserve constructor arguments whose meaning depends on the receiving query.
+    pub(crate) fn apply_django_expression_call(
+        &self,
+        result: Type,
+        callee: &Type,
+        arguments: &Arguments,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let Type::ClassType(expression) = &result else {
+            return result;
+        };
+        if self.unwrap_class_object_silently(callee).is_none()
+            || !(expression.is(KnownClass::DjangoF)
+                || self
+                    .get_mro_for_class(expression.class_object())
+                    .ancestors(self.stdlib)
+                    .any(|base| {
+                        base.is(KnownClass::DjangoBaseExpression) || base.is(KnownClass::DjangoF)
+                    }))
+        {
+            return result;
+        }
+        let source = if expression.is(KnownClass::DjangoF) || expression.is(KnownClass::DjangoValue)
+        {
+            arguments
+                .find_argument_value(
+                    if expression.is(KnownClass::DjangoF) {
+                        "name"
+                    } else {
+                        "value"
+                    },
+                    0,
+                )
+                .map(|expr| self.expr_infer(expr, errors))
+                .unwrap_or_else(|| self.heap.mk_any_implicit())
+        } else if expression.is(KnownClass::DjangoWhen) {
+            arguments
+                .find_argument_value("then", 1)
+                .map(|expr| self.expr_infer(expr, errors))
+                .unwrap_or_else(|| self.heap.mk_none())
+        } else {
+            let mut sources = if expression.is(KnownClass::DjangoCast)
+                || expression.is(KnownClass::DjangoExpressionWrapper)
+            {
+                arguments
+                    .find_argument_value("expression", 0)
+                    .into_iter()
+                    .map(|expr| self.expr_infer(expr, errors))
+                    .collect()
+            } else {
+                arguments
+                    .args
+                    .iter()
+                    .map(|expr| self.expr_infer(expr, errors))
+                    .collect()
+            };
+            // A star argument can supply an unknown number of sources.
+            if arguments
+                .args
+                .iter()
+                .any(|arg| matches!(arg, Expr::Starred(_)))
+            {
+                sources = vec![self.heap.mk_any_implicit()];
+            }
+            self.heap.mk_concrete_tuple(sources)
+        };
+        let output_field = if expression.is(KnownClass::DjangoValue)
+            || expression.is(KnownClass::DjangoExpressionWrapper)
+            || expression.is(KnownClass::DjangoCast)
+        {
+            arguments.find_argument_value("output_field", 1)
+        } else {
+            arguments.find_keyword("output_field").map(|kw| &kw.value)
+        };
+        let output_type = output_field
+            .map(|expr| self.django_expression_field_type(&self.expr_infer(expr, errors)))
+            .unwrap_or_else(|| self.heap.mk_none());
+        let default = arguments
+            .find_keyword("default")
+            .map(|kw| self.expr_infer(&kw.value, errors))
+            .unwrap_or_else(|| self.heap.mk_none());
+        self.heap
+            .mk_class_type(
+                expression
+                    .clone()
+                    .with_django_expression(source, output_type, default),
+            )
+    }
+
+    /// Read an expression's output field without requiring a model declaration.
+    fn django_expression_field_type(&self, field: &Type) -> Type {
+        let field = self.solver().force(field.clone(), self);
+        if field.is_none() {
+            return self.heap.mk_none();
+        }
+        if let Type::ClassType(field) = &field
+            && self.inherits_from_django_field(field.class_object())
+        {
+            for (param, arg) in field.targs().iter_paired() {
+                let arg = self.solver().force(arg.clone(), self);
+                if param.name().as_str() == "_GT" && !matches!(arg, Type::Any(AnyStyle::Implicit)) {
+                    return arg;
+                }
+            }
+            if let Some(member) =
+                self.get_class_member(field.class_object(), &DJANGO_PRIVATE_GET_TYPE)
+            {
+                return member.ty();
+            }
+        }
+        self.heap.mk_any_implicit()
+    }
+
+    /// Resolve supported expressions to database values in the receiving row.
+    fn django_expression_type(
+        &self,
+        expression: &Type,
+        row: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        self.distribute_over_union(expression, |expression| {
+            let Type::ClassType(cls) = expression else {
+                return self.heap.mk_any_implicit();
+            };
+            let ancestors = self.get_mro_for_class(cls.class_object());
+            let is = |known| {
+                cls.is(known) || ancestors.ancestors(self.stdlib).any(|base| base.is(known))
+            };
+            let (source, output_type, default) = match cls.django_specialization() {
+                Some(DjangoSpecialization::Expression {
+                    source,
+                    output_type,
+                    default,
+                }) => (source.clone(), output_type.clone(), default.clone()),
+                _ => (
+                    self.heap.mk_any_implicit(),
+                    self.heap.mk_none(),
+                    self.heap.mk_none(),
+                ),
+            };
+            if is(KnownClass::DjangoF) {
+                return self.django_expression_reference(&source, row, range, errors);
+            }
+            if is(KnownClass::DjangoWhen) {
+                return self.django_expression_source_type(&source, row, range, errors, true);
+            }
+            let sources = if is(KnownClass::DjangoValue) {
+                vec![source.promote(self.stdlib)]
+            } else if let Type::Tuple(Tuple::Concrete(sources)) = source {
+                sources
+                    .iter()
+                    .map(|source| {
+                        self.django_expression_source_type(source, row, range, errors, true)
+                    })
+                    .collect()
+            } else {
+                vec![self.heap.mk_any_implicit()]
+            };
+            let default = self.django_expression_source_type(
+                &default,
+                row,
+                range,
+                errors,
+                is(KnownClass::DjangoCase),
+            );
+            let mut source_type = self.unions(sources.clone());
+            if is(KnownClass::DjangoCase) {
+                source_type = self.union(source_type, default.clone());
+            }
+            let explicit_output = !output_type.is_none();
+            let mut ty = if explicit_output {
+                output_type
+            } else if is(KnownClass::DjangoValue) {
+                match &source_type {
+                    Type::None => source_type.clone(),
+                    Type::ClassType(value)
+                        if matches!(
+                            value.known(),
+                            Some(
+                                KnownClass::Bool
+                                    | KnownClass::Bytes
+                                    | KnownClass::Float
+                                    | KnownClass::Int
+                                    | KnownClass::Str
+                                    | KnownClass::Decimal
+                                    | KnownClass::Datetime
+                                    | KnownClass::DatetimeDate
+                                    | KnownClass::DatetimeTime
+                                    | KnownClass::DatetimeTimedelta
+                            )
+                        ) => source_type.clone(),
+                    _ => self.heap.mk_any_implicit(),
+                }
+            } else {
+                let field = self.attr_infer_for_type(
+                    expression,
+                    &Name::new_static("output_field"),
+                    range,
+                    &self.error_swallower(),
+                    None,
+                );
+                let output = self.django_expression_field_type(&field);
+                if !output.is_any() {
+                    output
+                } else if is(KnownClass::DjangoSum)
+                    || is(KnownClass::DjangoMin)
+                    || is(KnownClass::DjangoMax)
+                    || is(KnownClass::DjangoCase)
+                    || is(KnownClass::DjangoCoalesce)
+                {
+                    source_type.clone()
+                } else if is(KnownClass::DjangoAvg)
+                    || is(KnownClass::DjangoStdDev)
+                    || is(KnownClass::DjangoVariance)
+                {
+                    self.distribute_over_union(&source_type, |ty| {
+                        if matches!(ty, Type::ClassType(cls) if cls.is(KnownClass::Int) || cls.is(KnownClass::Bool)) {
+                            self.heap.mk_class_type(self.stdlib.float().clone())
+                        } else if ty.is_none()
+                            || matches!(ty, Type::ClassType(cls) if matches!(
+                                cls.known(),
+                                Some(KnownClass::Float | KnownClass::Decimal | KnownClass::DatetimeTimedelta)
+                            ))
+                        {
+                            ty.clone()
+                        } else {
+                            self.heap.mk_any_implicit()
+                        }
+                    })
+                } else {
+                    self.heap.mk_any_implicit()
+                }
+            };
+            if is(KnownClass::DjangoSum) && !explicit_output {
+                // SQL adds boolean values as integers and can produce values greater than one.
+                ty = self.distribute_over_union(&ty, |ty| {
+                    if matches!(ty, Type::ClassType(cls) if cls.is(KnownClass::Bool)) {
+                        self.heap.mk_class_type(self.stdlib.int().clone())
+                    } else {
+                        ty.clone()
+                    }
+                });
+            }
+            let nullable = if is(KnownClass::DjangoAggregate) {
+                !is(KnownClass::DjangoCount) && self.django_expression_may_be_none(&default)
+            } else if is(KnownClass::DjangoCase) {
+                self.django_expression_may_be_none(&source_type)
+            } else if is(KnownClass::DjangoCoalesce) {
+                sources.iter().all(|ty| self.django_expression_may_be_none(ty))
+            } else if is(KnownClass::DjangoConcat) {
+                false
+            } else if is(KnownClass::DjangoFunc)
+                || is(KnownClass::DjangoExpressionWrapper)
+                || is(KnownClass::DjangoValue)
+            {
+                sources.iter().any(|ty| self.django_expression_may_be_none(ty))
+            } else {
+                false
+            };
+            if nullable {
+                self.union(ty, self.heap.mk_none())
+            } else {
+                self.distribute_over_union(&ty, |ty| {
+                    if ty.is_none() {
+                        self.heap.mk_never()
+                    } else {
+                        ty.clone()
+                    }
+                })
+            }
+        })
+    }
+
+    /// Interpret strings as field paths where Django uses F(). Other defaults remain literal values.
+    fn django_expression_source_type(
+        &self,
+        source: &Type,
+        row: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+        strings_are_fields: bool,
+    ) -> Type {
+        self.distribute_over_union(source, |source| {
+            if strings_are_fields
+                && let Type::Literal(lit) = source
+                && let Lit::Str(path) = &lit.value
+            {
+                // Count("*") counts rows rather than resolving a model field.
+                if path.as_str() == "*" {
+                    return self.heap.mk_any_implicit();
+                }
+                return self.django_expression_reference(source, row, range, errors);
+            }
+            if let Type::ClassType(cls) = source
+                && (cls.is(KnownClass::DjangoF)
+                    || self
+                        .get_mro_for_class(cls.class_object())
+                        .ancestors(self.stdlib)
+                        .any(|base| {
+                            base.is(KnownClass::DjangoBaseExpression)
+                                || base.is(KnownClass::DjangoF)
+                        }))
+            {
+                self.django_expression_type(source, row, range, errors)
+            } else {
+                source.clone().promote(self.stdlib)
+            }
+        })
+    }
+
+    /// Unknown values can be SQL NULL as well as values of an unresolved type.
+    fn django_expression_may_be_none(&self, ty: &Type) -> bool {
+        let mut nullable = false;
+        self.map_over_union(ty, |ty| nullable |= ty.is_none() || ty.is_any());
+        nullable
+    }
+
+    /// Resolve a literal Django field path, including traversal through related managers.
+    fn django_expression_reference(
+        &self,
+        source: &Type,
+        row: &Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let Type::Literal(lit) = source else {
+            return self.heap.mk_any_implicit();
+        };
+        let Lit::Str(path) = &lit.value else {
+            return self.heap.mk_any_implicit();
+        };
+        let mut ty = row.clone();
+        for part in path.split("__") {
+            ty = self.distribute_over_union(&ty, |base| {
+                if base.is_none() {
+                    return base.clone();
+                }
+                let related_manager = self.is_django_manager_type(base);
+                let base = if related_manager && let Type::ClassType(cls) = base {
+                    self.get_mro_for_class(cls.class_object())
+                        .ancestors(self.stdlib)
+                        .find(|base| base.is(KnownClass::DjangoBaseManager))
+                        .map(|base| base.substitute_with(&cls.substitution(), self))
+                        .and_then(|base| base.targs().as_slice().first().cloned())
+                        .unwrap_or_else(|| self.heap.mk_any_implicit())
+                } else {
+                    base.clone()
+                };
+                let mut name = Name::new(part);
+                if let Some(ty) = self.django_annotated_fields(&base).get(&name) {
+                    return ty.clone();
+                }
+                let Some(model) = self.attribute_lookup_classes(&base).and_then(|classes| {
+                    classes
+                        .into_iter()
+                        .find(|cls| self.get_metadata_for_class(cls).is_django_model())
+                }) else {
+                    // SQL transforms can follow a scalar field and need not be Python attributes.
+                    return self.heap.mk_any_implicit();
+                };
+                if !self.has_attr(&base, &name) {
+                    // Default reverse query names omit the accessor's `_set` suffix.
+                    let reverse = Name::new(format!("{part}_set"));
+                    let reverse_type = self.attr_infer_for_type(
+                        &base,
+                        &reverse,
+                        range,
+                        &self.error_swallower(),
+                        None,
+                    );
+                    if self.is_django_manager_type(&reverse_type) {
+                        name = reverse;
+                    } else {
+                        self.error(
+                            errors,
+                            range,
+                            ErrorKind::MissingAttributeDjangoField,
+                            format!(
+                                "Django field path `{path}` has no field `{part}` on model `{}`",
+                                model.name(self)
+                            ),
+                        );
+                        return self.heap.mk_any_implicit();
+                    }
+                }
+                let ty =
+                    self.attr_infer_for_type(&base, &name, range, &self.error_swallower(), None);
+                if related_manager {
+                    // A reverse relation can have no matching rows in a left join.
+                    self.union(ty, self.heap.mk_none())
+                } else {
+                    ty
+                }
+            });
+        }
+        self.distribute_over_union(&ty, |ty| {
+            if let Type::ClassType(cls) = ty
+                && self
+                    .get_metadata_for_class(cls.class_object())
+                    .is_django_model()
+            {
+                // A query returns a relation's stored key, rather than a model instance.
+                self.get_pk_field_type(cls.class_object())
+                    .map(|(ty, _)| ty)
+                    .unwrap_or_else(|| self.heap.mk_any_implicit())
+            } else if self.is_django_manager_type(ty) {
+                self.heap.mk_any_implicit()
+            } else {
+                ty.clone()
+            }
+        })
     }
 
     fn is_django_model_row(&self, ty: &Type) -> bool {
@@ -756,6 +1189,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         name: &Name,
     ) -> Option<ClassAttribute> {
         match cls.django_specialization()? {
+            DjangoSpecialization::Expression { .. } => None,
             DjangoSpecialization::Field {
                 get_type,
                 set_type,
