@@ -14,6 +14,31 @@ import { loadPyrefly } from '../sandbox/pyreflyWasmLoader';
 import { restoreFetch, stubFetch } from './__test_utils__/fetchStub';
 
 describe('pyreflyWasmLoader', () => {
+    const originalReleaseFlag = process.env.PYREFLY_WASM_RELEASES_ENABLED;
+    beforeEach(() => {
+        process.env.PYREFLY_WASM_RELEASES_ENABLED = '1';
+    });
+    afterEach(() => {
+        if (originalReleaseFlag === undefined) {
+            delete process.env.PYREFLY_WASM_RELEASES_ENABLED;
+        } else {
+            process.env.PYREFLY_WASM_RELEASES_ENABLED = originalReleaseFlag;
+        }
+    });
+    test('rejects a shared release until publishing is enabled', async () => {
+        delete process.env.PYREFLY_WASM_RELEASES_ENABLED;
+        const fetchMock = jest
+            .fn()
+            .mockResolvedValue({ ok: false, status: 404 });
+        stubFetch(fetchMock);
+        try {
+            // Bug: a valid shared URL can load from an unverified publishing channel.
+            await expect(loadPyrefly('1.5.0')).rejects.toThrow('404');
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+            restoreFetch();
+        }
+    });
     test('loads the bundled build and caches it', async () => {
         const first = loadPyrefly(null);
         // A repeated load of the bundled build reuses the promise.

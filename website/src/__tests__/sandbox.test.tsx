@@ -426,6 +426,14 @@ describe('Sandbox Component', () => {
         }
     });
 
+    test('version controls have a row separate from file tabs', async () => {
+        const result = render(<Sandbox sampleFilename={SANDBOX_FILE_NAME} />);
+        const selector = result.getByLabelText('Select Pyrefly version');
+        await waitFor(() => expect(selector).not.toBeDisabled());
+        // Bug: file tabs consume the settings row's width on phones.
+        expect(selector.parentElement).toHaveTextContent('sandbox.py');
+    });
+
     function expectMonacoEditorLoadedWithContent(
         container: HTMLElement,
         fileName: string,

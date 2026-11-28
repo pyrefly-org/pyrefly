@@ -19,9 +19,32 @@ import {
 import { restoreFetch, stubFetch } from './__test_utils__/fetchStub';
 
 describe('pyreflyVersions', () => {
+    const originalReleaseFlag = process.env.PYREFLY_WASM_RELEASES_ENABLED;
     // The catalog is cached across calls; each test needs its own fetch.
     beforeEach(() => {
+        process.env.PYREFLY_WASM_RELEASES_ENABLED = '1';
         invalidatePyreflyVersions();
+    });
+    afterEach(() => {
+        if (originalReleaseFlag === undefined) {
+            delete process.env.PYREFLY_WASM_RELEASES_ENABLED;
+        } else {
+            process.env.PYREFLY_WASM_RELEASES_ENABLED = originalReleaseFlag;
+        }
+    });
+    test('does not fetch a catalog until release publishing is enabled', async () => {
+        delete process.env.PYREFLY_WASM_RELEASES_ENABLED;
+        const fetchMock = jest
+            .fn()
+            .mockResolvedValue({ ok: false, status: 404 });
+        stubFetch(fetchMock);
+        try {
+            // Bug: an absent publishing prerequisite does not prevent a request.
+            await expect(fetchPyreflyVersions()).rejects.toThrow('404');
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+            restoreFetch();
+        }
     });
     test('pyreflyWasmUrls builds jsDelivr URLs', () => {
         expect(pyreflyWasmUrls('1.2.0')).toEqual({

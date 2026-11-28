@@ -23,12 +23,19 @@ const VERSIONS_RESPONSE = {
 };
 
 describe('PyreflyVersionSelector', () => {
+    const originalReleaseFlag = process.env.PYREFLY_WASM_RELEASES_ENABLED;
     beforeEach(() => {
+        process.env.PYREFLY_WASM_RELEASES_ENABLED = '1';
         invalidatePyreflyVersions();
     });
 
     afterEach(() => {
         restoreFetch();
+        if (originalReleaseFlag === undefined) {
+            delete process.env.PYREFLY_WASM_RELEASES_ENABLED;
+        } else {
+            process.env.PYREFLY_WASM_RELEASES_ENABLED = originalReleaseFlag;
+        }
     });
 
     test('lists releases and dev builds and reports the selection', async () => {
