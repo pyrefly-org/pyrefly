@@ -25,6 +25,58 @@ use crate::test::util::code_frame_of_source_at_range;
 use crate::test::util::get_batched_lsp_operations_report;
 
 #[test]
+fn outgoing_call_hierarchy_visits_nested_expressions() {
+    let env = TestEnv::one(
+        "main",
+        r#"def value() -> int:
+    return 1
+
+def outer(value: int) -> int:
+    return value
+
+def caller():
+    outer(value())
+    if value() == 0:
+        pass
+    [value() for item in (1, 2)]
+    {value(): value()}
+    outer(value=value())
+"#,
+    );
+    let (state, handle_for_name) = env.to_state();
+    let handle = handle_for_name("main");
+    let mut transaction = state.cancellable_transaction();
+    let module = transaction.as_ref().get_module_info(&handle).unwrap();
+    let position = module.from_lsp_position(Position::new(6, 4), None);
+    let callees = transaction
+        .find_global_outgoing_calls_from_function_definition(&handle, position)
+        .unwrap();
+    let calls = transform_outgoing_calls(callees, &module, None);
+    let mut actual = calls
+        .iter()
+        .map(|call| {
+            assert_eq!(call.from_ranges.len(), 1);
+            let start = call.from_ranges[0].start;
+            (call.to.name.as_str(), start.line, start.character)
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    assert_eq!(
+        actual,
+        vec![
+            ("outer", 7, 4),
+            ("outer", 12, 4),
+            ("value", 7, 10),
+            ("value", 8, 7),
+            ("value", 10, 5),
+            ("value", 11, 5),
+            ("value", 11, 14),
+            ("value", 12, 16),
+        ]
+    );
+}
+
+#[test]
 fn outgoing_call_hierarchy_uses_the_bundled_callee_uri() {
     let env = TestEnv::one(
         "main",

@@ -498,31 +498,38 @@ impl CancellableTransaction<'_> {
             (Module, Vec<(TextRange, TextRange)>),
         > = std::collections::HashMap::new();
 
+        fn visit_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
+            f(expr);
+            expr.recurse(&mut |child| visit_expr(child, f));
+        }
+
         for stmt in &func_def.body {
             stmt.visit(&mut |expr| {
-                if let Expr::Call(call) = expr {
-                    let call_pos = call
-                        .func
-                        .range()
-                        .end()
-                        .checked_sub(TextSize::from(1))
-                        .unwrap_or(call.func.range().start());
+                visit_expr(expr, &mut |expr| {
+                    if let Expr::Call(call) = expr {
+                        let call_pos = call
+                            .func
+                            .range()
+                            .end()
+                            .checked_sub(TextSize::from(1))
+                            .unwrap_or(call.func.range().start());
 
-                    let definitions = self
-                        .as_ref()
-                        .find_definition(&target_handle, call_pos, FindPreference::default())
-                        .map(Vec1::into_vec)
-                        .unwrap_or_default();
+                        let definitions = self
+                            .as_ref()
+                            .find_definition(&target_handle, call_pos, FindPreference::default())
+                            .map(Vec1::into_vec)
+                            .unwrap_or_default();
 
-                    for def in definitions {
-                        let module_path = def.module.path().dupe();
-                        callees_by_module
-                            .entry(module_path)
-                            .or_insert_with(|| (def.module.clone(), Vec::new()))
-                            .1
-                            .push((call.range(), def.definition_range));
+                        for def in definitions {
+                            let module_path = def.module.path().dupe();
+                            callees_by_module
+                                .entry(module_path)
+                                .or_insert_with(|| (def.module.clone(), Vec::new()))
+                                .1
+                                .push((call.range(), def.definition_range));
+                        }
                     }
-                }
+                });
             });
         }
 
