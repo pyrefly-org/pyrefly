@@ -2102,8 +2102,8 @@ class Config:
 
 Default severity: `ignore`
 
-The `protected-access` error is reported when a protected class member, whose name starts with a
-single underscore, is accessed from outside its defining class or a subclass.
+The `protected-access` error checks protected class members outside their class hierarchy
+and private module names that are not exported in `__all__`.
 
 ```python
 class Service:
@@ -2112,7 +2112,7 @@ class Service:
 Service()._reset()  # protected-access
 ```
 
-Double-underscore private attributes are checked separately under [`no-access`](#no-access).
+Double-underscore private class attributes are checked separately under [`no-access`](#no-access).
 
 ## protocol-implicitly-defined-attribute
 
