@@ -12,6 +12,7 @@ use pyrefly_build::handle::Handle;
 use pyrefly_graph::index::Idx;
 use pyrefly_python::ast::Ast;
 use pyrefly_python::module::TextRangeWithModule;
+use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::literal::Lit;
 use pyrefly_util::visit::Visit;
 use ruff_python_ast::Expr;
@@ -261,6 +262,20 @@ impl<'a> Transaction<'a> {
                     let mut ty = declaration_type.unwrap_or(ty);
                     if let Some(constructor) = self.new_type_constructor_signature(handle, &ty) {
                         ty = constructor;
+                        insertable = false;
+                    }
+                    // An enum member assigned `auto()` shows the type of the value `auto()`
+                    // generates. It cannot be annotated, because enum members may not be.
+                    if matches!(&ty, Type::ClassType(cls) if cls.is(KnownClass::EnumAuto))
+                        && let Some(field) = answers.get_class_field_at_definition(idx)
+                        && let Type::Literal(lit) = field.ty()
+                        && let Lit::Enum(lit_enum) = &lit.value
+                    {
+                        ty = self
+                            .ad_hoc_solve(handle, "inlay_hint_enum_auto", |solver| {
+                                solver.auto_value_type(lit_enum.class.class_object())
+                            })
+                            .expect("the handle was already solved above");
                         insertable = false;
                     }
                     // Inspect the value-producing binding before deciding whether to show a hint.

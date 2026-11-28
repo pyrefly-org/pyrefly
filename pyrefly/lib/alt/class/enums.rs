@@ -570,7 +570,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     /// 1. If a data type is mixed in (e.g. `class E(str, Enum)`), `auto()` produces
     ///    that type because `__new__` converts the raw value.
     /// 2. Otherwise, look up `_generate_next_value_` on the class, defaulting to `int` for `enum.Enum`
-    fn auto_value_type(&self, cls: &Class) -> Type {
+    pub(crate) fn auto_value_type(&self, cls: &Class) -> Type {
         // A mixed-in data type takes priority: the enum's `__new__` converts values to that type.
         if let Some(mixed_in) = self.mixed_in_enum_data_type(cls) {
             return mixed_in;

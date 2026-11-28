@@ -52,6 +52,7 @@ use crate::alt::answers_solver::ThreadState;
 use crate::alt::attr::AttrDefinition;
 use crate::alt::attr::AttrInfo;
 use crate::alt::class::attrs::AttrsInitName;
+use crate::alt::class::class_field::ClassField;
 use crate::alt::class::class_field::DataclassMember;
 use crate::alt::traits::Solve;
 use crate::binding::binding::AnyIdx;
@@ -1996,13 +1997,19 @@ impl Answers {
         Some(self.get_idx(idx)?.ty().clone())
     }
 
-    /// The resolved declaration type of an annotated class-body field, including inherited
-    /// annotations. No attribute-access substitutions are applied, so `Self` stays relative.
-    pub(crate) fn get_class_field_type_at_definition(&self, idx: Idx<Key>) -> Option<Type> {
+    /// The solved class field for a class-body definition, or `None` if the definition is not
+    /// a class field.
+    pub(crate) fn get_class_field_at_definition(&self, idx: Idx<Key>) -> Option<&ClassField> {
         let bindings = self.bindings();
         let field_key = bindings.class_field_for_definition(idx)?;
         let field_idx = bindings.key_to_idx_hashed_opt(Hashed::new(field_key))?;
-        let field = self.get_idx(field_idx)?;
+        self.get_idx(field_idx)
+    }
+
+    /// The resolved declaration type of an annotated class-body field, including inherited
+    /// annotations. No attribute-access substitutions are applied, so `Self` stays relative.
+    pub(crate) fn get_class_field_type_at_definition(&self, idx: Idx<Key>) -> Option<Type> {
+        let field = self.get_class_field_at_definition(idx)?;
         field.has_explicit_annotation().then(|| field.ty())
     }
 

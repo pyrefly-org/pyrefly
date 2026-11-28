@@ -1781,3 +1781,39 @@ zzz = f()
         .collect();
     assert_eq!(label, ": int");
 }
+
+#[test]
+fn test_enum_auto_inlay_hint() {
+    let code = r#"
+from enum import Enum, IntEnum, StrEnum, auto
+class A(Enum):
+    a = auto()
+class B(IntEnum):
+    b = auto()
+class C(StrEnum):
+    c = auto()
+class D(str, Enum):
+    d = auto()
+class E(Enum):
+    e = 1
+"#;
+    // `auto()` members show the type of the value that `auto()` generates.
+    assert_eq!(
+        r#"
+# main.py
+4 |     a = auto()
+         ^ inlay-hint: `: int`
+
+6 |     b = auto()
+         ^ inlay-hint: `: int`
+
+8 |     c = auto()
+         ^ inlay-hint: `: str`
+
+10 |     d = auto()
+          ^ inlay-hint: `: str`
+"#
+        .trim(),
+        generate_inlay_hint_report(code, Default::default()).trim()
+    );
+}
