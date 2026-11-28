@@ -20,6 +20,7 @@ import { loadPyrefly } from '../sandbox/pyreflyWasmLoader';
 // snapshot pins the sandbox while the list is still loading. The mock is
 // countable so that tests can assert how often the catalog is requested.
 jest.mock('../sandbox/pyreflyVersions', () => ({
+    ...jest.requireActual('../sandbox/pyreflyVersions'),
     fetchPyreflyVersions: jest.fn(() => new Promise(() => {})),
 }));
 
@@ -53,6 +54,7 @@ describe('Sandbox Component', () => {
             actualLoader.loadPyrefly(version)
         );
         fetchVersionsMock.mockClear();
+        fetchVersionsMock.mockImplementation(() => new Promise(() => {}));
     });
 
     afterEach(() => {
@@ -261,6 +263,167 @@ describe('Sandbox Component', () => {
         });
 
         expect(window.location.search).toContain('pyrefly=2.0.0');
+    });
+
+    // These tests pin the transition behavior before changing checker ownership.
+    test('reports the running build while a release is pending', async () => {
+        const bundled = await actualLoader.loadPyrefly(null);
+        let finishLoad!: (loaded: typeof bundled) => void;
+        const pending = new Promise<typeof bundled>((resolve) => {
+            finishLoad = resolve;
+        });
+        fetchVersionsMock.mockResolvedValue([
+            { version: '1.5.0', prerelease: false },
+        ]);
+        loadPyreflyMock.mockImplementation((version: string | null) =>
+            version === null ? Promise.resolve(bundled) : pending
+        );
+        const open = jest.spyOn(window, 'open').mockImplementation(() => null);
+        try {
+            const result = render(
+                <Sandbox sampleFilename={SANDBOX_FILE_NAME} />
+            );
+            const selector = result.getByLabelText('Select Pyrefly version');
+            await waitFor(() => expect(selector).not.toBeDisabled());
+            await waitFor(() =>
+                expect(selector).toHaveTextContent('Pyrefly 1.5.0')
+            );
+            fireEvent.change(selector, { target: { value: '1.5.0' } });
+            // Bug: pending downloads hide results from the still-active checker.
+            expect(result.queryByText('No errors!')).not.toBeInTheDocument();
+            const link = result.container.querySelector('#pyrefly-build');
+            expect(link).toHaveTextContent('Pyrefly 1.2.3-test');
+            // Bug: the label still describes bundled, but its link and report URL do not.
+            expect(link).toHaveAttribute(
+                'href',
+                'https://github.com/pyrefly-org/pyrefly/releases/tag/1.5.0'
+            );
+            fireEvent.click(result.getByLabelText('report issue on GitHub'));
+            const issue = new URL(open.mock.calls[0][0] as string);
+            expect(issue.searchParams.get('description')).toContain(
+                'Pyrefly: 1.2.3-test'
+            );
+            expect(
+                new URL(issue.searchParams.get('sandbox')!).searchParams.get(
+                    'pyrefly'
+                )
+            ).toBe('1.5.0');
+            await act(async () => {
+                finishLoad({
+                    ...bundled,
+                    mod: { ...bundled.mod, version: () => '1.5.0' },
+                });
+            });
+            expect(link).toHaveTextContent('Pyrefly 1.5.0');
+            expect(
+                new URLSearchParams(window.location.search).get('pyrefly')
+            ).toBe('1.5.0');
+        } finally {
+            open.mockRestore();
+        }
+    });
+
+    test('can return to bundled while a shared release is pending', async () => {
+        window.history.replaceState({}, '', '/?pyrefly=1.5.0');
+        loadPyreflyMock.mockImplementation((version: string | null) =>
+            version === null
+                ? actualLoader.loadPyrefly(null)
+                : new Promise(() => {})
+        );
+        const result = render(<Sandbox sampleFilename={SANDBOX_FILE_NAME} />);
+        const selector = result.getByLabelText('Select Pyrefly version');
+        await act(async () => {
+            await Promise.resolve();
+        });
+        // Bug: the only control that can select the bundled build is disabled.
+        expect(selector).toBeDisabled();
+        expect(selector).toHaveValue('1.5.0');
+    });
+
+    test('recovers the running module rather than a pending release', async () => {
+        const bundled = await actualLoader.loadPyrefly(null);
+        let notReady = false;
+        const bundledInit = jest.fn().mockResolvedValue(undefined);
+        const releaseInit = jest.fn().mockResolvedValue(undefined);
+        const running = {
+            ...bundled,
+            mod: {
+                ...bundled.mod,
+                default: bundledInit,
+                State: class extends bundled.mod.State {
+                    getErrors() {
+                        if (notReady)
+                            throw new Error('pyrefly_wasm is not ready');
+                        return [];
+                    }
+                },
+            },
+        };
+        let finishLoad!: (loaded: typeof bundled) => void;
+        const pending = new Promise<typeof bundled>((resolve) => {
+            finishLoad = resolve;
+        });
+        fetchVersionsMock.mockResolvedValue([
+            { version: '1.5.0', prerelease: false },
+        ]);
+        loadPyreflyMock.mockImplementation((version: string | null) =>
+            version === null ? Promise.resolve(running) : pending
+        );
+        const error = jest.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+            const result = render(
+                <Sandbox sampleFilename={SANDBOX_FILE_NAME} />
+            );
+            const selector = result.getByLabelText('Select Pyrefly version');
+            await waitFor(() => expect(selector).not.toBeDisabled());
+            await waitFor(() =>
+                expect(selector).toHaveTextContent('Pyrefly 1.5.0')
+            );
+            fireEvent.change(selector, { target: { value: '1.5.0' } });
+            notReady = true;
+            fireEvent.click(result.getByLabelText('Parameter hints'));
+            notReady = false;
+            await act(async () => {
+                finishLoad({
+                    ...bundled,
+                    mod: {
+                        ...bundled.mod,
+                        default: releaseInit,
+                        version: () => '1.5.0',
+                    },
+                });
+            });
+            // Bug: the pending loader promise selects the wrong module for recovery.
+            expect(bundledInit).not.toHaveBeenCalled();
+            expect(releaseInit).toHaveBeenCalledTimes(1);
+        } finally {
+            error.mockRestore();
+        }
+    });
+
+    test('bundled initialization preserves the URL and router history entry', async () => {
+        const state = { routerKey: 'sandbox-entry' };
+        window.history.replaceState(
+            state,
+            '',
+            '/?version=3.12#sandbox-results-container'
+        );
+        const replace = jest.spyOn(window.history, 'replaceState');
+        try {
+            const result = render(
+                <Sandbox sampleFilename={SANDBOX_FILE_NAME} />
+            );
+            await waitFor(() =>
+                expect(
+                    result.container.querySelector('#pyrefly-build')
+                ).toHaveTextContent('Pyrefly 1.2.3-test')
+            );
+            expect(window.location.hash).toBe('#sandbox-results-container');
+            expect(window.history.state).toEqual(state);
+            expect(replace).not.toHaveBeenCalled();
+        } finally {
+            replace.mockRestore();
+        }
     });
 
     function expectMonacoEditorLoadedWithContent(
