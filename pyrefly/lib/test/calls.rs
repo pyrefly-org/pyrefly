@@ -1883,3 +1883,55 @@ schema.update(
 )
 "#,
 );
+
+testcase!(
+    test_deprecated_call_with_alias,
+    r#"
+from warnings import deprecated as _deprecated
+
+@_deprecated("Use new_func instead")
+def old_func() -> None:
+    pass
+
+old_func()  # E: `old_func` is deprecated
+    "#,
+);
+
+testcase!(
+    test_deprecated_call_with_module_alias,
+    r#"
+import warnings as w
+
+@w.deprecated("Use new_func instead")
+def old_func() -> None:
+    pass
+
+old_func()  # E: `old_func` is deprecated
+    "#,
+);
+
+testcase!(
+    test_deprecated_overload_import_alias,
+    TestEnv::one(
+        "library",
+        r#"
+import typing
+from warnings import deprecated as mark
+
+@typing.overload
+@mark("Only int is deprecated")
+def choose(x: int) -> int: ...
+
+@typing.overload
+def choose(x: str) -> str: ...
+
+def choose(x: int | str) -> int | str:
+    return x
+"#,
+    ),
+    r#"
+from library import choose
+choose("ok")
+choose(1)  # E: Only int is deprecated
+"#,
+);

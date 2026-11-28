@@ -10,8 +10,6 @@ use ruff_python_ast::Expr;
 use ruff_python_ast::ExprCall;
 use ruff_python_ast::ExprStringLiteral;
 
-use crate::export::special::SpecialExport;
-
 fn extract_message(call: &ExprCall) -> Option<String> {
     if let Some(arg) = call.arguments.args.first()
         && let Expr::StringLiteral(ExprStringLiteral { value, .. }) = arg
@@ -22,10 +20,10 @@ fn extract_message(call: &ExprCall) -> Option<String> {
     }
 }
 
-/// Parse a decorator and return its deprecation metadata if it represents `@deprecated`.
-pub fn parse_deprecation(e: &Expr) -> Option<Deprecation> {
+/// Parse a decorator using a custom resolver for SpecialExport::Deprecated.
+pub fn parse_deprecation(e: &Expr, is_deprecated: impl Fn(&Expr) -> bool) -> Option<Deprecation> {
     let call = e.as_call_expr()?;
-    if SpecialExport::from_syntax(&call.func) != Some(SpecialExport::Deprecated) {
+    if !is_deprecated(&call.func) {
         return None;
     }
     Some(Deprecation::new(extract_message(call)))

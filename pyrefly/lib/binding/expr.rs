@@ -67,6 +67,7 @@ use crate::binding::scope::Scope;
 use crate::binding::scope::TerminationKind;
 use crate::binding::scope::is_constant_name;
 use crate::config::error_kind::ErrorKind;
+use crate::export::deprecation::parse_deprecation;
 use crate::export::special::SpecialExport;
 use crate::types::callable::unexpected_keyword;
 use crate::types::types::AnyStyle;
@@ -1621,11 +1622,17 @@ impl<'a> BindingsBuilder<'a> {
         for mut x in decorators {
             self.ensure_expr(&mut x.expression, usage);
             let trailing_name = Ast::decorator_trailing_name(&x.expression).map(Name::new);
+            let deprecation = parse_deprecation(&x.expression, |func| {
+                self.as_special_export(func) == Some(SpecialExport::Deprecated)
+                    || SpecialExport::from_syntax(func) == Some(SpecialExport::Deprecated)
+            })
+            .map(Box::new);
             let k = self.insert_binding(
                 KeyDecorator(x.range),
                 BindingDecorator {
                     expr: x.expression,
                     trailing_name,
+                    deprecation,
                 },
             );
             decorator_keys.push(k);
