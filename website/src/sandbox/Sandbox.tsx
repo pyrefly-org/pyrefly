@@ -72,6 +72,13 @@ export interface PyreflyState {
     semanticTokensLegend: () => any;
 }
 
+interface ActivePyrefly {
+    releaseVersion: string | null;
+    reportedVersion: string;
+    build: LoadedPyrefly;
+    service: PyreflyState;
+}
+
 interface SandboxProps {
     sampleFilename: string;
     isCodeSnippet?: boolean;
@@ -104,7 +111,13 @@ export default function Sandbox({
     // Increases when the module is ready again after a crash.
     const [wasmRestarts, setWasmRestarts] = useState(0);
     const [loading, setLoading] = useState(true);
-    const [pyreService, setPyreService] = useState<PyreflyState | null>(null);
+    // A pending selection must not change the identity of the running checker.
+    const [activePyrefly, setActivePyrefly] = useState<ActivePyrefly | null>(
+        null
+    );
+    const pyreService = activePyrefly?.service ?? null;
+    const pyreflyVersion = activePyrefly?.reportedVersion ?? null;
+    const activePyreflySource = activePyrefly?.releaseVersion ?? null;
     const [editorHeightforCodeSnippet, setEditorHeightforCodeSnippet] =
         useState<number | null>(null);
     const [models, setModels] = useState<Map<string, editor.ITextModel>>(
@@ -121,16 +134,11 @@ export default function Sandbox({
     const [isHovered, setIsHovered] = useState(false);
     const [pythonVersion, setPythonVersion] = useState('3.12');
     const [showParameterHints, setShowParameterHints] = useState(false);
-    const [pyreflyVersion, setPyreflyVersion] = useState<string | null>(null);
     const pyreflyCommit = process.env.PYREFLY_COMMIT;
-    // The selected pyrefly build: `null` for the bundled latest build, else a
-    // version from the selector, mirrored in the `pyrefly` URL parameter.
+    // The requested build can differ from the running checker while it loads.
     const [pyreflySource, setPyreflySource] = useState<string | null>(() =>
         isCodeSnippet ? null : getPyreflySourceFromURL()
     );
-    // The loaded pyrefly module, so that a crash restarts the selected build
-    // rather than the bundled one.
-    const pyreflyWasmRef = useRef<Promise<LoadedPyrefly> | null>(null);
     // Absolute pixel height for the editor pane (null = not yet initialized)
     const [editorHeight, setEditorHeight] = useState<number | null>(null);
     const [isResizing, setIsResizing] = useState(false);
@@ -190,12 +198,10 @@ export default function Sandbox({
     const switchToFileRef = useRef(switchToFile);
     switchToFileRef.current = switchToFile;
 
-    // Switches the typechecker to the selected pyrefly build and mirrors the
-    // selection in the URL, so that shared sandbox links reproduce it.
+    // The URL is committed only after the requested checker initializes.
     const handlePyreflyVersionSelect = useCallback((version: string | null) => {
         setPyreflySource(version);
         setFallbackWarning('');
-        updatePyreflyVersionParam(version);
     }, []);
 
     // Create a new temporary file
@@ -595,13 +601,13 @@ export default function Sandbox({
             <PyreflyVersionSelector
                 selected={pyreflySource}
                 onSelect={handlePyreflyVersionSelect}
-                disabled={loading}
+                disabled={false}
             />
             {pyreflyVersion && (
                 <PyreflyBuildLink
                     pyreflyVersion={pyreflyVersion}
                     pyreflyCommit={pyreflyCommit}
-                    pyreflySource={pyreflySource}
+                    pyreflySource={activePyreflySource}
                 />
             )}
         </div>
@@ -713,13 +719,10 @@ export default function Sandbox({
         const fallBack = (message: string) => {
             setFallbackWarning(`${message}. Using the bundled build.`);
             setPyreflySource(null);
-            updatePyreflyVersionParam(null);
         };
 
         setLoading(true);
-        const pyreflyWasmPromise = loadPyrefly(pyreflySource);
-        pyreflyWasmRef.current = pyreflyWasmPromise;
-        pyreflyWasmPromise
+        loadPyrefly(pyreflySource)
             .then((loaded) => {
                 if (cancelled) {
                     return;
@@ -731,8 +734,15 @@ export default function Sandbox({
                     // checker that is actually running.
                     const reported = loaded.mod.version();
                     const service = new loaded.mod.State(pythonVersion);
-                    setPyreflyVersion(reported);
-                    setPyreService(service);
+                    setActivePyrefly({
+                        releaseVersion: pyreflySource,
+                        reportedVersion: reported,
+                        build: loaded,
+                        service,
+                    });
+                    if (!isCodeSnippet) {
+                        updatePyreflyVersionParam(pyreflySource);
+                    }
                     setLoading(false);
                     setInternalError('');
                 } catch (e) {
@@ -764,7 +774,7 @@ export default function Sandbox({
         return () => {
             cancelled = true;
         };
-    }, [isInViewport, pythonVersion, pyreflySource]); // Re-run when these change
+    }, [isInViewport, isCodeSnippet, pythonVersion, pyreflySource]);
 
     // Need to add createModel handler in case monaco model was not created at mount time
     monaco.editor.onDidCreateModel((newModel) => {
@@ -903,8 +913,8 @@ export default function Sandbox({
             // the results do not wait for the next edit. A check that crashes
             // is not run again, because it would crash again.
             if (String(e).includes('not ready')) {
-                pyreflyWasmRef.current
-                    ?.then((loaded) => loaded.mod.default(loaded.wasmSource))
+                activePyrefly?.build.mod
+                    .default(activePyrefly.build.wasmSource)
                     .then(() => setWasmRestarts((count) => count + 1))
                     .catch((initError) => setInternalError(String(initError)));
             }
@@ -1029,7 +1039,8 @@ export default function Sandbox({
         activeFileName,
         setModels,
         setActiveFileName,
-        pyreflyVersion
+        pyreflyVersion,
+        activePyreflySource
     );
 
     // Calculate heights based on stored editor height (only used in sandbox mode)
@@ -1124,7 +1135,7 @@ export default function Sandbox({
                             onMouseDown={handleResizeStart}
                         />
                         <SandboxResults
-                            loading={loading}
+                            loading={loading && activePyrefly === null}
                             goToDef={handleGoToDefFromErrors}
                             errors={errors}
                             internalError={internalError}
@@ -1144,20 +1155,21 @@ export default function Sandbox({
 
 type ProjectState = SandboxProject;
 
-function updateURL(allFiles: Record<string, string>, activeFile: string): void {
+function updateURL(
+    allFiles: Record<string, string>,
+    activeFile: string,
+    pyreflySource: string | null
+): void {
     const projectState: ProjectState = {
         files: allFiles,
         activeFile: activeFile,
     };
     const compressed = encodeSandboxProject(projectState);
-    // Keep the selected pyrefly version, so that a shared link reproduces
-    // it, and drop legacy parameters as before.
-    const params = new URLSearchParams(window.location.search);
+    // Shared links describe the active checker, not a pending selection.
+    const params = new URLSearchParams();
     params.set('project', compressed);
-    for (const key of Array.from(params.keys())) {
-        if (key !== 'project' && key !== 'pyrefly') {
-            params.delete(key);
-        }
+    if (pyreflySource !== null) {
+        params.set('pyrefly', pyreflySource);
     }
     replaceURLWith(params);
 }
@@ -1211,6 +1223,9 @@ function getPyreflySourceFromURL(): string | null {
 function updatePyreflyVersionParam(version: string | null): void {
     if (typeof window === 'undefined') return;
     const params = new URLSearchParams(window.location.search);
+    if (params.get('pyrefly') === version) {
+        return;
+    }
     if (version === null) {
         params.delete('pyrefly');
     } else {
@@ -1221,13 +1236,8 @@ function updatePyreflyVersionParam(version: string | null): void {
 
 function replaceURLWith(params: URLSearchParams): void {
     const query = params.toString();
-    window.history.replaceState(
-        {},
-        '',
-        query
-            ? `${window.location.pathname}?${query}`
-            : window.location.pathname
-    );
+    const url = `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`;
+    window.history.replaceState(window.history.state, '', url);
 }
 
 function fetchCurMonacoModelAndTriggerUpdate(
@@ -1417,7 +1427,8 @@ function getMonacoButtons(
         React.SetStateAction<Map<string, editor.ITextModel>>
     >,
     setActiveFileName: (fileName: string) => void,
-    pyreflyVersion: string | null
+    pyreflyVersion: string | null,
+    pyreflySource: string | null
 ): ReadonlyArray<React.ReactElement> {
     let buttons: ReadonlyArray<React.ReactElement> = [];
     if (isCodeSnippet) {
@@ -1445,7 +1456,7 @@ function getMonacoButtons(
                 pyodideStatus,
                 setPyodideStatus
             ),
-            getShareUrlButton(models, activeFileName),
+            getShareUrlButton(models, activeFileName, pyreflySource),
             getResetButton(
                 model,
                 forceRecheck,
@@ -1460,7 +1471,8 @@ function getMonacoButtons(
                 models,
                 activeFileName,
                 pythonVersion,
-                pyreflyVersion
+                pyreflyVersion,
+                pyreflySource
             ),
         ];
     }
@@ -1481,7 +1493,8 @@ function getMonacoButtons(
 // Monaco Editor Buttons
 function getShareUrlButton(
     models: Map<string, editor.ITextModel>,
-    activeFileName: string
+    activeFileName: string,
+    pyreflySource: string | null
 ): React.ReactElement {
     return (
         <MonacoEditorButton
@@ -1492,7 +1505,7 @@ function getShareUrlButton(
                 models.forEach((model, filename) => {
                     allFiles[filename] = model.getValue();
                 });
-                updateURL(allFiles, activeFileName);
+                updateURL(allFiles, activeFileName, pyreflySource);
 
                 const currentURL = window.location.href;
                 return navigator.clipboard.writeText(currentURL);
@@ -1508,7 +1521,8 @@ function getGitHubIssuesButton(
     models: Map<string, editor.ITextModel>,
     activeFileName: string,
     pythonVersion: string,
-    pyreflyVersion: string | null
+    pyreflyVersion: string | null,
+    pyreflySource: string | null
 ): React.ReactElement {
     return (
         <MonacoEditorButton
@@ -1519,7 +1533,7 @@ function getGitHubIssuesButton(
                 models.forEach((model, filename) => {
                     allFiles[filename] = model.getValue();
                 });
-                updateURL(allFiles, activeFileName);
+                updateURL(allFiles, activeFileName, pyreflySource);
 
                 const sandboxURL = window.location.href;
                 const model = models.get(activeFileName);

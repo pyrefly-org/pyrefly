@@ -265,7 +265,7 @@ describe('Sandbox Component', () => {
         expect(window.location.search).toContain('pyrefly=2.0.0');
     });
 
-    // These tests pin the transition behavior before changing checker ownership.
+    // Pending selections must not relabel or recover the running checker.
     test('reports the running build while a release is pending', async () => {
         const bundled = await actualLoader.loadPyrefly(null);
         let finishLoad!: (loaded: typeof bundled) => void;
@@ -289,14 +289,12 @@ describe('Sandbox Component', () => {
                 expect(selector).toHaveTextContent('Pyrefly 1.5.0')
             );
             fireEvent.change(selector, { target: { value: '1.5.0' } });
-            // Bug: pending downloads hide results from the still-active checker.
-            expect(result.queryByText('No errors!')).not.toBeInTheDocument();
+            expect(result.getByText('No errors!')).toBeInTheDocument();
             const link = result.container.querySelector('#pyrefly-build');
             expect(link).toHaveTextContent('Pyrefly 1.2.3-test');
-            // Bug: the label still describes bundled, but its link and report URL do not.
             expect(link).toHaveAttribute(
                 'href',
-                'https://github.com/pyrefly-org/pyrefly/releases/tag/1.5.0'
+                `https://github.com/pyrefly-org/pyrefly/commit/${pyreflyCommit}`
             );
             fireEvent.click(result.getByLabelText('report issue on GitHub'));
             const issue = new URL(open.mock.calls[0][0] as string);
@@ -307,7 +305,7 @@ describe('Sandbox Component', () => {
                 new URL(issue.searchParams.get('sandbox')!).searchParams.get(
                     'pyrefly'
                 )
-            ).toBe('1.5.0');
+            ).toBeNull();
             await act(async () => {
                 finishLoad({
                     ...bundled,
@@ -335,9 +333,17 @@ describe('Sandbox Component', () => {
         await act(async () => {
             await Promise.resolve();
         });
-        // Bug: the only control that can select the bundled build is disabled.
-        expect(selector).toBeDisabled();
+        expect(selector).not.toBeDisabled();
         expect(selector).toHaveValue('1.5.0');
+        fireEvent.change(selector, { target: { value: '' } });
+        await waitFor(() =>
+            expect(
+                result.container.querySelector('#pyrefly-build')
+            ).toHaveTextContent('Pyrefly 1.2.3-test')
+        );
+        expect(
+            new URLSearchParams(window.location.search).get('pyrefly')
+        ).toBeNull();
     });
 
     test('recovers the running module rather than a pending release', async () => {
@@ -393,9 +399,8 @@ describe('Sandbox Component', () => {
                     },
                 });
             });
-            // Bug: the pending loader promise selects the wrong module for recovery.
-            expect(bundledInit).not.toHaveBeenCalled();
-            expect(releaseInit).toHaveBeenCalledTimes(1);
+            expect(bundledInit).toHaveBeenCalledTimes(1);
+            expect(releaseInit).not.toHaveBeenCalled();
         } finally {
             error.mockRestore();
         }
