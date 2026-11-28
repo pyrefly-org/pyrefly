@@ -154,13 +154,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         cls: &Class,
         root_model_type: Type,
         has_strict: bool,
+        model_strict: bool,
     ) -> ClassSynthesizedField {
         let is_any_or_quantified =
             root_model_type.is_any() || matches!(root_model_type, Type::Quantified(_));
-        let has_default = matches!(
-            self.get_dataclass_member(cls, &ROOT),
-            DataclassMember::Field(_, keywords) if keywords.default.is_some()
-        );
+        let (has_default, field_strict) = match self.get_dataclass_member(cls, &ROOT) {
+            DataclassMember::Field(_, keywords) => (keywords.default.is_some(), keywords.strict),
+            _ => (false, None),
+        };
+        let has_strict = if has_strict {
+            true
+        } else {
+            match field_strict {
+                Some(false) => false,
+                Some(true) => model_strict || Self::is_pydantic_root_leaf_type(&root_model_type),
+                None => model_strict,
+            }
+        };
         let root_requiredness = if is_any_or_quantified || has_default {
             Required::Optional(None)
         } else {
@@ -175,6 +185,20 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let params = vec![self.class_self_param(cls, false), root_param];
         let ty = self.synthesized_method(cls, dunder::INIT, params, self.heap.mk_none());
         ClassSynthesizedField::new(ty)
+    }
+
+    fn is_pydantic_root_leaf_type(ty: &Type) -> bool {
+        let inner = match ty {
+            Type::Union(union) => {
+                let mut non_none = union.members.iter().filter(|m| !matches!(m, Type::None));
+                match (non_none.next(), non_none.next()) {
+                    (Some(single), None) => single,
+                    _ => return false,
+                }
+            }
+            other => other,
+        };
+        matches!(inner, Type::ClassType(cls) if cls.targs().as_slice().is_empty())
     }
 
     /// Synthesizes BaseModel's typed signature or exposes an inherited nonstandard implementation.
@@ -252,7 +276,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let tparam = tparams.iter().next()?;
         let root_model_type = self.heap.mk_quantified(tparam.clone());
         Some(
-            self.get_pydantic_root_model_init(cls, root_model_type, false)
+            self.get_pydantic_root_model_init(cls, root_model_type, false, false)
                 .inner
                 .ty(),
         )
