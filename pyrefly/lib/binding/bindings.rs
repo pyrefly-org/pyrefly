@@ -581,6 +581,10 @@ pub struct BindingsBuilder<'a> {
     environment_names: SmallSet<Name>,
     /// BoundName lookups keyed by source occurrence and finalized in insertion order.
     deferred_bound_names: SmallMap<ShortIdentifier, DeferredBoundName>,
+    /// For an operand of a boolean operation that is followed by an operand assigning a name
+    /// with a walrus, the flow idx of that name once the operand has been evaluated, without
+    /// the narrows the operand itself establishes. See `NarrowOps::add_prior_values`.
+    walrus_prior_values: SmallMap<TextRange, SmallMap<Name, Idx<Key>>>,
     /// Yield and yield-from indices for lambdas that contain yields.
     lambda_yield_keys: Vec<(TextRange, Box<[Idx<KeyYield>]>, Box<[Idx<KeyYieldFrom>]>)>,
     /// Lambda parameters, grouped by their lambdas' owners.
@@ -1131,6 +1135,7 @@ impl Bindings {
             environment_definitions: SmallMap::new(),
             environment_names: SmallSet::new(),
             deferred_bound_names: SmallMap::new(),
+            walrus_prior_values: SmallMap::new(),
             lambda_yield_keys: Vec::new(),
             owned_lambda_params: SmallMap::new(),
             next_lambda_param_id: 0,
@@ -3323,6 +3328,27 @@ impl<'a> BindingsBuilder<'a> {
             );
         }
         names
+    }
+
+    /// Record that `name`, assigned by a walrus in a later operand of a boolean operation,
+    /// still has the value of `idx` once the operand at `operand` has been evaluated.
+    pub fn record_walrus_prior_value(&mut self, operand: TextRange, name: Name, idx: Idx<Key>) {
+        self.walrus_prior_values
+            .entry(operand)
+            .or_default()
+            .insert(name, idx);
+    }
+
+    /// The names a walrus assigns in an operand after `operand`, with the flow idx each one
+    /// has once `operand` has been evaluated. See `record_walrus_prior_value`.
+    pub fn walrus_prior_values(
+        &self,
+        operand: TextRange,
+    ) -> impl Iterator<Item = (&Name, &Idx<Key>)> {
+        self.walrus_prior_values
+            .get(&operand)
+            .into_iter()
+            .flat_map(|names| names.iter())
     }
 
     pub fn bind_narrow_ops(&mut self, narrow_ops: &NarrowOps, use_location: NarrowUseLocation) {

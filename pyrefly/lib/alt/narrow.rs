@@ -1679,7 +1679,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 );
                 self.intersect_with_fallback(ty, &element, IntersectFallback::Right)
             }
-            AtomicNarrowOp::WalrusValue(value) => self.get_idx(*value).ty().clone(),
+            AtomicNarrowOp::WalrusValue(value) | AtomicNarrowOp::PriorValue(value) => {
+                self.get_idx(*value).ty().clone()
+            }
+            AtomicNarrowOp::MergedValue(_) => ty.clone(),
             AtomicNarrowOp::ClassCoverageGate(_) => ty.clone(),
             AtomicNarrowOp::ClassCoverageGateNeg(keys) => {
                 // Subtract the class only when every positional slot's sub-pattern exhausts its
