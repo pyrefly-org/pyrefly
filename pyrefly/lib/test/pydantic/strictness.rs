@@ -771,3 +771,49 @@ OptionalList(["1"])
 OptionalInt("1") # E: Argument `Literal['1']` is not assignable to parameter `root` with type `int | None`
 "#,
 );
+
+pydantic_testcase!(
+    bug = "Strict RootModel ignores before validators on root",
+    test_strict_root_model_before_validator,
+    r#"
+from typing import assert_type
+from pydantic import ConfigDict, RootModel, field_validator
+
+class Text(RootModel[str]):
+    model_config = ConfigDict(strict=True)
+
+    @field_validator("root", mode="before")
+    @classmethod
+    def decode(cls, value: object) -> object:
+        return value.decode() if isinstance(value, bytes) else value
+
+assert_type(Text(b"hello").root, str)  # E: not assignable to parameter `root` with type `str`
+"#,
+);
+
+pydantic_testcase!(
+    bug = "Strict RootModel rejects dictionaries for nested models",
+    test_strict_root_model_nested_model_input,
+    r#"
+from typing import assert_type
+from pydantic import BaseModel, ConfigDict, Field, RootModel
+
+class Inner(BaseModel):
+    a: int
+
+class ConfigStrict(RootModel[Inner]):
+    model_config = ConfigDict(strict=True)
+
+class FieldStrict(RootModel[Inner]):
+    root: Inner = Field(strict=True)
+
+class ListStrict(RootModel[list[Inner]]):
+    model_config = ConfigDict(strict=True)
+
+fields: dict[str, int] = {"a": 1}
+items: list[dict[str, int]] = [fields]
+assert_type(ConfigStrict(fields).root, Inner)  # E: not assignable to parameter `root` with type `Inner`
+assert_type(FieldStrict(fields).root, Inner)  # E: not assignable to parameter `root` with type `Inner`
+assert_type(ListStrict(items).root, list[Inner])  # E: not assignable to parameter `root` with type `list[Inner]`
+"#,
+);
