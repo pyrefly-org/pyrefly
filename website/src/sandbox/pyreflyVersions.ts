@@ -15,6 +15,12 @@
 
 export const PYREFLY_NPM_PACKAGE = 'pyrefly-wasm';
 
+// Enable only in a website build after the publishing identity and compatible
+// release artifacts have been verified. Shared URLs cannot enable downloads.
+export function releasedPyreflyBuildsEnabled(): boolean {
+    return process.env.PYREFLY_WASM_RELEASES_ENABLED === '1';
+}
+
 // jsDelivr's data API lists the versions of an npm package, with CORS
 // headers, so that the browser can fetch the list directly.
 const JSDELIVR_DATA_URL = `https://data.jsdelivr.com/v1/packages/npm/${PYREFLY_NPM_PACKAGE}`;
@@ -72,6 +78,9 @@ let catalog: Promise<PyreflyVersionInfo[]> | null = null;
  * calls share one request; a failed request is retried by the next call.
  */
 export function fetchPyreflyVersions(): Promise<PyreflyVersionInfo[]> {
+    if (!releasedPyreflyBuildsEnabled()) {
+        return Promise.resolve([]);
+    }
     if (catalog === null) {
         catalog = loadCatalog().catch((error) => {
             catalog = null;

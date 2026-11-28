@@ -7,7 +7,11 @@
  * @format
  */
 
-import { isValidPyreflyVersion, pyreflyWasmUrls } from './pyreflyVersions';
+import {
+    isValidPyreflyVersion,
+    pyreflyWasmUrls,
+    releasedPyreflyBuildsEnabled,
+} from './pyreflyVersions';
 
 /**
  * A loaded pyrefly module: the JS glue, which exports `State` and
@@ -35,6 +39,13 @@ const loadedModules = new Map<string, Promise<LoadedPyrefly>>();
  * removed from the cache so that selecting it again retries.
  */
 export function loadPyrefly(version: string | null): Promise<LoadedPyrefly> {
+    if (version !== null && !releasedPyreflyBuildsEnabled()) {
+        return Promise.reject(
+            new Error(
+                'Released Pyrefly builds are not enabled for this website'
+            )
+        );
+    }
     const key = version ?? BUNDLED_KEY;
     const cached = loadedModules.get(key);
     if (cached) {

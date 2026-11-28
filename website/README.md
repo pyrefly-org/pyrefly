@@ -63,6 +63,13 @@ localhost:3000
 
 Most changes are reflected live without having to restart the server.
 
+## Released sandbox builds
+
+Released builds are disabled by default. Set `PYREFLY_WASM_RELEASES_ENABLED=1`
+for a website build only after Pyrefly controls `pyrefly-wasm`, compatible
+artifacts are published, and an end-to-end release load has been verified.
+Shared URL parameters cannot enable downloads.
+
 ## Tests
 
 We have snapshot tests powered by Jest.

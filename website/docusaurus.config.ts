@@ -303,6 +303,7 @@ const config: Config = {
                                 INTERNAL_STATIC_DOCS:
                                     process.env.INTERNAL_STATIC_DOCS === '1' || false,
                                 PYREFLY_COMMIT: pyreflyCommit,
+                                PYREFLY_WASM_RELEASES_ENABLED: '',
                             }),
                         ],
                     };

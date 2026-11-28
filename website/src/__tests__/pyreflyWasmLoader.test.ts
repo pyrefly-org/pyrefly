@@ -32,9 +32,10 @@ describe('pyreflyWasmLoader', () => {
             .mockResolvedValue({ ok: false, status: 404 });
         stubFetch(fetchMock);
         try {
-            // Bug: a valid shared URL can load from an unverified publishing channel.
-            await expect(loadPyrefly('1.5.0')).rejects.toThrow('404');
-            expect(fetchMock).toHaveBeenCalledTimes(1);
+            await expect(loadPyrefly('1.5.0')).rejects.toThrow(
+                'Released Pyrefly builds are not enabled'
+            );
+            expect(fetchMock).not.toHaveBeenCalled();
         } finally {
             restoreFetch();
         }

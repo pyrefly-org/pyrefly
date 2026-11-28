@@ -39,9 +39,8 @@ describe('pyreflyVersions', () => {
             .mockResolvedValue({ ok: false, status: 404 });
         stubFetch(fetchMock);
         try {
-            // Bug: an absent publishing prerequisite does not prevent a request.
-            await expect(fetchPyreflyVersions()).rejects.toThrow('404');
-            expect(fetchMock).toHaveBeenCalledTimes(1);
+            await expect(fetchPyreflyVersions()).resolves.toEqual([]);
+            expect(fetchMock).not.toHaveBeenCalled();
         } finally {
             restoreFetch();
         }
