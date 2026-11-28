@@ -590,6 +590,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             calls_super_method,
             ..Default::default()
         };
+        let pytest_param_hints = self.pytest_parametrize_parameter_types(decorators, errors);
         let mut found_class_property = false;
         let decorators =
             Box::from_iter(decorators.iter().enumerate().filter_map(|(position, k)| {
@@ -826,6 +827,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             flags.facts().is_stub(),
             &mut self_type,
             &mut decorator_param_hints,
+            &pytest_param_hints,
             &mut parent_param_hints,
             errors,
         );
@@ -1688,6 +1690,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         is_stub: bool,
         self_type: &mut Option<Type>,
         decorator_param_hints: &mut Option<DecoratorParamHints>,
+        pytest_param_hints: &SmallMap<Name, Type>,
         parent_param_hints: &mut Option<ParentParamHints>,
         errors: &ErrorCollector,
     ) -> FunctionParamsResult {
@@ -1715,7 +1718,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 x.default.as_deref(),
                 is_stub,
                 self_type,
-                decorator_hint.or(parent_hint),
+                pytest_param_hints
+                    .get(&x.parameter.name.id)
+                    .cloned()
+                    .or(decorator_hint)
+                    .or(parent_hint),
                 errors,
             );
             if is_unannotated {
@@ -1749,7 +1756,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 x.default.as_deref(),
                 is_stub,
                 self_type,
-                decorator_hint.or(parent_hint),
+                pytest_param_hints
+                    .get(&x.parameter.name.id)
+                    .cloned()
+                    .or(decorator_hint)
+                    .or(parent_hint),
                 errors,
             );
             if is_unannotated {
@@ -1830,7 +1841,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 x.default.as_deref(),
                 is_stub,
                 self_type,
-                parent_hint,
+                pytest_param_hints
+                    .get(&x.parameter.name.id)
+                    .cloned()
+                    .or(parent_hint),
                 errors,
             );
             if is_unannotated {

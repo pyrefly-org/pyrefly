@@ -2761,6 +2761,307 @@ assert_type(r, int)
     "#,
 );
 
+fn env_pytest_parametrize() -> TestEnv {
+    let mut env = TestEnv::one_with_path(
+        "pytest",
+        "pytest.pyi",
+        r#"
+from _pytest.mark.structures import ParameterSet as ParameterSet
+
+class MarkDecorator:
+    def __call__[T](self, func: T) -> T: ...
+
+class MarkGenerator:
+    def parametrize(self, argnames: object, argvalues: object, indirect: object = False) -> MarkDecorator: ...
+
+mark: MarkGenerator
+
+def param(*values: object, marks: object = (), id: str | None = None) -> ParameterSet: ...
+
+class FixtureRequest:
+    param: object
+
+def fixture[T](func: T) -> T: ...
+"#,
+    );
+    env.add_with_path(
+        "_pytest.mark.structures",
+        "_pytest/mark/structures.pyi",
+        "class ParameterSet: ...",
+    );
+    env
+}
+
+testcase!(
+    test_pytest_parametrize_infers_parameter_types,
+    env_pytest_parametrize(),
+    r#"
+import pytest
+from typing import assert_type
+
+@pytest.mark.parametrize(
+    ("exception", "expected_error"),
+    [
+        (Exception("OAuth error"), "OAuth process failed"),
+        (ValueError("Invalid token"), "OAuth process failed"),
+        (KeyError("Missing key"), "OAuth process failed"),
+    ],
+)
+def test_oauth_error(exception, expected_error) -> None:
+    assert_type(exception, Exception | KeyError | ValueError)
+    assert_type(expected_error, str)
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_single_argument_forms,
+    env_pytest_parametrize(),
+    r#"
+import pytest
+from typing import assert_type
+
+@pytest.mark.parametrize("x", [(1,), (2,)])
+def test_string(x) -> None:
+    assert_type(x, tuple[int])
+
+@pytest.mark.parametrize(["x"], [(1,), (2,)])
+def test_list(x) -> None:
+    assert_type(x, int)
+
+@pytest.mark.parametrize(("x",), [[1], [2]])
+def test_tuple(x) -> None:
+    assert_type(x, int)
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_indirect,
+    env_pytest_parametrize(),
+    r#"
+import pytest
+from typing import Any, assert_type
+
+@pytest.fixture
+def value(request: pytest.FixtureRequest) -> str:
+    return str(request.param)
+
+@pytest.mark.parametrize("value", [1], indirect=True)
+def test_fixture(value) -> None:
+    assert_type(value, Any)
+    assert value.upper() == "1"
+
+@pytest.mark.parametrize("value, direct", [(1, "text")], indirect=["value"])
+def test_partial(value, direct) -> None:
+    assert_type(value, Any)
+    assert_type(direct, str)
+
+@pytest.mark.parametrize("value", [1], indirect=False)
+def test_direct(value) -> None:
+    assert_type(value, int)
+
+@pytest.mark.parametrize("value", [1], True)
+def test_positional(value) -> None:
+    assert_type(value, Any)
+
+def unknown_indirect() -> bool: ...
+
+@pytest.mark.parametrize("value", [1], indirect=unknown_indirect())
+def test_unknown(value) -> None:
+    assert_type(value, Any)
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_parameter_sets,
+    env_pytest_parametrize(),
+    r#"
+import pytest as pt
+from pytest import param as parameter
+from typing import assert_type
+
+@pt.mark.parametrize("x", [pt.param(1, id="one"), 2])
+def test_single(x) -> None:
+    assert_type(x, int)
+
+@pt.mark.parametrize(["x"], [pt.param((1,), id="tuple")])
+def test_tuple_value(x) -> None:
+    assert_type(x, tuple[int])
+
+@pt.mark.parametrize("x, y", [pt.param(1, "one"), (2, "two"), parameter(3, "three")])
+def test_multiple(x, y) -> None:
+    assert_type(x, int)
+    assert_type(y, str)
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_keywords_and_methods,
+    env_pytest_parametrize(),
+    r#"
+from pytest import mark
+from pytest import mark as m
+from typing import Self, assert_type
+
+@mark.parametrize(argnames="x", argvalues=[1, 2])
+def test_keywords(x) -> None:
+    assert_type(x, int)
+
+class TestValues:
+    @m.parametrize(argvalues=[(1, "one")], argnames=("x", "y"))
+    def test_method(self, x, *, y) -> None:
+        assert_type(self, Self)
+        assert_type(x, int)
+        assert_type(y, str)
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_separate_decorator_hints,
+    env_pytest_parametrize(),
+    r#"
+import pytest
+from typing import Callable, assert_type
+
+def typed(func: Callable[[int, str, bool], None]) -> Callable[[int, str, bool], None]:
+    return func
+
+@typed
+@pytest.mark.parametrize("x", [1])
+def test_hints(x, y, z) -> None:
+    assert_type(x, int)
+    assert_type(y, str)
+    assert_type(z, bool)
+
+@pytest.mark.parametrize("x", [1, 2])
+@pytest.mark.parametrize("y", ["one", "two"])
+def test_stacked(x, y) -> None:
+    assert_type(x, int)
+    assert_type(y, str)
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_unsupported_rows,
+    env_pytest_parametrize(),
+    r#"
+import pytest
+from typing import Any, assert_type
+
+@pytest.mark.parametrize("x, y", [(1, "one"), (2,)])
+def test_wrong_length(x, y) -> None:
+    assert_type(x, Any)
+    assert_type(y, Any)
+
+@pytest.mark.parametrize(["x"], [pytest.param(1, 2)])
+def test_wrong_parameter_set(x) -> None:
+    assert_type(x, Any)
+
+def rows() -> list[tuple[int, str]]: ...
+
+@pytest.mark.parametrize("x, y", rows())
+def test_dynamic_rows(x, y) -> None:
+    assert_type(x, Any)
+    assert_type(y, Any)
+
+@pytest.mark.parametrize("x, y", [*rows()])
+def test_starred_rows(x, y) -> None:
+    assert_type(x, Any)
+    assert_type(y, Any)
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_empty_container_hints,
+    env_pytest_parametrize().enable_implicit_any_empty_container_error(),
+    r#"
+import pytest
+from typing import Any, assert_type
+
+@pytest.mark.parametrize("x", [[], [1]])
+def test_lists(x) -> None:
+    assert_type(x, list[Any] | list[int])
+
+@pytest.mark.parametrize("x", [{}, {1: 2}])
+def test_dicts(x) -> None:
+    assert_type(x, dict[Any, Any] | dict[int, int])
+
+@pytest.mark.parametrize("x", [pytest.param(([], {}))])
+def test_nested(x) -> None:
+    assert_type(x, tuple[list[Any], dict[Any, Any]])
+
+@pytest.mark.parametrize("unused", [[]])
+def test_unused(unused) -> None:
+    pass
+
+unrelated = []  # E: Cannot infer type of empty container
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_named_parameter_sets,
+    env_pytest_parametrize(),
+    r#"
+import pytest
+from typing import Any, assert_type
+
+parameter = pytest.param("hello")
+
+@pytest.mark.parametrize("text", [parameter])
+def test_text(text) -> None:
+    assert_type(text, Any)
+    text.upper()
+
+@pytest.mark.parametrize("text", ["plain", parameter])
+def test_mixed(text) -> None:
+    assert_type(text, Any)
+    text.upper()
+
+def maybe_parameter() -> str | pytest.ParameterSet: ...
+
+@pytest.mark.parametrize("text", [maybe_parameter()])
+def test_union(text) -> None:
+    assert_type(text, Any)
+    text.upper()
+
+@pytest.mark.parametrize("value", [pytest.param(parameter)])
+def test_explicit_value(value) -> None:
+    assert_type(value, pytest.ParameterSet)
+
+@pytest.mark.parametrize(["value"], [(parameter,)])
+def test_sequence_value(value) -> None:
+    assert_type(value, pytest.ParameterSet)
+
+class ParameterSet: ...
+
+@pytest.mark.parametrize("value", [ParameterSet()])
+def test_unrelated_class(value) -> None:
+    assert_type(value, ParameterSet)
+"#,
+);
+
+testcase!(
+    test_pytest_parametrize_trailing_comma,
+    env_pytest_parametrize(),
+    r#"
+import pytest
+from typing import Any, assert_type
+
+@pytest.mark.parametrize("x,", [(1,), (2,)])
+def test_ambiguous(x) -> None:
+    assert_type(x, Any)
+    x + 1
+
+@pytest.mark.parametrize("x,  ", [pytest.param(1)])
+def test_whitespace(x) -> None:
+    assert_type(x, Any)
+
+@pytest.mark.parametrize("x, y,", [(1, "one")])
+def test_multiple(x, y) -> None:
+    assert_type(x, int)
+    assert_type(y, str)
+"#,
+);
+
 fn env_numba() -> TestEnv {
     let mut env = TestEnv::one_with_path(
         "numba",
