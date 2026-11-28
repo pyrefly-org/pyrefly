@@ -709,12 +709,21 @@ impl DataclassMetadata {
             .contains(&Name::new_static("*"))
     }
 
+    /// Whether validation can accept input outside this field's declared type.
+    pub fn pydantic_field_accepts_any_input(
+        &self,
+        name: &Name,
+        keywords: Option<&DataclassFieldKeywords>,
+    ) -> bool {
+        self.pydantic_before_validator_fields.contains(name)
+            || keywords.is_some_and(|keywords| keywords.pydantic_has_custom_schema)
+    }
+
     /// Whether Pydantic lax mode converts the `__init__` input for this field.
     pub fn is_pydantic_lax_field(&self, name: &Name, keywords: &DataclassFieldKeywords) -> bool {
         !keywords.strict.unwrap_or(self.kws.strict)
             && keywords.converter_param.is_none()
-            && !keywords.pydantic_has_custom_schema
-            && !self.pydantic_before_validator_fields.contains(name)
+            && !self.pydantic_field_accepts_any_input(name, Some(keywords))
     }
 }
 

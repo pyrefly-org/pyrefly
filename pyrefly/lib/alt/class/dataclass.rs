@@ -155,12 +155,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let init_method = if let Some((root_model_type, has_strict)) =
                 self.get_pydantic_root_model_type_via_mro(cls, metadata)
             {
-                self.get_pydantic_root_model_init(
-                    cls,
-                    root_model_type,
-                    has_strict,
-                    dataclass.kws.strict,
-                )
+                self.get_pydantic_root_model_init(cls, root_model_type, has_strict, Some(dataclass))
             } else if metadata.is_pydantic_model() {
                 // Pydantic models with RootModel fields need type expansion
                 let transform_type: &dyn Fn(Type) -> Type = &|ty: Type| {
@@ -1412,15 +1407,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                 }
 
-                // If this field has a `@field_validator(..., mode='before'|'plain')`, the init
-                // parameter accepts `Any` because the validator transforms arbitrary input.
-                let converter_param = if dataclass.pydantic_before_validator_fields.contains(&name)
-                    // A custom schema may accept input that is not of the declared
-                    // type, so only the `__init__` parameter is widened to `Any`. The
-                    // stored `converter_param` is left alone: attribute assignment and
-                    // `__replace__` also read it, and assignment must still enforce
-                    // the declared type.
-                    || field_flags.pydantic_has_custom_schema
+                // Widen only the constructor parameter, not the type used for attribute assignment
+                // or `__replace__`.
+                let converter_param = if dataclass
+                    .pydantic_field_accepts_any_input(&name, Some(&field_flags))
                     || (strict
                         && metadata.is_pydantic_model()
                         && field_flags.converter_param.is_none()

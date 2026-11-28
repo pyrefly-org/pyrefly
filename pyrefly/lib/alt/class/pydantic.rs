@@ -153,30 +153,33 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         &self,
         cls: &Class,
         root_model_type: Type,
-        has_strict: bool,
-        model_strict: bool,
+        type_strict: bool,
+        dataclass: Option<&DataclassMetadata>,
     ) -> ClassSynthesizedField {
         let is_any_or_quantified =
             root_model_type.is_any() || matches!(root_model_type, Type::Quantified(_));
-        let (has_default, field_strict) = match self.get_dataclass_member(cls, &ROOT) {
-            DataclassMember::Field(_, keywords) => (keywords.default.is_some(), keywords.strict),
-            _ => (false, None),
+        let keywords = match self.get_dataclass_member(cls, &ROOT) {
+            DataclassMember::Field(_, keywords) => Some(keywords),
+            _ => None,
         };
-        let has_strict = if has_strict {
-            true
-        } else {
-            match field_strict {
+        let model_strict = dataclass.is_some_and(|dataclass| dataclass.kws.strict);
+        let accepts_any_input = dataclass.is_some_and(|dataclass| {
+            dataclass.pydantic_validator_replaces_all_input()
+                || dataclass.pydantic_field_accepts_any_input(&ROOT, keywords.as_ref())
+        });
+        let has_strict = type_strict
+            || match keywords.as_ref().and_then(|keywords| keywords.strict) {
                 Some(false) => false,
                 Some(true) => model_strict || Self::is_pydantic_root_leaf_type(&root_model_type),
                 None => model_strict,
-            }
-        };
+            };
+        let has_default = keywords.is_some_and(|keywords| keywords.default.is_some());
         let root_requiredness = if is_any_or_quantified || has_default {
             Required::Optional(None)
         } else {
             Required::Required
         };
-        let root_model_type = if is_any_or_quantified || has_strict {
+        let root_model_type = if !accepts_any_input && (is_any_or_quantified || has_strict) {
             root_model_type
         } else {
             self.heap.mk_any_explicit()
@@ -276,7 +279,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let tparam = tparams.iter().next()?;
         let root_model_type = self.heap.mk_quantified(tparam.clone());
         Some(
-            self.get_pydantic_root_model_init(cls, root_model_type, false, false)
+            self.get_pydantic_root_model_init(cls, root_model_type, false, None)
                 .inner
                 .ty(),
         )

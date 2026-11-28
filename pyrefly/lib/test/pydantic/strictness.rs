@@ -773,7 +773,6 @@ OptionalInt("1") # E: Argument `Literal['1']` is not assignable to parameter `ro
 );
 
 pydantic_testcase!(
-    bug = "Strict RootModel ignores before validators on root",
     test_strict_root_model_before_validator,
     r#"
 from typing import assert_type
@@ -787,7 +786,7 @@ class Text(RootModel[str]):
     def decode(cls, value: object) -> object:
         return value.decode() if isinstance(value, bytes) else value
 
-assert_type(Text(b"hello").root, str)  # E: not assignable to parameter `root` with type `str`
+assert_type(Text(b"hello").root, str)
 "#,
 );
 
